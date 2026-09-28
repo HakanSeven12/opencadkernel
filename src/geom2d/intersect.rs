@@ -288,66 +288,46 @@ pub fn ellipse_circle(
     let f = |t: f64| (a * t.cos() - u).powi(2) + (b * t.sin() - v).powi(2) - r2;
     let df = |t: f64| (b * b - a * a) * (2.0 * t).sin() + 2.0 * a * u * t.sin() - 2.0 * b * v * t.cos();
 
+    // F is measured in length², so its tangency window is the distance
+    // tolerance of `line_circle` carried through d(r²) = 2r·dr.
+    let tol = PROXIMITY_EPSILON.max(1e-7 * radius.max(1.0));
+    let tangency = 2.0 * radius * tol;
+
+    // Sample F, and split any sample interval at an extremum of F: two
+    // crossings can sit between two samples of the same sign (a small circle
+    // on a large ellipse), and the extremum between them separates them.
+    // Each piece is then bracketed, so bisection cannot wander off to a
+    // neighbouring root.
     let mut roots: Vec<f64> = Vec::new();
+    let mut push = |t: f64| {
+        let t = t.rem_euclid(TAU);
+        if !roots.iter().any(|&r| (r - t).abs() < 1e-9 || (r - t).abs() > TAU - 1e-9) {
+            roots.push(t);
+        }
+    };
     const N: usize = 64;
-    let mut prev_t = 0.0;
-    let mut prev_f = f(0.0);
-
-    for i in 1..=N {
-        let t_curr = i as f64 * TAU / N as f64;
-        let f_curr = f(t_curr);
-        let mut candidate = None;
-
-        if prev_f * f_curr <= 0.0 {
-            // Crossing root in bracket [prev_t, t_curr]
-            let mut t = 0.5 * (prev_t + t_curr);
-            for _ in 0..15 {
-                let val = f(t);
-                let der = df(t);
-                if der.abs() < 1e-12 {
-                    break;
-                }
-                let t_next = t - val / der;
-                if (t_next - t).abs() < 1e-12 {
-                    t = t_next;
-                    break;
-                }
-                t = t_next;
+    for i in 0..N {
+        let t0 = i as f64 * TAU / N as f64;
+        let t1 = (i + 1) as f64 * TAU / N as f64;
+        let mut cuts = vec![t0];
+        if df(t0) * df(t1) < 0.0 {
+            let extremum = bisect(&df, t0, t1);
+            if f(extremum).abs() <= tangency {
+                // A touch, not two crossings a hair apart.
+                push(extremum);
+                continue;
             }
-            candidate = Some(t.rem_euclid(TAU));
-        } else {
-            // Tangency / extremum root in bracket
-            let der_prev = df(prev_t);
-            let der_curr = df(t_curr);
-            if der_prev * der_curr <= 0.0 {
-                let mut t = 0.5 * (prev_t + t_curr);
-                for _ in 0..15 {
-                    let der = df(t);
-                    let d2f = 2.0 * (b * b - a * a) * (2.0 * t).cos() + 2.0 * a * u * t.cos() + 2.0 * b * v * t.sin();
-                    if d2f.abs() < 1e-12 {
-                        break;
-                    }
-                    let t_next = t - der / d2f;
-                    if (t_next - t).abs() < 1e-12 {
-                        t = t_next;
-                        break;
-                    }
-                    t = t_next;
-                }
-                let val = f(t);
-                if val.abs() <= 1e-4 * radius.max(1.0) {
-                    candidate = Some(t.rem_euclid(TAU));
-                }
+            cuts.push(extremum);
+        }
+        cuts.push(t1);
+        for piece in cuts.windows(2) {
+            let (lo, hi) = (f(piece[0]), f(piece[1]));
+            if lo == 0.0 {
+                push(piece[0]);
+            } else if lo * hi < 0.0 {
+                push(bisect(&f, piece[0], piece[1]));
             }
         }
-
-        if let Some(t) = candidate {
-            if !roots.iter().any(|&r| (r - t).abs() < 1e-5 || (r - t).abs() > TAU - 1e-5) {
-                roots.push(t);
-            }
-        }
-        prev_t = t_curr;
-        prev_f = f_curr;
     }
 
     roots
@@ -361,6 +341,20 @@ pub fn ellipse_circle(
             (angle, t)
         })
         .collect()
+}
+
+/// A root of `g` between `lo` and `hi`, where `g` changes sign.
+fn bisect(g: &impl Fn(f64) -> f64, mut lo: f64, mut hi: f64) -> f64 {
+    let lo_negative = g(lo) < 0.0;
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if (g(mid) < 0.0) == lo_negative {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
 }
 
 #[cfg(test)]
