@@ -356,15 +356,7 @@ impl Curve {
                 arc_parameter(angle, arc.start_angle, arc.end_angle)
             }
             Self::Ellipse(arc) => {
-                let ellipse = &arc.ellipse;
-                let rx = point[0] - ellipse.centre[0];
-                let ry = point[1] - ellipse.centre[1];
-                let (nx, ny) = (ellipse.major_axis[0], ellipse.major_axis[1]);
-                // Squash to the unit circle, where the coordinates are
-                // (cos t, sin t) and the parameter reads straight off.
-                let along = (rx * nx + ry * ny) / ellipse.major_radius;
-                let across = (-rx * ny + ry * nx) / ellipse.minor_radius;
-                let parameter = across.atan2(along);
+                let parameter = arc.ellipse.closest_parameter(point);
                 let travelled = (parameter - arc.start_parameter).rem_euclid(TAU);
                 travelled / arc.sweep()
             }
