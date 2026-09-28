@@ -24,8 +24,6 @@ use super::Ellipse;
 /// Below this, two directions are parallel and there is no single crossing.
 const DETERMINANT_EPSILON: f64 = 1e-10;
 
-/// Below this, a quadratic has a double root: the line grazes the conic.
-const DISCRIMINANT_EPSILON: f64 = 1e-14;
 
 /// Below this, a direction is too short to define a line at all.
 const DEGENERATE_DIRECTION: f64 = 1e-20;
@@ -61,6 +59,9 @@ pub fn line_line(p: [f64; 2], d: [f64; 2], q: [f64; 2], e: [f64; 2]) -> Option<(
 /// Returns the line parameters: empty when they miss, one value where the
 /// line is tangent, two otherwise, ordered by increasing `t`.
 pub fn line_circle(p: [f64; 2], d: [f64; 2], centre: [f64; 2], radius: f64) -> Vec<f64> {
+    if radius <= 0.0 {
+        return Vec::new();
+    }
     let fx = p[0] - centre[0];
     let fy = p[1] - centre[1];
     let a = d[0] * d[0] + d[1] * d[1];
@@ -68,16 +69,24 @@ pub fn line_circle(p: [f64; 2], d: [f64; 2], centre: [f64; 2], radius: f64) -> V
         return Vec::new();
     }
     let b = 2.0 * (fx * d[0] + fy * d[1]);
-    let c = fx * fx + fy * fy - radius * radius;
-    let discriminant = b * b - 4.0 * a * c;
-    if discriminant < 0.0 {
+
+    let t_perp = -b / (2.0 * a);
+    let px = fx + t_perp * d[0];
+    let py = fy + t_perp * d[1];
+    let h = (px * px + py * py).sqrt();
+
+    let max_radius = radius.max(1.0);
+    let tol = PROXIMITY_EPSILON.max(1e-7 * max_radius);
+
+    if h > radius + tol {
         return Vec::new();
     }
-    if discriminant < DISCRIMINANT_EPSILON {
-        return vec![-b / (2.0 * a)];
+    if (h - radius).abs() <= tol {
+        return vec![t_perp];
     }
-    let root = discriminant.sqrt();
-    vec![(-b - root) / (2.0 * a), (-b + root) / (2.0 * a)]
+    let half_chord = (radius * radius - h * h).max(0.0).sqrt();
+    let delta_t = half_chord / a.sqrt();
+    vec![t_perp - delta_t, t_perp + delta_t]
 }
 
 /// Where two circles meet, as angles measured on the **first** circle.
@@ -195,17 +204,22 @@ pub fn line_ellipse(p: [f64; 2], d: [f64; 2], ellipse: &Ellipse) -> Vec<(f64, f6
         return Vec::new();
     }
     let b = 2.0 * (unit_x * unit_dx + unit_y * unit_dy);
-    let c = unit_x * unit_x + unit_y * unit_y - 1.0;
-    let discriminant = b * b - 4.0 * a * c;
-    if discriminant < 0.0 {
-        return Vec::new();
-    }
 
-    let line_params = if discriminant < DISCRIMINANT_EPSILON {
-        vec![-b / (2.0 * a)]
+    let t_perp = -b / (2.0 * a);
+    let px = unit_x + t_perp * unit_dx;
+    let py = unit_y + t_perp * unit_dy;
+    let h = (px * px + py * py).sqrt();
+
+    let tol = PROXIMITY_EPSILON.max(1e-7);
+
+    let line_params = if h > 1.0 + tol {
+        Vec::new()
+    } else if (h - 1.0).abs() <= tol {
+        vec![t_perp]
     } else {
-        let root = discriminant.sqrt();
-        vec![(-b - root) / (2.0 * a), (-b + root) / (2.0 * a)]
+        let half_chord = (1.0 - h * h).max(0.0).sqrt();
+        let delta_t = half_chord / a.sqrt();
+        vec![t_perp - delta_t, t_perp + delta_t]
     };
 
     line_params
