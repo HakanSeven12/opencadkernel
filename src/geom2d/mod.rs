@@ -65,7 +65,8 @@ pub use frame::Frame;
 pub use fillet::{fillet_between_rays, fillets_between, Fillet};
 pub use gradient::{gradient_frame, GradientFrame};
 pub use intersect::{
-    circle_circle_angles, circle_circle_points, line_circle, line_ellipse, line_line,
+    circle_circle_angles, circle_circle_points, ellipse_circle, line_circle, line_ellipse,
+    line_line,
 };
 #[cfg(feature = "offset")]
 pub use offset::offset_polyline;
