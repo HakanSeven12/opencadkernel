@@ -84,19 +84,16 @@ pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
     }
 }
 
-/// A sphere and a coaxial cylinder meet in one or two exact latitude circles.
-/// Offset axes form a quartic and remain unknown until the marching path can
-/// represent every branch safely.
+/// A sphere centred on a cylinder's axis meets it in one or two exact
+/// circles round that axis. The sphere's own frame plays no part: any axis
+/// through its centre is one of its axes. Off the axis the section is a
+/// quartic, which remains unknown until the marching path can represent
+/// every branch safely.
 fn sphere_cylinder(sphere: &Sphere, cylinder: &Cylinder, tolerance: f64) -> Meeting {
-    let (Some(axis), Some(sphere_axis)) =
-        (cylinder.base.normal(), sphere.frame.normal())
-    else {
+    let Some(axis) = cylinder.base.normal() else {
         return Meeting::Unknown;
     };
     let axis = Vec3::from(axis);
-    if !axis.is_parallel_to(Vec3::from(sphere_axis), tolerance) {
-        return Meeting::Unknown;
-    }
     let offset = Vec3::from(sphere.frame.origin) - Vec3::from(cylinder.base.origin);
     let along = offset.dot(axis);
     if (offset - axis * along).length() > tolerance {

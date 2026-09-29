@@ -265,13 +265,39 @@ fn split_face_in_place(
 
     // Where the cut meets the boundary, as points in space.
     let mut landings: Vec<Landing> = Vec::new();
-    for shifted_cutter in periodic_images(&flat_cutter, periods) {
+    // Two circles on one sphere cross where the line their planes share
+    // pierces it. Solved there exactly rather than between the sampled
+    // chains their parameter-space images are, which only come near.
+    let sphere_circle = match (&surface, cutter) {
+        (super::geometry::Surface::Sphere(sphere), Curve3::Circle(circle)) => {
+            Some((sphere, circle))
+        }
+        _ => None,
+    };
+    let mut crossings_of = |shifted_cutter: Option<&crate::geom2d::Curve>| -> Option<()> {
         for (coedge, flat_edge) in &boundary_parts {
             let edge_key = body.coedges.get(*coedge)?.edge;
             let edge = body.edges.get(edge_key)?.clone();
             let curve = body.curves.get(edge.curve)?.clone();
-            for crossing in cross(&shifted_cutter, flat_edge, Tolerance::new(tolerance)) {
-                let point = surface.point_at(crossing.point[0], crossing.point[1]);
+            // An edge on the cutter's own curve is where an earlier cut
+            // already ran; it has no crossing to give, and sampling two
+            // copies of one curve against each other never settles.
+            if same_circle(cutter, &curve, tolerance) {
+                continue;
+            }
+            let points: Vec<[f64; 3]> = match (shifted_cutter, sphere_circle, &curve) {
+                (None, Some((sphere, circle)), Curve3::Circle(rim)) => {
+                    circles_meet_on_sphere(sphere, circle, rim, tolerance)
+                }
+                (Some(_), Some(_), Curve3::Circle(_)) | (None, _, _) => continue,
+                (Some(shifted_cutter), _, _) => {
+                    cross(shifted_cutter, flat_edge, Tolerance::new(tolerance))
+                        .into_iter()
+                        .map(|crossing| surface.point_at(crossing.point[0], crossing.point[1]))
+                        .collect()
+                }
+            };
+            for point in points {
                 let along = parameter_in_span(
                     &curve,
                     point,
@@ -303,6 +329,11 @@ fn split_face_in_place(
                 });
             }
         }
+        Some(())
+    };
+    crossings_of(None)?;
+    for shifted_cutter in periodic_images(&flat_cutter, periods) {
+        crossings_of(Some(&shifted_cutter))?;
     }
     let inside = |parameter: f64| {
         let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
@@ -518,12 +549,16 @@ fn split_face_in_place(
     // two landings and cuts again — the same face for ever. Asked of the
     // midpoint rather than the ends, since a genuine cut also touches the
     // boundary at both of those.
+    // Asked of the edges' own curves too: a sampled boundary image sits off
+    // its edge by more than the tolerance between samples.
     let midway = cutter.point_at(0.5 * (start_parameter + end_parameter));
     let (u, v) = surface.parameters_at(midway)?;
     if periodic_points([u, v], periods).into_iter().any(|point| {
         original_boundary
             .iter()
             .any(|edge| distance_to(edge, point) <= tolerance)
+    }) || boundary_parts.iter().any(|(coedge, _)| {
+        on_edge(body, *coedge, midway, tolerance).unwrap_or(false)
     })
     {
         return None;
@@ -563,7 +598,12 @@ fn split_face_in_place(
             return Some(at);
         }
         let next = (at + 1) % ring.len();
-        begins_at(body, ring[next], vertex).then_some(next)
+        if begins_at(body, ring[next], vertex) {
+            return Some(next);
+        }
+        // Both ends landed on one edge, and splitting it at the first moved
+        // the second onto a piece further round.
+        ring.iter().position(|coedge| begins_at(body, *coedge, vertex))
     };
     let at_first = landing_index(&landings[0], first)?;
     let at_second = landing_index(&landings[1], second)?;
@@ -589,9 +629,16 @@ fn split_face_in_place(
     // where the arc began. The two therefore run it opposite ways, which is
     // what makes the new edge a shared one rather than two coincident walls.
     let sense = |from: VertexKey| start == from;
+    // A cut starting and ending at one vertex gives no ends to go by; the
+    // near arc has to be on the face's side of the cut instead.
+    let near_forward = if same_vertex_landing {
+        near_side_forward(body, &surface, cutter, start_parameter, &near, node.forward)?
+    } else {
+        sense(second)
+    };
     let near_closer = body.coedges.insert(Coedge {
         edge: cut,
-        forward: if same_vertex_landing { true } else { sense(second) },
+        forward: near_forward,
         pcurve: None,
         owner: ring_key,
         provenance: Provenance::Synthesized,
@@ -624,7 +671,7 @@ fn split_face_in_place(
     });
     let far_closer = body.coedges.insert(Coedge {
         edge: cut,
-        forward: if same_vertex_landing { false } else { sense(first) },
+        forward: if same_vertex_landing { !near_forward } else { sense(first) },
         pcurve: None,
         owner: other_ring,
         provenance: Provenance::Synthesized,
@@ -760,7 +807,7 @@ fn split_full_sphere(
     body.validate().is_empty().then_some([face, other])
 }
 
-fn reverse_closed_pcurve(curve: &crate::geom2d::Curve) -> Option<crate::geom2d::Curve> {
+pub(super) fn reverse_closed_pcurve(curve: &crate::geom2d::Curve) -> Option<crate::geom2d::Curve> {
     use crate::geom2d::{Curve, Line, Polyline};
     Some(match curve {
         Curve::Line(line) => Curve::Line(Line {
@@ -958,6 +1005,106 @@ fn parameter_in_span(curve: &Curve3, point: [f64; 3], start: f64, end: f64) -> f
     };
     let middle = 0.5 * (start + end);
     parameter + period * ((middle - parameter) / period).round()
+}
+
+/// Whether the near arc's closer runs with the cutter: true when the arc
+/// lies on the left of the cut in the surface's parameter space, where a
+/// forward face keeps its region.
+fn near_side_forward(
+    body: &Body,
+    surface: &super::geometry::Surface,
+    cutter: &Curve3,
+    at: f64,
+    near: &[CoedgeKey],
+    face_forward: bool,
+) -> Option<bool> {
+    let period = pcurve::periods(surface)[0];
+    let unwind = |value: f64, beside: f64| match period {
+        Some(period) => value + period * ((beside - value) / period).round(),
+        None => value,
+    };
+    let (u0, v0) = surface.parameters_at(cutter.point_at(at))?;
+    let (u1, v1) = surface.parameters_at(cutter.point_at(at + 1.0e-4))?;
+    let along = [unwind(u1, u0) - u0, v1 - v0];
+    let sample = body.coedges.get(*near.get(near.len() / 2)?)?;
+    let edge = body.edges.get(sample.edge)?;
+    let point = body
+        .curves
+        .get(edge.curve)?
+        .point_at(0.5 * (edge.start_parameter + edge.end_parameter));
+    let (u, v) = surface.parameters_at(point)?;
+    let side = along[0] * (v - v0) - along[1] * (unwind(u, u0) - u0);
+    (side != 0.0).then_some((side > 0.0) == face_forward)
+}
+
+/// Whether `point` lies on the edge under `coedge`, within its span.
+fn on_edge(body: &Body, coedge: CoedgeKey, point: [f64; 3], tolerance: f64) -> Option<bool> {
+    let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
+    let curve = body.curves.get(edge.curve)?;
+    let parameter = parameter_in_span(curve, point, edge.start_parameter, edge.end_parameter);
+    let (low, high) = (
+        edge.start_parameter.min(edge.end_parameter),
+        edge.start_parameter.max(edge.end_parameter),
+    );
+    Some(
+        parameter >= low
+            && parameter <= high
+            && Vec3::from(curve.point_at(parameter)).distance(Vec3::from(point)) <= tolerance,
+    )
+}
+
+/// Whether two curves are one circle, whichever way round each runs.
+pub(super) fn same_circle(one: &Curve3, other: &Curve3, tolerance: f64) -> bool {
+    let (Curve3::Circle(one), Curve3::Circle(other)) = (one, other) else {
+        return false;
+    };
+    let (Some(first), Some(second)) = (one.plane.normal(), other.plane.normal()) else {
+        return false;
+    };
+    (one.radius - other.radius).abs() <= tolerance
+        && Vec3::from(one.plane.origin).distance(Vec3::from(other.plane.origin)) <= tolerance
+        && Vec3::from(first).is_parallel_to(Vec3::from(second), tolerance)
+}
+
+/// Where two circles lying on `sphere` cross: the points where the line
+/// common to their planes meets it. None for circles on parallel planes,
+/// which either coincide or never meet.
+fn circles_meet_on_sphere(
+    sphere: &super::geometry::Sphere,
+    one: &super::geometry::Circle3,
+    other: &super::geometry::Circle3,
+    tolerance: f64,
+) -> Vec<[f64; 3]> {
+    let (Some(first), Some(second)) = (one.plane.normal(), other.plane.normal()) else {
+        return Vec::new();
+    };
+    let (first, second) = (Vec3::from(first), Vec3::from(second));
+    if first.cross(second).length() <= tolerance {
+        return Vec::new();
+    }
+    let Some(along) = first.cross(second).normalize() else {
+        return Vec::new();
+    };
+    let cosine = first.dot(second);
+    let offsets = [
+        first.dot(Vec3::from(one.plane.origin)),
+        second.dot(Vec3::from(other.plane.origin)),
+    ];
+    let square = 1.0 - cosine * cosine;
+    let base = first * ((offsets[0] - offsets[1] * cosine) / square)
+        + second * ((offsets[1] - offsets[0] * cosine) / square);
+    let from_centre = base - Vec3::from(sphere.frame.origin);
+    let half = along.dot(from_centre);
+    let discriminant = half * half - (from_centre.dot(from_centre) - sphere.radius * sphere.radius);
+    if discriminant < -tolerance * sphere.radius {
+        return Vec::new();
+    }
+    let root = discriminant.max(0.0).sqrt();
+    let mut points = vec![(base + along * (-half - root)).to_array()];
+    if root > tolerance {
+        points.push((base + along * (-half + root)).to_array());
+    }
+    points
 }
 
 /// Where the cut met the boundary.

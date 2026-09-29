@@ -633,6 +633,92 @@ pub fn sphere(centre: [f64; 3], radius: f64) -> Option<Body> {
     body.validate().is_empty().then_some(body)
 }
 
+/// The same sphere as [`sphere`], divided into eight triangular faces by
+/// three perpendicular great circles.
+///
+/// A whole sphere has one face whose parameter space ends at two poles and
+/// meets itself along a seam, and a cut that runs round a pole or across the
+/// seam has no plain region there. Here each face has its own frame, with the
+/// poles and seam well outside it, so every piece a boolean cuts from it is
+/// an ordinary region of `(u, v)`. The dividing circles are tilted off the
+/// world axes, so the planar cuts drawings mostly make do not run along them.
+pub(crate) fn sphere_in_octants(centre: [f64; 3], radius: f64) -> Option<Body> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return None;
+    }
+    let first = Vec3::new(0.9, 0.35, 0.26).normalize()?;
+    let second = {
+        let rough = Vec3::new(-0.31, 0.83, 0.17);
+        (rough - first * rough.dot(first)).normalize()?
+    };
+    let axes = [first, second, first.cross(second)];
+    let centre_vec = Vec3::from(centre);
+    let mut body = Body::new();
+
+    // The six places the circles cross, as (axis, positive side).
+    let mut corners = HashMap::new();
+    for axis in 0..3 {
+        for positive in [true, false] {
+            let direction = if positive { axes[axis] } else { -axes[axis] };
+            let point = (centre_vec + direction * radius).to_array();
+            corners.insert((axis, positive), add_vertex(&mut body, point));
+        }
+    }
+    // Circle `k` is the one square to axis `k`; it starts on axis `k + 1` and
+    // turns towards axis `k + 2`, a quarter at a time.
+    let mut edges: HashMap<(VertexKey, VertexKey), EdgeKey> = HashMap::new();
+    for axis in 0..3 {
+        let (along, towards) = ((axis + 1) % 3, (axis + 2) % 3);
+        let plane = Plane::orthonormal(centre, axes[along].to_array(), axes[axis].to_array())?;
+        let curve = body.curves.insert(Curve3::Circle(Circle3 { plane, radius }));
+        let round = [(along, true), (towards, true), (along, false), (towards, false)];
+        for quarter in 0..4 {
+            let start = corners[&round[quarter]];
+            let end = corners[&round[(quarter + 1) % 4]];
+            let edge = body.edges.insert(Edge {
+                curve,
+                start_parameter: FRAC_PI_2 * quarter as f64,
+                end_parameter: FRAC_PI_2 * (quarter + 1) as f64,
+                start,
+                end,
+                coedges: Vec::new(),
+                provenance: Provenance::Synthesized,
+            });
+            edges.insert((start, end), edge);
+        }
+    }
+
+    let (lump, shell) = add_shell(&mut body);
+    for signs in 0..8 {
+        let sign = |axis: usize| if signs >> axis & 1 == 0 { 1.0 } else { -1.0 };
+        let middle = (axes[0] * sign(0) + axes[1] * sign(1) + axes[2] * sign(2)).normalize()?;
+        // The pole axis lies square to the face's middle, leaning away from
+        // all three of its corners, and the seam sits behind it.
+        let pole = axes[0] * sign(0) - axes[1] * (0.8 * sign(1)) - axes[2] * (0.2 * sign(2));
+        let frame = Plane::orthonormal(centre, (-middle).to_array(), pole.to_array())?;
+        let surface = body
+            .surfaces
+            .insert(Surface::Sphere(Sphere { frame, radius }));
+        // Round the corners anticlockwise seen from outside.
+        let mut ring = [(0, sign(0) > 0.0), (1, sign(1) > 0.0), (2, sign(2) > 0.0)];
+        if sign(0) * sign(1) * sign(2) < 0.0 {
+            ring.swap(1, 2);
+        }
+        let mut senses = Vec::with_capacity(3);
+        for index in 0..3 {
+            let from = corners[&ring[index]];
+            let to = corners[&ring[(index + 1) % 3]];
+            senses.push(match (edges.get(&(from, to)), edges.get(&(to, from))) {
+                (Some(edge), _) => (*edge, true),
+                (None, Some(edge)) => (*edge, false),
+                (None, None) => return None,
+            });
+        }
+        close_shell(&mut body, lump, shell, surface, true, &senses)?;
+    }
+    body.validate().is_empty().then_some(body)
+}
+
 /// A circular or elliptical cylinder standing on `base`.
 ///
 /// The two radii are the semi-axes of both planar end faces. Circular input

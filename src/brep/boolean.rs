@@ -51,6 +51,13 @@ pub enum Operation {
 /// not the body the caller handed over, and returning it silently would be
 /// worse than asking for ownership.
 pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+    let (divided_a, divided_b) = (divided_sphere(&a, &b, tolerance), divided_sphere(&b, &a, tolerance));
+    if let Some(divided) = divided_a {
+        a = divided;
+    }
+    if let Some(divided) = divided_b {
+        b = divided;
+    }
     let original_a = a.clone();
     let original_b = b.clone();
     imprint(&mut a, &mut b, tolerance)?;
@@ -113,6 +120,34 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
     }
     regroup_shells(&mut result, tolerance)?;
     Ok(result)
+}
+
+/// A whole sphere that `other` cuts, rebuilt in eight faces, each with its
+/// poles and seam outside it, so the cuts it takes stay plain regions of
+/// `(u, v)`. One left whole — nested, apart — keeps its single face.
+fn divided_sphere(body: &Body, other: &Body, tolerance: f64) -> Option<Body> {
+    let mut faces = body.face_keys();
+    let face = body.faces.get(faces.next()?)?;
+    if faces.next().is_some() || !face.forward {
+        return None;
+    }
+    let surface = body.surfaces.get(face.surface)?;
+    let Surface::Sphere(sphere) = surface else {
+        return None;
+    };
+    let cut = other.face_keys().any(|key| {
+        other
+            .faces
+            .get(key)
+            .and_then(|face| other.surfaces.get(face.surface))
+            .is_some_and(|wall| {
+                matches!(
+                    super::intersect::surfaces(surface, wall, tolerance),
+                    super::intersect::Meeting::Curves(_)
+                )
+            })
+    });
+    cut.then(|| super::make::sphere_in_octants(sphere.frame.origin, sphere.radius))?
 }
 
 /// A Boolean initially sews all retained faces into one provisional shell.
@@ -250,7 +285,7 @@ pub(super) fn orient_shell(body: &mut Body) -> Result<(), Snag> {
                 let coedge = body.coedges.get_mut(*key).ok_or(Snag::CutRefused)?;
                 coedge.forward = !coedge.forward;
                 if let Some(curve) = coedge.pcurve.take() {
-                    coedge.pcurve = Some(reversed_pcurve(&curve).ok_or(Snag::CutRefused)?);
+                    coedge.pcurve = Some(super::split::reverse_closed_pcurve(&curve).ok_or(Snag::CutRefused)?);
                 }
             }
             body
@@ -525,7 +560,7 @@ fn copy_face_with_tolerance(result: &mut Body, source: &Body, face: FaceKey, she
                 .is_some_and(|node| node.start != start);
             let reverse_pcurve = flip != reversed;
             let pcurve = match (&source_coedge.pcurve, reverse_pcurve) {
-                (Some(curve), true) => Some(reversed_pcurve(curve).ok_or(Snag::CutRefused)?),
+                (Some(curve), true) => Some(super::split::reverse_closed_pcurve(curve).ok_or(Snag::CutRefused)?),
                 (Some(curve), false) => Some(curve.clone()),
                 (None, _) => None,
             };
@@ -571,18 +606,6 @@ fn copy_face_with_tolerance(result: &mut Body, source: &Body, face: FaceKey, she
         .faces
         .push(new_face);
     Ok(())
-}
-
-fn reversed_pcurve(curve: &crate::geom2d::Curve) -> Option<crate::geom2d::Curve> {
-    use crate::geom2d::{Curve, Line};
-    Some(match curve {
-        Curve::Line(line) => Curve::Line(Line {
-            start: line.end,
-            end: line.start,
-        }),
-        Curve::Nurbs(curve) => Curve::Nurbs(curve.reversed()),
-        _ => return None,
-    })
 }
 
 /// An edge already joining the two vertices along the same path, if there is

@@ -57,11 +57,17 @@ pub struct Imprint {
 pub fn imprint(a: &mut Body, b: &mut Body, tolerance: f64) -> Result<Imprint, Snag> {
     let meetings = shared_curves(a, b, tolerance)?;
     let count = meetings.len();
-    let mut cuts = 0;
-    for meeting in &meetings {
-        cuts += cut_along(a, &meeting.curves, tolerance)?;
-        cuts += cut_along(b, &meeting.curves, tolerance)?;
+    // Face pairs on the same two surfaces all report the same curve — every
+    // part of a divided sphere meets a plane in one circle — and each copy
+    // would be tried against every face again for nothing.
+    let mut curves: Vec<Curve3> = Vec::new();
+    for curve in meetings.iter().flat_map(|meeting| &meeting.curves) {
+        if !curves.iter().any(|seen| same_curve(seen, curve, tolerance)) {
+            curves.push(curve.clone());
+        }
     }
+    let mut cuts = cut_along(a, &curves, tolerance)?;
+    cuts += cut_along(b, &curves, tolerance)?;
     // Stitching needs matching edge partitions on both bodies.
     align_edge_vertices(a, b, tolerance);
     align_edge_vertices(b, a, tolerance);
@@ -119,6 +125,23 @@ fn align_edge_vertices(source: &Body, target: &mut Body, tolerance: f64) {
             }
             split_edge(target, key, parameter);
         }
+    }
+}
+
+/// Whether two curves trace the same points: one circle, or one line.
+fn same_curve(one: &Curve3, other: &Curve3, tolerance: f64) -> bool {
+    match (one, other) {
+        (Curve3::Circle(_), Curve3::Circle(_)) => super::split::same_circle(one, other, tolerance),
+        (Curve3::Line(one), Curve3::Line(other)) => {
+            let direction = Vec3::from(one.direction);
+            let Some(unit) = direction.normalize() else {
+                return false;
+            };
+            let offset = Vec3::from(other.origin) - Vec3::from(one.origin);
+            direction.is_parallel_to(Vec3::from(other.direction), tolerance)
+                && (offset - unit * offset.dot(unit)).length() <= tolerance
+        }
+        _ => false,
     }
 }
 

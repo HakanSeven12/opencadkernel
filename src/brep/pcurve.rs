@@ -225,15 +225,25 @@ fn sampled_sphere_circle(surface: &Surface, curve: &Curve3) -> Option<Curve> {
     let (mut final_u, final_v) = surface.parameters_at(curve.point_at(TAU))?;
     final_u = unwound(final_u, previous?, TAU);
     let first = points[0];
-    if (final_u - first[0]).abs() > 1.0e-6 || (final_v - first[1]).abs() > 1.0e-6 {
+    if (final_v - first[1]).abs() > 1.0e-6 {
         return None;
+    }
+    // A circle round the pole axis comes back a turn along, like a band of
+    // latitude: one turn, left open, which its periodic images continue.
+    let closed = match (final_u - first[0]).abs() {
+        gap if gap <= 1.0e-6 => true,
+        gap if (gap - TAU).abs() <= 1.0e-6 => false,
+        _ => return None,
+    };
+    if !closed {
+        points.push([final_u, final_v]);
     }
     Some(Curve::Polyline(Polyline {
         vertices: points
             .into_iter()
             .map(PolylineVertex::straight)
             .collect(),
-        closed: true,
+        closed,
     }))
 }
 
@@ -326,9 +336,9 @@ fn chain_round(pieces: &mut [Curve], periods: [Option<f64>; 2]) {
         return;
     }
     let mut head = pieces[0].point_at(1.0);
-    let mut behind = [pieces[0].point_at(0.0), head];
+    let mut behind = [pieces[0].point_at(0.0), head, pieces[0].point_at(0.5)];
     for piece in pieces.iter_mut().skip(1) {
-        let (start, end) = (piece.point_at(0.0), piece.point_at(1.0));
+        let (start, end, middle) = (piece.point_at(0.0), piece.point_at(1.0), piece.point_at(0.5));
         let mut best = (f64::INFINITY, [0.0, 0.0]);
         for across in turns(periods[0]) {
             for along in turns(periods[1]) {
@@ -340,11 +350,15 @@ fn chain_round(pieces: &mut [Curve], periods: [Option<f64>; 2]) {
                 // one: it retraces the piece before it and the ring encloses
                 // nothing, which is how a cone's wall came to be missing from
                 // every mesh.
+                //
+                // Only the same path counts: two arcs between one pair of
+                // corners — a sliver cut from a sphere — share their ends too.
                 let moved = [
                     [start[0] + shift[0], start[1] + shift[1]],
                     [end[0] + shift[0], end[1] + shift[1]],
+                    [middle[0] + shift[0], middle[1] + shift[1]],
                 ];
-                if near(moved[0], behind[1]) && near(moved[1], behind[0]) {
+                if near(moved[0], behind[1]) && near(moved[1], behind[0]) && near(moved[2], behind[2]) {
                     continue;
                 }
                 let gap = (moved[0][0] - head[0]).hypot(moved[0][1] - head[1]);
@@ -356,7 +370,7 @@ fn chain_round(pieces: &mut [Curve], periods: [Option<f64>; 2]) {
         if best.1 != [0.0, 0.0] {
             slide(piece, best.1);
         }
-        behind = [piece.point_at(0.0), piece.point_at(1.0)];
+        behind = [piece.point_at(0.0), piece.point_at(1.0), piece.point_at(0.5)];
         head = behind[1];
     }
 }
@@ -375,15 +389,25 @@ fn turns(period: Option<f64>) -> impl Iterator<Item = f64> {
     (-span..=span).map(move |turn| period.unwrap_or(0.0) * f64::from(turn))
 }
 
-/// Moves a projected piece by whole turns. Only the straight kinds ever need
-/// it: a circle or an ellipse in parameter space comes from a plane, and a
-/// plane does not wrap.
+/// Moves a projected piece by whole turns. Only the straight and sampled
+/// kinds ever need it: a circle or an ellipse in parameter space comes from a
+/// plane, and a plane does not wrap.
 fn slide(piece: &mut Curve, shift: [f64; 2]) {
-    if let Curve::Line(line) = piece {
-        for axis in 0..2 {
-            line.start[axis] += shift[axis];
-            line.end[axis] += shift[axis];
+    match piece {
+        Curve::Line(line) => {
+            for axis in 0..2 {
+                line.start[axis] += shift[axis];
+                line.end[axis] += shift[axis];
+            }
         }
+        Curve::Polyline(polyline) => {
+            for vertex in &mut polyline.vertices {
+                for axis in 0..2 {
+                    vertex.position[axis] += shift[axis];
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -391,6 +415,8 @@ fn slide(piece: &mut Curve, shift: [f64; 2]) {
 /// begins and ends. Three would do for the shapes here; more costs nothing
 /// and keeps the unwrapping below honest when an edge covers most of a turn.
 const WALK: usize = 8;
+/// Steps per whole turn when a sampled projection is walked.
+const SAMPLED_WALK: usize = 256;
 
 /// The part of a projected boundary curve the edge actually covers.
 ///
@@ -409,9 +435,16 @@ fn trim_to(
     // backwards unless it is unwound. One that does not wrap must be left
     // alone: unwinding a plane's coordinates would move the curve.
     let periods = periods(surface);
-    let mut raw: Vec<[f64; 2]> = Vec::with_capacity(WALK + 1);
-    for step in 0..=WALK {
-        let t = span.0 + (span.1 - span.0) * step as f64 / WALK as f64;
+    // A sampled projection is kept as the walk itself, so it walks finely:
+    // evenly round the turn, so a short arc is not sampled like a whole one.
+    let steps = if matches!(flat, Curve::Polyline(_)) {
+        ((span.1 - span.0).abs() / TAU * SAMPLED_WALK as f64).ceil().clamp(16.0, SAMPLED_WALK as f64) as usize
+    } else {
+        WALK
+    };
+    let mut raw: Vec<[f64; 2]> = Vec::with_capacity(steps + 1);
+    for step in 0..=steps {
+        let t = span.0 + (span.1 - span.0) * step as f64 / steps as f64;
         let point = curve.point_at(t);
         if let Some((u, v)) = surface.parameters_at(point) {
             raw.push([u, v]);
@@ -446,7 +479,7 @@ fn trim_to(
         raw[index][0] = longitude;
     }
 
-    let mut walk: Vec<[f64; 2]> = Vec::with_capacity(WALK + 1);
+    let mut walk: Vec<[f64; 2]> = Vec::with_capacity(steps + 1);
     let mut last: Option<[f64; 2]> = None;
     for mut here in raw {
         if let Some(previous) = last {
@@ -459,7 +492,7 @@ fn trim_to(
         last = Some(here);
         walk.push(here);
     }
-    let (first, final_point) = (walk[0], walk[WALK]);
+    let (first, final_point) = (walk[0], walk[steps]);
 
     Some(match flat {
         // The kinds that run past their edge become the segment between the
@@ -500,6 +533,11 @@ fn trim_to(
                 Curve::Nurbs(super::nurbs_builder::RationalCurve2::from_curve(&positive)?.reversed().curve()?)
             } else { positive }
         }
+        // A sampled circle covers the whole turn; the edge is the walk.
+        Curve::Polyline(_) => Curve::Polyline(Polyline {
+            vertices: walk.into_iter().map(PolylineVertex::straight).collect(),
+            closed: false,
+        }),
         // A spline's projection already spans exactly its own edge.
         other => other,
     })
