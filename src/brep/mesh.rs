@@ -1579,6 +1579,11 @@ fn edge_samples_from_pcurves(
         }
         breaks.sort_by(f64::total_cmp);
         breaks.dedup_by(|a, b| parameter_value_near(*a, *b));
+        // A pcurve that disagrees with its edge keeps every piece turning,
+        // however small, and halving it down to MAX_DEPTH is billions of
+        // evaluations. Past the budget the pcurve is given up on and the
+        // edge's own curve is sampled instead.
+        let mut budget = PCURVE_REFINE_BUDGET;
         let resolved = breaks.windows(2).all(|pair| {
             refine_pcurve_edge(
                 body,
@@ -1591,6 +1596,7 @@ fn edge_samples_from_pcurves(
                 0,
                 &mut samples,
                 directions,
+                &mut budget,
             )
             .is_some()
         });
@@ -1620,7 +1626,9 @@ fn refine_pcurve_edge(
     depth: u32,
     samples: &mut Vec<super::place::EdgeSample>,
     coedge_directions: &HashMap<super::topology::CoedgeKey, bool>,
+    budget: &mut usize,
 ) -> Option<()> {
+    *budget = budget.checked_sub(1)?;
     let edge = body.edges.get(edge_key)?;
     let (source_surface, Some(source_pcurve)) = coedge_geometry(body, source_coedge)? else {
         return None;
@@ -1716,6 +1724,7 @@ fn refine_pcurve_edge(
             depth + 1,
             samples,
             coedge_directions,
+            budget,
         )?;
         refine_pcurve_edge(
             body,
@@ -1728,6 +1737,7 @@ fn refine_pcurve_edge(
             depth + 1,
             samples,
             coedge_directions,
+            budget,
         )?;
     } else {
         samples.push(super::place::EdgeSample {
@@ -3485,6 +3495,8 @@ fn distance3(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 /// Recursion guard; tolerance normally stops first.
 const MAX_DEPTH: u32 = 32;
+/// Most pieces one edge's pcurve walk may split into before it is abandoned.
+const PCURVE_REFINE_BUDGET: usize = 1 << 14;
 const MAX_FACE_DEPTH: u32 = 128;
 const MAX_FACE_PASSES: usize = 128;
 const MAX_FACE_ADDITIONS: usize = 262_144;

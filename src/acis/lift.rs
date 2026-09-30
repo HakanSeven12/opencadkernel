@@ -213,6 +213,10 @@ fn lift_face(
                         source_start.is_some() && source_start == kernel_start
                     });
                 let forward = (source_coedge.sense() == Sense::Forward) == edge_forward;
+                // A pcurve whose image leaves its edge is worse than none:
+                // meshing trusts it over the edge and chases a curve that is
+                // not there. Without it the edge's own curve is used.
+                let pcurve = pcurve.filter(|pcurve| pcurve_on_edge(body, surface, edge, pcurve));
                 let coedge = body.coedges.insert(Coedge {
                     edge,
                     forward,
@@ -461,6 +465,33 @@ fn read_curve(document: &SatDocument, record: &SatRecord) -> Option<Curve3> {
         .with_periodicity(closed)));
     }
     None
+}
+
+/// Whether a pcurve's image on `surface` lies on the edge it belongs to, to
+/// a small share of the edge's size. Checked without assuming a direction:
+/// each sample is compared with the nearest point of the edge's curve.
+fn pcurve_on_edge(body: &Body, surface: SurfaceKey, edge: EdgeKey, pcurve: &Curve2) -> bool {
+    let (Some(surface), Some(edge)) = (body.surfaces.get(surface), body.edges.get(edge)) else {
+        return false;
+    };
+    let Some(curve) = body.curves.get(edge.curve) else {
+        return false;
+    };
+    let span = edge.end_parameter - edge.start_parameter;
+    let along: Vec<Vec3> = (0..=8)
+        .map(|i| Vec3::from(curve.point_at(edge.start_parameter + span * i as f64 / 8.0)))
+        .collect();
+    let size = along
+        .iter()
+        .flat_map(|a| along.iter().map(move |b| a.distance(*b)))
+        .fold(0.0, f64::max);
+    let tolerance = 1e-3 * size + 1e-6;
+    [0.0, 0.25, 0.5, 0.75, 1.0].into_iter().all(|t| {
+        let uv = pcurve.point_at(t);
+        let point = surface.point_at(uv[0], uv[1]);
+        let nearest = curve.point_at(curve.parameter_at(point));
+        Vec3::from(point).distance(Vec3::from(nearest)) <= tolerance
+    })
 }
 
 fn read_pcurve(
