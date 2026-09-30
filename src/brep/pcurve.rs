@@ -46,6 +46,15 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
     if !lies_on(surface, curve, tolerance) {
         return None;
     }
+    // A spline edge — an intersection a file saved as one — has no closed
+    // image on an analytic surface, and without one the face had no
+    // boundary at all: no point could be placed in or out of a solid with a
+    // hex socket, so every boolean against it was refused (#1563). Its
+    // image is walked instead, which `trim_to` redoes over the edge's own
+    // span, the same way a general circle on a sphere is kept.
+    if matches!(curve, Curve3::Nurbs(_)) && !matches!(surface, Surface::Nurbs(_)) {
+        return sampled_image(surface, curve);
+    }
     match surface {
         Surface::Plane(plane) => match curve {
             Curve3::Line(line) => Some(Curve::XLine(XLine {
@@ -153,9 +162,16 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
                 let offset = Vec3::from(circle.plane.origin) - Vec3::from(torus.frame.origin);
                 if plane_normal.is_parallel_to(axis, tolerance) {
                     // A parallel. Where it sits round the tube is fixed by
-                    // how far out and how high it is.
+                    // how far out and how high it is — read the way
+                    // `parameters_at` reads it, through the minor radius's
+                    // sign: a torus stored with a negative one (a concave
+                    // fillet) otherwise put every parallel half a turn round
+                    // the tube, where a cut that missed the face fell inside
+                    // it (#1563).
+                    let sign = torus.minor_radius.signum();
                     Some(band_at(
-                        offset.dot(axis).atan2(circle.radius - torus.major_radius),
+                        (offset.dot(axis) * sign)
+                            .atan2((circle.radius - torus.major_radius) * sign),
                     ))
                 } else if plane_normal.dot(axis).abs() <= tolerance {
                     Some(meridian_at(angle_about(&torus.frame, circle.plane.origin)?))
@@ -204,6 +220,35 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
         },
         Surface::Nurbs(_) => None,
     }
+}
+
+/// A spline edge's image in an analytic surface's parameters, walked over
+/// the spline's whole domain and unwound across any seam.
+fn sampled_image(surface: &Surface, curve: &Curve3) -> Option<Curve> {
+    const SAMPLES: usize = 64;
+    let Curve3::Nurbs(spline) = curve else {
+        return None;
+    };
+    let (start, end) = spline.domain();
+    let periods = periods(surface);
+    let mut points: Vec<[f64; 2]> = Vec::with_capacity(SAMPLES + 1);
+    for index in 0..=SAMPLES {
+        let t = start + (end - start) * index as f64 / SAMPLES as f64;
+        let (u, v) = surface.parameters_at(curve.point_at(t))?;
+        let mut here = [u, v];
+        if let Some(previous) = points.last() {
+            for axis in 0..2 {
+                if let Some(period) = periods[axis] {
+                    here[axis] = unwound(here[axis], previous[axis], period);
+                }
+            }
+        }
+        points.push(here);
+    }
+    Some(Curve::Polyline(Polyline {
+        vertices: points.into_iter().map(PolylineVertex::straight).collect(),
+        closed: false,
+    }))
 }
 
 /// A general circle on a sphere is not a conic in longitude/latitude space.

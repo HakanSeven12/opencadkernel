@@ -351,7 +351,60 @@ impl Surface {
                     across_offset.length_squared() - at_start * at_start,
                 ))
             }
-            Self::Torus(_) | Self::Nurbs(_) => None,
+            Self::Torus(torus) => {
+                // The section is a quartic in the ray parameter. Its roots
+                // lie within the torus's bounding sphere, so the span there is
+                // walked for sign changes and each one halved down to a
+                // root. Two roots inside one step, or a graze, show no
+                // change and are missed together — an even number, which
+                // leaves a crossing count's parity as it was.
+                let axis = Vec3::from(torus.frame.normal()?);
+                let (major, minor) = (torus.major_radius.abs(), torus.minor_radius.abs());
+                let offset = start - Vec3::from(torus.frame.origin);
+                let bound = major + minor;
+                let span = roots(
+                    along.length_squared(),
+                    2.0 * offset.dot(along),
+                    offset.length_squared() - bound * bound,
+                );
+                let [first, second] = span[..] else {
+                    return Some(Vec::new());
+                };
+                let (enter, leave) = (first.min(second), first.max(second));
+                let quartic = |t: f64| {
+                    let q = offset + along * t;
+                    let height = q.dot(axis);
+                    let squared = q.length_squared();
+                    let across = squared - height * height;
+                    let sum = squared + major * major - minor * minor;
+                    sum * sum - 4.0 * major * major * across
+                };
+                const STEPS: usize = 256;
+                let mut hits = Vec::new();
+                let mut previous = (enter, quartic(enter));
+                for step in 1..=STEPS {
+                    let t = enter + (leave - enter) * step as f64 / STEPS as f64;
+                    let value = quartic(t);
+                    if value == 0.0 {
+                        hits.push(t);
+                    } else if previous.1 != 0.0 && (value > 0.0) != (previous.1 > 0.0) {
+                        let (mut low, mut high) = (previous.0, t);
+                        let low_positive = previous.1 > 0.0;
+                        for _ in 0..64 {
+                            let middle = 0.5 * (low + high);
+                            if (quartic(middle) > 0.0) == low_positive {
+                                low = middle;
+                            } else {
+                                high = middle;
+                            }
+                        }
+                        hits.push(0.5 * (low + high));
+                    }
+                    previous = (t, value);
+                }
+                Some(hits)
+            }
+            Self::Nurbs(_) => None,
         }
     }
 

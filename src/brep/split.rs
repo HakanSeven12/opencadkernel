@@ -371,16 +371,50 @@ fn split_face_in_place(
     }
     if landings.is_empty() {
         let period = closed_period(cutter)?;
+        // A closed cutter that already is one of the face's edges was cut
+        // before: the landings skip it as their own curve, and cutting
+        // between the loops again peeled a sliver off the same band for ever
+        // (#1563).
+        let already_cut = boundary_parts.iter().any(|(coedge, _)| {
+            body.coedges
+                .get(*coedge)
+                .and_then(|coedge| body.edges.get(coedge.edge))
+                .and_then(|edge| body.curves.get(edge.curve))
+                .is_some_and(|curve| same_circle(cutter, curve, tolerance))
+        });
+        if already_cut {
+            return None;
+        }
+        // Loops the cutter closes round go with the island it cuts out. On a
+        // band the cutter is straight and runs between the loops; on a plane
+        // it is a closed curve, and an annulus cut by a circle between its
+        // rims keeps one rim on each side (#1563's collar under a washer).
+        let mut enclosed = Vec::new();
         if node.loops.len() > 1 {
-            return split_closed_between_loops(
-                body,
-                face,
-                &node,
-                cutter,
-                &flat_cutter,
-                &boundary_parts,
-                period,
-            );
+            if !matches!(surface, super::geometry::Surface::Plane(_))
+                || matches!(flat_cutter, crate::geom2d::Curve::Line(_))
+            {
+                return split_closed_between_loops(
+                    body,
+                    face,
+                    &node,
+                    cutter,
+                    &flat_cutter,
+                    &boundary_parts,
+                    period,
+                );
+            }
+            for ring in &node.loops {
+                let first = *body.loops.get(*ring)?.coedges.first()?;
+                let boundary = &boundary_parts.iter().find(|(key, _)| *key == first)?.1;
+                if crate::geom2d::contains(
+                    std::slice::from_ref(&flat_cutter),
+                    boundary.point_at(0.5),
+                    Tolerance::new(tolerance),
+                ) {
+                    enclosed.push(*ring);
+                }
+            }
         }
         let start_parameter = (0..16)
             .map(|index| period * index as f64 / 16.0)
@@ -471,7 +505,12 @@ fn split_face_in_place(
             provenance: Provenance::Synthesized,
         });
         body.loops.get_mut(other_ring)?.coedges = vec![inner];
-        body.faces.get_mut(other)?.loops = vec![other_ring];
+        body.faces.get_mut(face)?.loops.retain(|ring| !enclosed.contains(ring));
+        for ring in &enclosed {
+            body.loops.get_mut(*ring)?.owner = other;
+        }
+        body.faces.get_mut(other)?.loops =
+            std::iter::once(other_ring).chain(enclosed.iter().copied()).collect();
         body.shells.get_mut(node.owner)?.faces.push(other);
         body.edges.get_mut(cut)?.coedges = vec![hole, inner];
         return Some([face, other]);

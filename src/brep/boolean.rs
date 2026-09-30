@@ -60,6 +60,12 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
     }
     let original_a = a.clone();
     let original_b = b.clone();
+    // A solid may arrive with edges more than two faces share: a ball held
+    // against the walls of its pocket along a line (#1563). Those stay as
+    // they came, so the result may carry them too.
+    let shared_edges = [&a, &b]
+        .iter()
+        .any(|body| body.edges.iter().any(|(_, edge)| edge.coedges.len() > 2));
     imprint(&mut a, &mut b, tolerance)?;
 
     let (keep_a, keep_b, flip_b) = match how {
@@ -113,7 +119,10 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
         return Ok(Body::new());
     }
     orient_shell(&mut result)?;
-    if result.edges.iter().any(|(_, edge)| edge.coedges.len() != 2)
+    if result.edges.iter().any(|(_, edge)| {
+        let uses = edge.coedges.len();
+        uses != 2 && !(shared_edges && uses > 2 && uses % 2 == 0)
+    })
         || !result.validate().is_empty()
     {
         return Err(Snag::CutRefused);
@@ -426,6 +435,9 @@ pub(super) fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Opti
             }
         }
     }
+    if super::classify::whole_closed_face(body, face) {
+        return whole_face_point(body, face, surface, tolerance);
+    }
     let boundary = pcurve::face_boundary(body, face, tolerance)?;
     let samples: Vec<[f64; 2]> = boundary
         .iter()
@@ -464,10 +476,69 @@ pub(super) fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Opti
             })
         })
     });
+    // A thin ring — an annulus cut just inside one rim — has its centroid in
+    // the hole and every point between the two there too. Halfway between two
+    // boundary points, one on each rim, lands in it (#1563).
+    let chosen = chosen.or_else(|| {
+        samples.iter().enumerate().find_map(|(index, first)| {
+            samples[index + 1..].iter().find_map(|second| {
+                usable([0.5 * (first[0] + second[0]), 0.5 * (first[1] + second[1])])
+            })
+        })
+    });
     if let Some(chosen) = chosen {
         return Some(surface.point_at(chosen[0], chosen[1]));
     }
     pcurve::periodic_band_point(surface, &boundary, tolerance)
+}
+
+/// A point on a face that is its whole sphere or torus, clear of the slit
+/// edges it may carry.
+fn whole_face_point(
+    body: &Body,
+    face: FaceKey,
+    surface: &Surface,
+    tolerance: f64,
+) -> Option<[f64; 3]> {
+    let edges: Vec<[f64; 3]> = body
+        .faces
+        .get(face)?
+        .loops
+        .iter()
+        .filter_map(|ring| body.loops.get(*ring))
+        .flat_map(|ring| ring.coedges.iter())
+        .filter_map(|coedge| body.coedges.get(*coedge))
+        .filter_map(|coedge| body.edges.get(coedge.edge))
+        .filter_map(|edge| {
+            let curve = body.curves.get(edge.curve)?;
+            Some((0..=8).map(move |step| {
+                curve.point_at(
+                    edge.start_parameter
+                        + (edge.end_parameter - edge.start_parameter) * step as f64 / 8.0,
+                )
+            }))
+        })
+        .flatten()
+        .collect();
+    let size = edges.first().map_or(1.0, |first| {
+        edges
+            .iter()
+            .map(|point| Vec3::from(*point).distance(Vec3::from(*first)))
+            .fold(0.0, f64::max)
+    });
+    (0..8)
+        .flat_map(|around| (1..4).map(move |across| (around, across)))
+        .map(|(around, across)| {
+            surface.point_at(
+                std::f64::consts::TAU * (around as f64 + 0.5) / 8.0,
+                std::f64::consts::PI * (across as f64 / 4.0 - 0.5),
+            )
+        })
+        .find(|point| {
+            edges.iter().all(|edge| {
+                Vec3::from(*edge).distance(Vec3::from(*point)) > size * 0.05 + tolerance
+            })
+        })
 }
 
 /// Copies a face and everything bounding it into the result.
