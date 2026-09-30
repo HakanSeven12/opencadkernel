@@ -213,10 +213,12 @@ fn lift_face(
                         source_start.is_some() && source_start == kernel_start
                     });
                 let forward = (source_coedge.sense() == Sense::Forward) == edge_forward;
-                // A pcurve whose image leaves its edge is worse than none:
-                // meshing trusts it over the edge and chases a curve that is
-                // not there. Without it the edge's own curve is used.
-                let pcurve = pcurve.filter(|pcurve| pcurve_on_edge(body, surface, edge, pcurve));
+                // A pcurve may run past its edge (a whole ellipse under an
+                // arc), so it is cut down to the edge's span. One whose image
+                // leaves the edge is worse than none: meshing trusts it over
+                // the edge and chases a curve that is not there. Without it
+                // the edge's own curve is used.
+                let pcurve = pcurve.and_then(|pcurve| pcurve_on_edge(body, surface, edge, &pcurve));
                 let coedge = body.coedges.insert(Coedge {
                     edge,
                     forward,
@@ -475,35 +477,106 @@ fn read_curve(document: &SatDocument, record: &SatRecord) -> Option<Curve3> {
     None
 }
 
-/// Whether a pcurve traces its edge on `surface`, to a small share of the
-/// edge's size. The coedge reads the pcurve over its whole parameter range
-/// as the edge's span, so each sample is compared with the edge point at the
-/// same fraction — one way round or the other. A pcurve longer than its edge
-/// (one shared by two halves of a rim) or in another surface's parameters
-/// fails, and the edge's own curve is used instead.
-fn pcurve_on_edge(body: &Body, surface: SurfaceKey, edge: EdgeKey, pcurve: &Curve2) -> bool {
-    let (Some(surface), Some(edge)) = (body.surfaces.get(surface), body.edges.get(edge)) else {
-        return false;
-    };
-    let Some(curve) = body.curves.get(edge.curve) else {
-        return false;
+/// The part of a pcurve that traces its edge on `surface`, to a small share
+/// of the edge's size: cut between where it passes the edge's two ends
+/// (either way round), with every sample on the edge's own span. The whole
+/// pcurve is taken when it fits; one covering more than its edge (a whole
+/// ellipse under an arc) is cut down. One drawn in another surface's
+/// parameters gives `None`, and the edge's curve is used instead. The two
+/// need not run at the same speed — a seam's pcurve is linear where its
+/// circle is not.
+fn pcurve_on_edge(
+    body: &Body,
+    surface: SurfaceKey,
+    edge: EdgeKey,
+    pcurve: &Curve2,
+) -> Option<Curve2> {
+    let surface = body.surfaces.get(surface)?;
+    let edge = body.edges.get(edge)?;
+    let curve = body.curves.get(edge.curve)?;
+    let Curve2::Nurbs(nurbs) = pcurve else {
+        return None;
     };
     let span = edge.end_parameter - edge.start_parameter;
-    let at = |t: f64| Vec3::from(curve.point_at(edge.start_parameter + span * t));
-    let along: Vec<Vec3> = (0..=8).map(|i| at(i as f64 / 8.0)).collect();
+    let along: Vec<Vec3> = (0..=64)
+        .map(|i| Vec3::from(curve.point_at(edge.start_parameter + span * i as f64 / 64.0)))
+        .collect();
     let size = along
         .iter()
-        .flat_map(|a| along.iter().map(move |b| a.distance(*b)))
+        .step_by(8)
+        .flat_map(|a| along.iter().step_by(8).map(move |b| a.distance(*b)))
         .fold(0.0, f64::max);
     let tolerance = 1e-3 * size + 1e-6;
-    let (mut forward, mut backward) = (0.0_f64, 0.0_f64);
-    for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
-        let uv = pcurve.point_at(t);
-        let point = Vec3::from(surface.point_at(uv[0], uv[1]));
-        forward = forward.max(point.distance(at(t)));
-        backward = backward.max(point.distance(at(1.0 - t)));
-    }
-    forward.min(backward) <= tolerance
+    let image_of = |curve: &NurbsCurve, t: f64| {
+        let uv = curve.point_at(t);
+        Vec3::from(surface.point_at(uv[0], uv[1]))
+    };
+    const STEPS: usize = 256;
+    let samples: Vec<Vec3> = (0..=STEPS)
+        .map(|i| image_of(nurbs, i as f64 / STEPS as f64))
+        .collect();
+    // Every stretch of the pcurve that passes within tolerance of `target`
+    // gives one candidate: its closest sample, refined between neighbours.
+    let landings = |target: Vec3| {
+        let mut found = Vec::new();
+        let mut run: Option<(usize, f64)> = None;
+        for (i, sample) in samples.iter().enumerate() {
+            let distance = sample.distance(target);
+            if distance <= tolerance {
+                if run.is_none_or(|(_, best)| distance < best) {
+                    run = Some((i, distance));
+                }
+            } else if let Some((best, _)) = run.take() {
+                found.push(best);
+            }
+        }
+        found.extend(run.map(|(best, _)| best));
+        found
+            .into_iter()
+            .map(|i| {
+                let (mut low, mut high) = (
+                    i.saturating_sub(1) as f64 / STEPS as f64,
+                    (i + 1).min(STEPS) as f64 / STEPS as f64,
+                );
+                for _ in 0..40 {
+                    let (a, b) = (low + (high - low) / 3.0, high - (high - low) / 3.0);
+                    if image_of(nurbs, a).distance(target) < image_of(nurbs, b).distance(target) {
+                        high = b;
+                    } else {
+                        low = a;
+                    }
+                }
+                (low + high) / 2.0
+            })
+            .collect::<Vec<_>>()
+    };
+    let on_edge = |point: Vec3| {
+        along.windows(2).any(|pair| {
+            let (a, b) = (pair[0], pair[1]);
+            let ab = b - a;
+            let t = ((point - a).dot(ab) / ab.dot(ab).max(f64::MIN_POSITIVE)).clamp(0.0, 1.0);
+            point.distance(a + ab * t) <= tolerance
+        })
+    };
+    let whole = |from: f64, to: f64| from < 1e-6 && to > 1.0 - 1e-6;
+    let (starts, ends) = (landings(along[0]), landings(along[along.len() - 1]));
+    let mut spans: Vec<(f64, f64)> = starts
+        .iter()
+        .flat_map(|start| ends.iter().map(move |end| (start.min(*end), start.max(*end))))
+        .filter(|(from, to)| to - from > 1e-9)
+        .collect();
+    // The pcurve as written wins over any cut of it.
+    spans.sort_by_key(|(from, to)| !whole(*from, *to));
+    spans.into_iter().find_map(|(from, to)| {
+        let trimmed = if whole(from, to) {
+            nurbs.clone()
+        } else {
+            nurbs.trimmed(from, to)?
+        };
+        (1..16)
+            .all(|i| on_edge(image_of(&trimmed, i as f64 / 16.0)))
+            .then_some(Curve2::Nurbs(trimmed))
+    })
 }
 
 fn read_pcurve(
