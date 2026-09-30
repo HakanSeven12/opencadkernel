@@ -444,7 +444,15 @@ fn read_curve(document: &SatDocument, record: &SatRecord) -> Option<Curve3> {
     }
     if let Some(spline) = SatIntCurve::from_record(record) {
         let closed = spline.is_closed_in(document);
-        let (degree, knots, controls) = spline.bspline_in(document)?;
+        let (degree, mut knots, mut controls) = spline.bspline_in(document)?;
+        // A reversed intcurve runs against its spline: it is c(t) = s(-t),
+        // and the edges on it store parameters in that negated range. Read
+        // as the spline alone, a rim ran the wrong way round its face and
+        // the face's boundary no longer closed (#1538).
+        if record.token_sense(1) == Sense::Reversed {
+            controls.reverse();
+            knots = knots.into_iter().rev().map(|knot| -knot).collect();
+        }
         let mut points = Vec::with_capacity(controls.len());
         let mut weights = Vec::with_capacity(controls.len());
         for control in controls {
@@ -467,9 +475,12 @@ fn read_curve(document: &SatDocument, record: &SatRecord) -> Option<Curve3> {
     None
 }
 
-/// Whether a pcurve's image on `surface` lies on the edge it belongs to, to
-/// a small share of the edge's size. Checked without assuming a direction:
-/// each sample is compared with the nearest point of the edge's curve.
+/// Whether a pcurve traces its edge on `surface`, to a small share of the
+/// edge's size. The coedge reads the pcurve over its whole parameter range
+/// as the edge's span, so each sample is compared with the edge point at the
+/// same fraction — one way round or the other. A pcurve longer than its edge
+/// (one shared by two halves of a rim) or in another surface's parameters
+/// fails, and the edge's own curve is used instead.
 fn pcurve_on_edge(body: &Body, surface: SurfaceKey, edge: EdgeKey, pcurve: &Curve2) -> bool {
     let (Some(surface), Some(edge)) = (body.surfaces.get(surface), body.edges.get(edge)) else {
         return false;
@@ -478,20 +489,21 @@ fn pcurve_on_edge(body: &Body, surface: SurfaceKey, edge: EdgeKey, pcurve: &Curv
         return false;
     };
     let span = edge.end_parameter - edge.start_parameter;
-    let along: Vec<Vec3> = (0..=8)
-        .map(|i| Vec3::from(curve.point_at(edge.start_parameter + span * i as f64 / 8.0)))
-        .collect();
+    let at = |t: f64| Vec3::from(curve.point_at(edge.start_parameter + span * t));
+    let along: Vec<Vec3> = (0..=8).map(|i| at(i as f64 / 8.0)).collect();
     let size = along
         .iter()
         .flat_map(|a| along.iter().map(move |b| a.distance(*b)))
         .fold(0.0, f64::max);
     let tolerance = 1e-3 * size + 1e-6;
-    [0.0, 0.25, 0.5, 0.75, 1.0].into_iter().all(|t| {
+    let (mut forward, mut backward) = (0.0_f64, 0.0_f64);
+    for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
         let uv = pcurve.point_at(t);
-        let point = surface.point_at(uv[0], uv[1]);
-        let nearest = curve.point_at(curve.parameter_at(point));
-        Vec3::from(point).distance(Vec3::from(nearest)) <= tolerance
-    })
+        let point = Vec3::from(surface.point_at(uv[0], uv[1]));
+        forward = forward.max(point.distance(at(t)));
+        backward = backward.max(point.distance(at(1.0 - t)));
+    }
+    forward.min(backward) <= tolerance
 }
 
 fn read_pcurve(

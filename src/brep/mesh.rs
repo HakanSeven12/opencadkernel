@@ -2044,6 +2044,21 @@ fn chain_samples(
     tolerance: f64,
 ) -> Option<Vec<BoundaryPoint>> {
     let surface_periods = periods(surface);
+    // Neighbouring edges meet at their shared vertex, but a file's edges are
+    // often only fitted to within its own tolerance and may end a hair apart
+    // (5e-5 on a 100-unit solid, #1538). The joins accept a gap that small
+    // next to the ring rather than the fitting tolerance alone.
+    let join = {
+        let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for sample in pieces.iter().flat_map(|(samples, _)| samples) {
+            for axis in 0..3 {
+                low[axis] = low[axis].min(sample.position[axis]);
+                high[axis] = high[axis].max(sample.position[axis]);
+            }
+        }
+        let size = distance3(low, high);
+        tolerance.max(if size.is_finite() { size * 1e-5 } else { 0.0 })
+    };
     let mut pieces = pieces.into_iter();
     let (first, pcurve) = pieces.next()?;
     let (mut points, mut explicit) = parameterize_samples(surface, &first, pcurve, tolerance)?;
@@ -2060,8 +2075,19 @@ fn chain_samples(
         // that difference away erases the patch's parameter-space area.
         if !explicit || !next_explicit {
             align_parameters(&mut next, &points, surface_periods, pieces.peek().is_none());
+        } else if let Some(shift) =
+            ordinary_period_jump(surface, points.last()?.parameters, next[0].parameters, surface_periods)
+        {
+            // Two explicit pcurves on either side of an ordinary seam point
+            // that merely name it from different turns: the jump is not a
+            // pole's, so it is folded rather than kept as a boundary segment
+            // spanning a whole period (#1538).
+            for point in &mut next {
+                point.parameters[0] += shift[0];
+                point.parameters[1] += shift[1];
+            }
         }
-        if distance3(head, next[0].position) > tolerance {
+        if distance3(head, next[0].position) > join {
             return None;
         }
         let skip = if explicit
@@ -2076,7 +2102,7 @@ fn chain_samples(
         explicit = next_explicit;
         all_explicit &= next_explicit;
     }
-    if distance3(points.first()?.position, points.last()?.position) > tolerance {
+    if distance3(points.first()?.position, points.last()?.position) > join {
         return None;
     }
     let first = points.first()?.parameters;
@@ -2436,6 +2462,44 @@ fn parameterize_samples(
     }
     let positions: Vec<[f64; 3]> = samples.iter().map(|sample| sample.position).collect();
     parameterize(surface, &positions).map(|points| (points, false))
+}
+
+/// The shift that brings `to` onto `from` when the two differ by whole
+/// periods on one axis at a point where that axis is not singular — moving
+/// along it moves the point, so the two parameters are one ordinary place.
+/// `None` for a real parameter jump or one at a pole (where the patch may
+/// legitimately span a period between its sides).
+fn ordinary_period_jump(
+    surface: &super::geometry::Surface,
+    from: [f64; 2],
+    to: [f64; 2],
+    periods: [Option<f64>; 2],
+) -> Option<[f64; 2]> {
+    for axis in 0..2 {
+        let Some(period) = periods[axis] else {
+            continue;
+        };
+        let other = 1 - axis;
+        let turns = ((from[axis] - to[axis]) / period).round();
+        if turns == 0.0
+            || !parameter_value_near(to[axis] + turns * period, from[axis])
+            || !parameter_value_near(to[other], from[other])
+        {
+            continue;
+        }
+        let mut nudged = from;
+        nudged[axis] += period * 0.01;
+        let here = surface.point_at(from[0], from[1]);
+        let there = surface.point_at(nudged[0], nudged[1]);
+        let singular = distance3(here, there) <= 1e-9 * (1.0 + distance3(here, [0.0; 3]));
+        if singular {
+            return None;
+        }
+        let mut shift = [0.0; 2];
+        shift[axis] = turns * period;
+        return Some(shift);
+    }
+    None
 }
 
 fn align_parameters(
