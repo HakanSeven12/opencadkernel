@@ -4,7 +4,7 @@
 //! [`Loss`].
 
 use opencadcodec::entities::acis::types::{
-    SatBody, SatCoedge, SatConeSurface, SatDocument, SatEdge, SatEllipseCurve, SatFace, SatIntCurve,
+    SatBSplineSurface, SatBody, SatCoedge, SatConeSurface, SatDocument, SatEdge, SatEllipseCurve, SatFace, SatIntCurve,
     SatLoop, SatLump, SatPCurve, SatPlaneSurface, SatPoint, SatPointer, SatRecord, SatShell,
     SatSphereSurface, SatSplineSurface, SatStraightCurve, SatTorusSurface, SatVertex, Sense,
 };
@@ -148,7 +148,11 @@ fn lift_face(
 ) -> Option<()> {
     let surface_record = resolve(document, source.surface())?;
     let reversed_v = analytic_surface_reversed(surface_record);
-    let surface = surface_of(document, body, seen, loss, source.surface())?;
+    let surface = match surface_of(document, body, seen, loss, source.surface()) {
+        Some(surface) => surface,
+        // Still counted as lost: the patch only stands in for the surface.
+        None => body.surfaces.insert(boundary_patch(document, source)?),
+    };
     let face = body.faces.insert(Face {
         surface,
         forward: (source.sense() == Sense::Forward) != reversed_v,
@@ -446,7 +450,10 @@ fn read_curve(document: &SatDocument, record: &SatRecord) -> Option<Curve3> {
     }
     if let Some(spline) = SatIntCurve::from_record(record) {
         let closed = spline.is_closed_in(document);
-        let (degree, mut knots, mut controls) = spline.bspline_in(document)?;
+        let (degree, mut knots, mut controls) = spline.bspline_in(document).or_else(|| {
+            let (surface, pcurve, offset) = spline.support_in(document)?;
+            supported_curve(surface, pcurve, offset)
+        })?;
         // A reversed intcurve runs against its spline: it is c(t) = s(-t),
         // and the edges on it store parameters in that negated range. Read
         // as the spline alone, a rim ran the wrong way round its face and
@@ -688,31 +695,44 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
     }
     if let Some(spline) = SatSplineSurface::from_record(record) {
         let reversed = spline.sense() == Sense::Reversed;
-        let spline = spline.bspline(document)?;
-        let closed = |value: &Option<String>| {
-            value
-                .as_deref()
-                .is_some_and(|value| matches!(value, "closed" | "periodic"))
-        };
-        let (u_closed, v_closed) = (closed(&spline.u_closure), closed(&spline.v_closure));
-        let mut points = vec![vec![[0.0; 3]; spline.control_count_v]; spline.control_count_u];
-        let mut weights = vec![vec![1.0; spline.control_count_v]; spline.control_count_u];
-        for v in 0..spline.control_count_v {
-            for u in 0..spline.control_count_u {
-                let control = spline.control_points[v * spline.control_count_u + u];
-                let weight = control[3];
-                if !weight.is_finite() || weight <= 0.0 {
-                    return None;
-                }
-                points[u][v] = [
-                    control[0] / weight,
-                    control[1] / weight,
-                    control[2] / weight,
-                ];
-                weights[u][v] = weight;
+        let surface = match spline.bspline(document) {
+            Some(fitted) => nurbs_surface(fitted)?,
+            None => {
+                let (base, distance) = spline.offset_in(document)?;
+                offset_surface(&nurbs_surface(base)?, distance)?
             }
+        };
+        return Some(Surface::Nurbs(surface.with_v_reversed(reversed)));
+    }
+    None
+}
+
+fn nurbs_surface(spline: SatBSplineSurface) -> Option<NurbsSurface3> {
+    let closed = |value: &Option<String>| {
+        value
+            .as_deref()
+            .is_some_and(|value| matches!(value, "closed" | "periodic"))
+    };
+    let (u_closed, v_closed) = (closed(&spline.u_closure), closed(&spline.v_closure));
+    let mut points = vec![vec![[0.0; 3]; spline.control_count_v]; spline.control_count_u];
+    let mut weights = vec![vec![1.0; spline.control_count_v]; spline.control_count_u];
+    for v in 0..spline.control_count_v {
+        for u in 0..spline.control_count_u {
+            let control = spline.control_points[v * spline.control_count_u + u];
+            let weight = control[3];
+            if !weight.is_finite() || weight <= 0.0 {
+                return None;
+            }
+            points[u][v] = [
+                control[0] / weight,
+                control[1] / weight,
+                control[2] / weight,
+            ];
+            weights[u][v] = weight;
         }
-        return Some(Surface::Nurbs(NurbsSurface3::new_strict(
+    }
+    Some(
+        NurbsSurface3::new_strict(
             spline.degree_u,
             spline.degree_v,
             points,
@@ -720,10 +740,270 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
             spline.v_knots,
             weights,
         )?
-        .with_periodicity(u_closed, v_closed)
-        .with_v_reversed(reversed)));
+        .with_periodicity(u_closed, v_closed),
+    )
+}
+
+/// An offset surface saved without its fitted spline: points pushed
+/// `distance` along the base's normal on a grid, interpolated row by row and
+/// then column by column. Evenly spaced samples interpolated at even
+/// parameters keep the base's `(u, v)`, so the face's pcurves still apply.
+fn offset_surface(base: &NurbsSurface3, distance: f64) -> Option<NurbsSurface3> {
+    let ((u0, u1), (v0, v1)) = base.domain();
+    let rows = base.control_points();
+    let (u_count, v_count) = ((rows.len() * 4).max(16), (rows.first()?.len() * 4).max(4));
+    let at = |i: usize, count: usize, low: f64, high: f64| low + (high - low) * i as f64 / count as f64;
+    let grid = (0..=v_count)
+        .map(|j| {
+            let v = at(j, v_count, v0, v1);
+            (0..=u_count)
+                .map(|i| {
+                    let u = at(i, u_count, u0, u1);
+                    let point = Vec3::from(base.point_at_knot(u, v));
+                    let normal = Vec3::from(base.normal_at_knot(u, v)?);
+                    Some((point + normal * distance).to_array())
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let [u_closed, v_closed] = base.periodicity();
+    Some(interpolate_grid(&grid, (u0, u1), (v0, v1))?.with_periodicity(u_closed, v_closed))
+}
+
+/// A cubic surface through an evenly spaced grid of points (rows run along
+/// `u`, one per `v`), interpolated row by row and then column by column.
+/// Evenly spaced samples interpolated at even parameters keep the grid's own
+/// `(u, v)`, so parameters read off the source still apply.
+fn interpolate_grid(
+    grid: &[Vec<[f64; 3]>],
+    (u0, u1): (f64, f64),
+    (v0, v1): (f64, f64),
+) -> Option<NurbsSurface3> {
+    let fit = |points: &[[f64; 3]]| {
+        NurbsCurve3::interpolate_fit(points, None, None, crate::space::Parameterization::Uniform)
+    };
+    let rows = grid.iter().map(|row| fit(row)).collect::<Option<Vec<_>>>()?;
+    let u_knots = rows.first()?.knots().to_vec();
+    let mut points = Vec::new();
+    let mut v_knots = Vec::new();
+    for i in 0..rows.first()?.control_points().len() {
+        let column: Vec<[f64; 3]> = rows.iter().map(|row| row.control_points()[i]).collect();
+        let fitted = fit(&column)?;
+        v_knots = fitted.knots().to_vec();
+        points.push(fitted.control_points().to_vec());
     }
-    None
+    let rescale = |knots: Vec<f64>, low: f64, high: f64| -> Vec<f64> {
+        let (first, last) = (knots[0], knots[knots.len() - 1]);
+        knots
+            .iter()
+            .map(|knot| low + (knot - first) / (last - first) * (high - low))
+            .collect()
+    };
+    let weights = vec![vec![1.0; points.first()?.len()]; points.len()];
+    NurbsSurface3::new_strict(
+        3,
+        3,
+        points,
+        rescale(u_knots, u0, u1),
+        rescale(v_knots, v0, v1),
+        weights,
+    )
+}
+
+/// A stand-in for a surface the kernel cannot evaluate — a vertex blend
+/// saves no fitted spline, only its boundary — filled over the face's own
+/// outer loop: the loop seen along its mean normal, and each point inside
+/// it the mean-value blend of the loop's points. It meets the face's edges
+/// exactly and is smooth between them, which is what drawing the face
+/// needs.
+// ponytail: mean-value fill, not the blend's own surface; its cross-boundary
+// tangents differ from the neighbouring blends'. Evaluate the blend itself
+// if the seams show.
+fn boundary_patch(document: &SatDocument, source: &SatFace<'_>) -> Option<Surface> {
+    let ring = SatLoop::from_record(resolve(document, source.first_loop())?)?;
+    let mut boundary: Vec<Vec3> = Vec::new();
+    let first = ring.first_coedge();
+    let mut pointer = first;
+    loop {
+        let coedge = SatCoedge::from_record(resolve(document, pointer)?)?;
+        let edge = SatEdge::from_record(resolve(document, coedge.edge())?)?;
+        let curve = read_curve(document, resolve(document, edge.curve())?)?;
+        let (low, high) = (edge.start_param(), edge.end_param());
+        let mut piece: Vec<Vec3> = (0..=8)
+            .map(|i| Vec3::from(curve.point_at(low + (high - low) * i as f64 / 8.0)))
+            .collect();
+        // Pieces are chained by their ends rather than by their senses.
+        if let Some(last) = boundary.last() {
+            if piece[8].distance(*last) < piece[0].distance(*last) {
+                piece.reverse();
+            }
+            boundary.extend(&piece[1..]);
+        } else {
+            boundary.extend(piece);
+        }
+        pointer = coedge.next();
+        if pointer == first || boundary.len() > 4096 {
+            break;
+        }
+    }
+    if boundary.len() > 2 && boundary[0].distance(boundary[boundary.len() - 1]) < 1e-9 {
+        boundary.pop();
+    }
+    if boundary.len() < 3 {
+        return None;
+    }
+    let centre = boundary.iter().fold(Vec3::ZERO, |sum, point| sum + *point)
+        * (1.0 / boundary.len() as f64);
+    let newell = (0..boundary.len()).fold(Vec3::ZERO, |sum, index| {
+        let (a, b) = (boundary[index] - centre, boundary[(index + 1) % boundary.len()] - centre);
+        sum + a.cross(b)
+    });
+    // The first piece may have been chained backwards, reversing the walk.
+    let ahead = boundary[1] - boundary[0];
+    let expected = {
+        let coedge = SatCoedge::from_record(resolve(document, first)?)?;
+        let edge = SatEdge::from_record(resolve(document, coedge.edge())?)?;
+        let curve = read_curve(document, resolve(document, edge.curve())?)?;
+        let start = Vec3::from(curve.point_at(edge.start_param()));
+        let end = Vec3::from(curve.point_at(edge.end_param()));
+        (end - start) * if coedge.sense() == edge.sense() { 1.0 } else { -1.0 }
+    };
+    let walked_backwards = ahead.dot(expected) < 0.0;
+    let face_normal = if walked_backwards { -newell } else { newell };
+    let normal = if source.sense() == Sense::Forward { face_normal } else { -face_normal };
+    let plane = Plane::orthonormal(
+        centre.to_array(),
+        (boundary[0] - centre).to_array(),
+        normal.to_array(),
+    )?;
+    let flat: Vec<[f64; 2]> = boundary
+        .iter()
+        .map(|point| {
+            let offset = *point - centre;
+            [
+                offset.dot(Vec3::from(plane.x_axis)),
+                offset.dot(Vec3::from(plane.y_axis)),
+            ]
+        })
+        .collect();
+    let (mut low, mut high) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for point in &flat {
+        for axis in 0..2 {
+            low[axis] = low[axis].min(point[axis]);
+            high[axis] = high[axis].max(point[axis]);
+        }
+    }
+    let margin = (high[0] - low[0]).max(high[1] - low[1]) * 0.02;
+    let (low, high) = (low.map(|value| value - margin), high.map(|value| value + margin));
+    const STEPS: usize = 24;
+    let grid: Vec<Vec<[f64; 3]>> = (0..=STEPS)
+        .map(|j| {
+            let y = low[1] + (high[1] - low[1]) * j as f64 / STEPS as f64;
+            (0..=STEPS)
+                .map(|i| {
+                    let x = low[0] + (high[0] - low[0]) * i as f64 / STEPS as f64;
+                    mean_value_point(&flat, &boundary, [x, y]).to_array()
+                })
+                .collect()
+        })
+        .collect();
+    Some(Surface::Nurbs(interpolate_grid(
+        &grid,
+        (low[0], high[0]),
+        (low[1], high[1]),
+    )?))
+}
+
+/// The blend of `values` at `point` by its mean-value coordinates in the
+/// polygon `corners`: each corner weighted by the half-angle tangents of the
+/// two sides it closes. Exact on the polygon, smooth inside it.
+fn mean_value_point(corners: &[[f64; 2]], values: &[Vec3], point: [f64; 2]) -> Vec3 {
+    let count = corners.len();
+    let spokes: Vec<[f64; 2]> = corners
+        .iter()
+        .map(|corner| [corner[0] - point[0], corner[1] - point[1]])
+        .collect();
+    let lengths: Vec<f64> = spokes.iter().map(|spoke| spoke[0].hypot(spoke[1])).collect();
+    if let Some(index) = lengths.iter().position(|length| *length < 1e-12) {
+        return values[index];
+    }
+    let half_tangents: Vec<f64> = (0..count)
+        .map(|index| {
+            let (a, b) = (spokes[index], spokes[(index + 1) % count]);
+            let cross = a[0] * b[1] - a[1] * b[0];
+            let dot = a[0] * b[0] + a[1] * b[1];
+            let product = lengths[index] * lengths[(index + 1) % count];
+            if cross.abs() < 1e-15 * product {
+                0.0
+            } else {
+                (product - dot) / cross
+            }
+        })
+        .collect();
+    let mut total = 0.0;
+    let mut sum = Vec3::ZERO;
+    for index in 0..count {
+        let weight = (half_tangents[(index + count - 1) % count] + half_tangents[index]) / lengths[index];
+        total += weight;
+        sum = sum + values[index] * weight;
+    }
+    if total.abs() < 1e-300 {
+        return values[0];
+    }
+    sum * (1.0 / total)
+}
+
+/// A procedural curve saved without its spline, rebuilt from its support
+/// surface and pcurve: sampled evenly in the curve's own parameter and
+/// interpolated with the samples at those same parameters, so an edge's
+/// stored span still selects the right piece.
+fn supported_curve(
+    surface: SatBSplineSurface,
+    pcurve: (usize, Vec<f64>, Vec<[f64; 3]>),
+    offset: f64,
+) -> Option<(usize, Vec<f64>, Vec<[f64; 4]>)> {
+    let surface = nurbs_surface(surface)?;
+    let (degree, knots, controls) = pcurve;
+    let mut points = Vec::with_capacity(controls.len());
+    let mut weights = Vec::with_capacity(controls.len());
+    for control in controls {
+        if !control[2].is_finite() || control[2] <= 0.0 {
+            return None;
+        }
+        points.push([control[0] / control[2], control[1] / control[2]]);
+        weights.push(control[2]);
+    }
+    let pcurve = NurbsCurve::new_strict(degree, points, knots, weights)?;
+    let (start, end) = pcurve.domain();
+    const SAMPLES: usize = 64;
+    let samples: Vec<[f64; 3]> = (0..=SAMPLES)
+        .map(|i| {
+            let [u, v] = pcurve.point_at_knot(start + (end - start) * i as f64 / SAMPLES as f64);
+            let point = Vec3::from(surface.point_at_knot(u, v));
+            if offset == 0.0 {
+                return Some(point.to_array());
+            }
+            Some((point + Vec3::from(surface.normal_at_knot(u, v)?) * offset).to_array())
+        })
+        .collect::<Option<_>>()?;
+    let fitted = NurbsCurve3::interpolate_fit(
+        &samples,
+        None,
+        None,
+        crate::space::Parameterization::Uniform,
+    )?;
+    let (low, high) = fitted.domain();
+    let knots = fitted
+        .knots()
+        .iter()
+        .map(|knot| start + (knot - low) / (high - low) * (end - start))
+        .collect();
+    let controls = fitted
+        .control_points()
+        .iter()
+        .map(|point| [point[0], point[1], point[2], 1.0])
+        .collect();
+    Some((3, knots, controls))
 }
 
 fn resolve(document: &SatDocument, pointer: SatPointer) -> Option<&SatRecord> {

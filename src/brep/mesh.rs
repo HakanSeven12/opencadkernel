@@ -993,12 +993,41 @@ fn body_edge_schedules(
 ) -> HashMap<EdgeKey, Vec<super::place::EdgeSample>> {
     body.edge_keys()
         .filter_map(|edge| {
-            let max_angle = edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal);
+            // The faces fill against their own limit and cannot split a
+            // boundary segment, so an edge is sampled at least as finely as
+            // every face it bounds needs (#1538: a cylinder notched by
+            // ellipses tightens its face below its circles').
+            let max_angle = body.edges.get(edge)?.coedges.iter().fold(
+                edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal),
+                |angle, coedge| {
+                    body.coedges
+                        .get(*coedge)
+                        .and_then(|coedge| body.loops.get(coedge.owner))
+                        .map_or(angle, |ring| {
+                            angle.min(face_chordal_angle(
+                                body,
+                                ring.owner,
+                                tolerance.angle,
+                                tolerance.chordal,
+                            ))
+                        })
+                },
+            );
             let mut samples = shared_edge_samples(body, edge, max_angle, tolerance.linear)?;
             for sample in &mut samples {
                 sample.position =
                     shared_surface_position(body, edge, sample.position, tolerance.linear)
                         .unwrap_or(sample.position);
+            }
+            // An edge ends at its vertices. Projected onto its faces, an end
+            // lands wherever those surfaces put it, and the surfaces of a
+            // file fitted to 4e-3 disagree by that much from one edge to the
+            // next round a vertex, so the face's boundary no longer closed
+            // (#1538).
+            {
+                let node = body.edges.get(edge)?;
+                samples.first_mut()?.position = body.vertices.get(node.start)?.point;
+                samples.last_mut()?.position = body.vertices.get(node.end)?.point;
             }
             Some((edge, samples))
         })
@@ -1926,11 +1955,17 @@ fn scheduled_face(
         {
             return fill_scheduled_singular_cap(body, face, &band, max_angle);
         }
+        let zipped = |rim: &[BoundaryPoint]| {
+            periods(surface)[band.varying]
+                .is_none_or(|period| is_monotonic_periodic_rim(rim, band.varying, period))
+        };
         if band.strip
             && band.holes.is_empty()
             && (band.structured
                 || (!matches!(surface, super::geometry::Surface::Nurbs(_))
-                    && periods(surface)[1 - band.varying].is_none()))
+                    && periods(surface)[1 - band.varying].is_none()
+                    && zipped(&band.low)
+                    && zipped(&band.high)))
         {
             return fill_scheduled_band(body, face, &band, max_angle, tolerance);
         }
@@ -2092,7 +2127,7 @@ fn chain_samples(
         }
         let skip = if explicit
             && next_explicit
-            && !parameter_near(points.last()?.parameters, next[0].parameters)
+            && !same_corner(points.last()?.parameters, next[0].parameters)
         {
             0
         } else {
@@ -2107,7 +2142,7 @@ fn chain_samples(
     }
     let first = points.first()?.parameters;
     let last = points.last()?.parameters;
-    if all_explicit && !parameter_near(first, last) {
+    if all_explicit && !same_corner(first, last) {
         return Some(points);
     }
     let mut closing = last;
@@ -2551,6 +2586,15 @@ fn period_shifts(period: Option<f64>) -> impl Iterator<Item = f64> {
     (-turns..=turns).map(move |turn| f64::from(turn) * period.unwrap_or(0.0))
 }
 
+/// Whether two explicit pcurve ends name one corner. Their pcurves are fitted
+/// separately and meet only to rounding (3e-13 on a 134-unit domain, #1538);
+/// ends that name one place from different turns, as at a pole, differ by far
+/// more.
+fn same_corner(a: [f64; 2], b: [f64; 2]) -> bool {
+    let scale = a.into_iter().chain(b).map(f64::abs).fold(1.0, f64::max);
+    (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-9 * scale
+}
+
 fn parameter_near(a: [f64; 2], b: [f64; 2]) -> bool {
     let scale = a.into_iter().chain(b).map(f64::abs).fold(1.0, f64::max);
     (a[0] - b[0]).hypot(a[1] - b[1]) <= f64::EPSILON * 64.0 * scale
@@ -2722,6 +2766,15 @@ fn scheduled_band(
     if let Some(rim) = winding_rim {
         rims.push(rim);
     }
+    if rims.len() == 2
+        && holes.is_empty()
+        && surface_periods[fixed].is_none()
+        && rims
+            .iter()
+            .any(|rim| !is_monotonic_periodic_rim(rim, varying, period))
+    {
+        return cut_winding_band(surface, &rims, varying, period);
+    }
     let traversal: Vec<f64> = rims
         .iter()
         .map(|rim| rim.last().unwrap().parameters[varying] - rim[0].parameters[varying])
@@ -2745,7 +2798,7 @@ fn scheduled_band(
         && (!holes.is_empty() || !structured)
         && parameter_range(&rims[0], varying) >= period * (1.0 - 1e-9)
     {
-        fit_periodic_band(&mut rims, &mut holes, varying, period)?;
+        fit_periodic_band(surface, &mut rims, &mut holes, varying, period)?;
     }
     let mut bounds: Vec<f64> = rims
         .iter()
@@ -2881,6 +2934,103 @@ fn scheduled_band(
     })
 }
 
+/// Two rims winding round a periodic surface, one of which doubles back
+/// along the way (a notch cut into a cylinder's edge), cut at one value of
+/// the varying parameter that each crosses exactly once. Sorting such a rim
+/// by that parameter, as a plain band does, tears the notch apart; cut
+/// there, the two rims and the seam between them bound an ordinary region.
+fn cut_winding_band(
+    surface: &super::geometry::Surface,
+    rims: &[Vec<BoundaryPoint>],
+    varying: usize,
+    period: f64,
+) -> Option<BoundaryBand> {
+    let rims: Vec<Vec<BoundaryPoint>> = rims
+        .iter()
+        .map(|rim| {
+            let mut rim = rim.clone();
+            if rim.last()?.parameters[varying] < rim.first()?.parameters[varying] {
+                rim.reverse();
+            }
+            Some(rim)
+        })
+        .collect::<Option<_>>()?;
+    let turn = |value: f64, seam: f64| ((value - seam) / period).floor();
+    let crossings = |rim: &[BoundaryPoint], seam: f64| -> f64 {
+        rim.windows(2)
+            .map(|pair| {
+                (turn(pair[1].parameters[varying], seam) - turn(pair[0].parameters[varying], seam))
+                    .abs()
+            })
+            .sum()
+    };
+    // Seams through the middle of the longest steps first: well clear of any
+    // vertex, and of a notch's sides, which do not step along at all.
+    let mut steps: Vec<(f64, f64)> = rims
+        .iter()
+        .flat_map(|rim| rim.windows(2))
+        .map(|pair| {
+            let (a, b) = (pair[0].parameters[varying], pair[1].parameters[varying]);
+            ((b - a).abs(), 0.5 * (a + b))
+        })
+        .collect();
+    steps.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let seam = steps
+        .into_iter()
+        .map(|(_, middle)| middle)
+        .find(|seam| rims.iter().all(|rim| crossings(rim, *seam) == 1.0))?;
+    let mut cut: Vec<Vec<BoundaryPoint>> = rims
+        .iter()
+        .map(|rim| {
+            let index = rim.windows(2).position(|pair| {
+                turn(pair[0].parameters[varying], seam) != turn(pair[1].parameters[varying], seam)
+            })?;
+            let (a, b) = (&rim[index], &rim[index + 1]);
+            let line = seam + turn(b.parameters[varying], seam) * period;
+            let t = (line - a.parameters[varying])
+                / (b.parameters[varying] - a.parameters[varying]);
+            let mut parameters = [0, 1].map(|axis| {
+                a.parameters[axis] + (b.parameters[axis] - a.parameters[axis]) * t
+            });
+            parameters[varying] = line;
+            let start = BoundaryPoint {
+                parameters,
+                position: surface.point_at(parameters[0], parameters[1]),
+            };
+            let mut out = vec![start.clone()];
+            out.extend(rim[index + 1..].iter().cloned());
+            out.extend(rim[1..=index].iter().map(|point| {
+                let mut point = point.clone();
+                point.parameters[varying] += period;
+                point
+            }));
+            let mut end = start;
+            end.parameters[varying] += period;
+            out.push(end);
+            let shift = seam - line;
+            for point in &mut out {
+                point.parameters[varying] += shift;
+            }
+            Some(out)
+        })
+        .collect::<Option<_>>()?;
+    let fixed = 1 - varying;
+    let first_is_low = average_parameter(&cut[0], fixed) < average_parameter(&cut[1], fixed);
+    let (low, high) = if first_is_low {
+        (cut.remove(0), cut.remove(0))
+    } else {
+        (cut.remove(1), cut.remove(0))
+    };
+    Some(BoundaryBand {
+        low,
+        high,
+        holes: Vec::new(),
+        varying,
+        strip: true,
+        structured: false,
+    })
+}
+
 fn unwrap_boundary(points: &mut [BoundaryPoint], periods: [Option<f64>; 2]) {
     for index in 1..points.len() {
         for axis in 0..2 {
@@ -2957,7 +3107,7 @@ fn scheduled_periodic_band(
         for point in &mut rims[1] {
             point.parameters[varying] += shift;
         }
-        fit_periodic_band(&mut rims, &mut holes, varying, period)?;
+        fit_periodic_band(surface, &mut rims, &mut holes, varying, period)?;
         let mut bounds = [
             average_parameter(&rims[0], fixed),
             average_parameter(&rims[1], fixed),
@@ -3130,7 +3280,7 @@ fn scheduled_winding_band(
             continue;
         }
         let mut rims = rings.clone();
-        fit_periodic_band(&mut rims, &mut [], varying, period)?;
+        fit_periodic_band(surface, &mut rims, &mut [], varying, period)?;
         let first_is_low = separated_rim_order(&rims[0], &rims[1], varying)?;
         let (low, high) = if first_is_low {
             (rims.remove(0), rims.remove(0))
@@ -3317,6 +3467,7 @@ fn sample_parameter_seam(
 }
 
 fn fit_periodic_band(
+    surface: &super::geometry::Surface,
     rims: &mut [Vec<BoundaryPoint>],
     holes: &mut [Vec<BoundaryPoint>],
     varying: usize,
@@ -3354,21 +3505,23 @@ fn fit_periodic_band(
         }
     }
     for rim in rims {
-        rotate_periodic_rim(rim, varying, choice.0, period)?;
+        rotate_periodic_rim(surface, rim, varying, choice.0, period)?;
     }
     Some(())
 }
 
 fn rotate_periodic_rim(
+    surface: &super::geometry::Surface,
     rim: &mut Vec<BoundaryPoint>,
     varying: usize,
     seam: f64,
     period: f64,
 ) -> Option<()> {
+    let scale = seam.abs().max((seam + period).abs()).max(1.0);
+    let epsilon = f64::EPSILON * 128.0 * scale;
     for point in rim.iter_mut() {
         let mut value = seam + (point.parameters[varying] - seam).rem_euclid(period);
-        let scale = seam.abs().max((seam + period).abs()).max(1.0);
-        if (value - seam - period).abs() <= f64::EPSILON * 128.0 * scale {
+        if (value - seam - period).abs() <= epsilon {
             value = seam;
         }
         point.parameters[varying] = value;
@@ -3381,6 +3534,26 @@ fn rotate_periodic_rim(
             .max(1.0);
         (a.parameters[varying] - b.parameters[varying]).abs() <= f64::EPSILON * 128.0 * scale
     });
+    // Both rims must start on the seam itself: one whose samples straddle
+    // it would otherwise start a step past it, and the seam joining the two
+    // rims ran slantwise across the face (#1538's torus).
+    let (first, last) = (rim.first()?, rim.last()?);
+    if first.parameters[varying] - seam > epsilon {
+        let before = last.parameters[varying] - period;
+        let t = (seam - before) / (first.parameters[varying] - before);
+        let fixed = 1 - varying;
+        let mut parameters = [0.0; 2];
+        parameters[varying] = seam;
+        parameters[fixed] =
+            last.parameters[fixed] + (first.parameters[fixed] - last.parameters[fixed]) * t;
+        rim.insert(
+            0,
+            BoundaryPoint {
+                parameters,
+                position: surface.point_at(parameters[0], parameters[1]),
+            },
+        );
+    }
     let mut closing = rim.first()?.clone();
     closing.parameters[varying] += period;
     rim.push(closing);
@@ -4214,14 +4387,27 @@ fn surface_grid_values(
     };
     let values = [0, 1].map(|axis| {
         let other = 1 - axis;
-        let mut probes = nurbs.map_or_else(Vec::new, |nurbs| {
-            let knots = nurbs.knots();
-            if other == 0 {
-                knots.0.to_vec()
-            } else {
-                knots.1.to_vec()
-            }
-        });
+        // An analytic surface has no knots to probe at, and its bounds and
+        // their middle can all sit where the normal stands still along the
+        // axis (a torus's top and bottom circles), leaving the grid with no
+        // lines at all (#1538). Eighths across the other axis cannot.
+        let mut probes = nurbs.map_or_else(
+            || {
+                (1..8)
+                    .map(|step| {
+                        bounds[other][0] + (bounds[other][1] - bounds[other][0]) * step as f64 / 8.0
+                    })
+                    .collect()
+            },
+            |nurbs| {
+                let knots = nurbs.knots();
+                if other == 0 {
+                    knots.0.to_vec()
+                } else {
+                    knots.1.to_vec()
+                }
+            },
+        );
         probes.retain(|value| *value >= bounds[other][0] && *value <= bounds[other][1]);
         probes.extend(bounds[other]);
         probes.sort_by(f64::total_cmp);
