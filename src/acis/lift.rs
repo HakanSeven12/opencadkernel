@@ -313,6 +313,25 @@ fn edge_of(
         Some(shape @ Curve3::Nurbs(curve)) if apart && !curve.periodicity() => {
             (shape.parameter_at(ends.0), shape.parameter_at(ends.1))
         }
+        // An open piece of a periodic spline: the vertices fix where it runs,
+        // the stored range only which turn. A reversed edge stores its range
+        // negated (its parameter runs against the curve's), so read raw a
+        // piece at [0, 1.18] evaluated at [-1.18, 0] and missed its vertices
+        // by a whole unit (#1563).
+        Some(shape @ Curve3::Nurbs(curve)) if apart => {
+            let period = curve.domain().1 - curve.domain().0;
+            let (near_low, near_high) = if edge_forward {
+                (stored_low, stored_high)
+            } else {
+                (-stored_high, -stored_low)
+            };
+            let low = periodic_near(shape.parameter_at(ends.0), near_low, period);
+            let mut high = periodic_near(shape.parameter_at(ends.1), near_high, period);
+            while high <= low {
+                high += period;
+            }
+            (low, high)
+        }
         Some(shape @ (Curve3::Circle(_) | Curve3::Ellipse(_))) if apart => {
             let low = periodic_near(shape.parameter_at(ends.0), stored_low, TAU);
             let mut high = periodic_near(shape.parameter_at(ends.1), stored_high, TAU);

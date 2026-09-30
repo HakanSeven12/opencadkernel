@@ -3635,33 +3635,36 @@ fn whole_surface_domain(
     if bounded_domain {
         return Some(domain);
     }
+    // Every loop a slit — one edge walked there and back — encloses nothing,
+    // so the face is the whole surface. A ball touching two tangent faces
+    // carries one slit per contact (#1563).
     let seam_loop = matches!(
         surface,
         super::geometry::Surface::Sphere(_) | super::geometry::Surface::Torus(_)
-    ) && node.loops.as_slice().first().is_some_and(|loop_key| {
-        let Some(ring) = body.loops.get(*loop_key) else {
-            return false;
-        };
-        node.loops.len() == 1
-            && !ring.coedges.is_empty()
-            && ring.coedges.iter().all(|coedge_key| {
-                let Some(coedge) = body.coedges.get(*coedge_key) else {
-                    return false;
-                };
-                if coedge.pcurve.is_some() {
-                    // An explicit pcurve bounds a trimmed periodic patch; it
-                    // is not merely an arbitrary cut across the whole surface.
-                    return false;
-                }
-                let matching: Vec<_> = ring
-                    .coedges
-                    .iter()
-                    .filter_map(|candidate| body.coedges.get(*candidate))
-                    .filter(|candidate| candidate.edge == coedge.edge)
-                    .collect();
-                matching.len() == 2 && matching[0].forward != matching[1].forward
-            })
-    });
+    ) && !node.loops.is_empty()
+        && node.loops.iter().all(|loop_key| {
+            let Some(ring) = body.loops.get(*loop_key) else {
+                return false;
+            };
+            !ring.coedges.is_empty()
+                && ring.coedges.iter().all(|coedge_key| {
+                    let Some(coedge) = body.coedges.get(*coedge_key) else {
+                        return false;
+                    };
+                    if coedge.pcurve.is_some() {
+                        // An explicit pcurve bounds a trimmed periodic patch; it
+                        // is not merely an arbitrary cut across the whole surface.
+                        return false;
+                    }
+                    let matching: Vec<_> = ring
+                        .coedges
+                        .iter()
+                        .filter_map(|candidate| body.coedges.get(*candidate))
+                        .filter(|candidate| candidate.edge == coedge.edge)
+                        .collect();
+                    matching.len() == 2 && matching[0].forward != matching[1].forward
+                })
+        });
     if !node.loops.is_empty() && !seam_loop {
         return None;
     }
@@ -4566,9 +4569,15 @@ fn triangle_refinement(
         });
         edge_angles[index] = surface_normal_angle_cached(surface, &parameters, normal_cache)?;
     }
+    // A constrained edge is a boundary sample pair (or a grid line), which
+    // no insertion may split: the neighbouring face shares those samples.
+    // The edge sampler measures the curve's own turn, this the surface
+    // normal's along the straight parameter chord, and the two differ by a
+    // hair — 0.171 against 0.170 on a torus rim failed a whole face (#1563).
+    // Within twice the limit it stands; beyond that the ring is broken.
     if (0..3).any(|index| {
         let [from, to] = edge_vertices[index];
-        angle_exceeds(edge_angles[index], max_angle)
+        angle_exceeds(edge_angles[index], max_angle * 2.0)
             && triangle.constraints[index]
             && distance3(
                 surface.point_at(corners[from][0], corners[from][1]),
@@ -4581,7 +4590,8 @@ fn triangle_refinement(
         .into_iter()
         .enumerate()
         .filter(|(index, [from, to])| {
-            angle_exceeds(edge_angles[*index], max_angle)
+            !triangle.constraints[*index]
+                && angle_exceeds(edge_angles[*index], max_angle)
                 && distance3(
                     surface.point_at(corners[*from][0], corners[*from][1]),
                     surface.point_at(corners[*to][0], corners[*to][1]),
