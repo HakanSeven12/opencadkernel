@@ -112,15 +112,16 @@ pub fn cuboid(origin: [f64; 3], size: [f64; 3]) -> Option<Body> {
     });
 
     // Each face as the four corners of its outer loop, listed
-    // counter-clockwise seen from outside the box. That ordering is what
-    // makes every edge come out traversed once each way.
+    // counter-clockwise seen from outside the box — material on the left of
+    // the way round, as ACIS and every other builder here have it. That
+    // ordering is also what makes every edge come out traversed once each way.
     const FACES: [[usize; 4]; 6] = [
-        [0, 2, 6, 4], // −x
-        [1, 5, 7, 3], // +x
-        [0, 4, 5, 1], // −y
-        [2, 3, 7, 6], // +y
-        [0, 1, 3, 2], // −z
-        [4, 6, 7, 5], // +z
+        [0, 4, 6, 2], // −x
+        [1, 3, 7, 5], // +x
+        [0, 1, 5, 4], // −y
+        [2, 6, 7, 3], // +y
+        [0, 2, 3, 1], // −z
+        [4, 5, 7, 6], // +z
     ];
     for ring in FACES {
         let plane = face_plane(&body, &corners, ring)?;
@@ -167,7 +168,8 @@ pub fn cuboid(origin: [f64; 3], size: [f64; 3]) -> Option<Body> {
 /// Builds a closed planar-faced solid from an indexed polygon mesh.
 ///
 /// Face winding is made consistent across every connected component and then
-/// oriented to the kernel's inward-loop convention. Every undirected edge
+/// oriented so every loop runs counter-clockwise about its face's outward
+/// normal, the way ACIS and the other builders wind them. Every undirected edge
 /// must be shared by exactly two faces; open and non-manifold meshes are
 /// rejected without producing a partial body.
 pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body> {
@@ -291,7 +293,8 @@ pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body
         if !signed_volume.is_finite() || signed_volume.abs() <= scale.powi(3) * 1e-12 {
             return None;
         }
-        if signed_volume > 0.0 {
+        // Counter-clockwise seen from outside encloses a positive volume.
+        if signed_volume < 0.0 {
             for &face in component {
                 faces[face].reverse();
             }
@@ -347,17 +350,13 @@ pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body
                 .iter()
                 .map(|&index| vertices[index])
                 .collect::<Vec<_>>();
-            let standard_normal = crate::space::polygon::normal(&points)?;
+            let outward = crate::space::polygon::normal(&points)?;
             let origin = Vec3::from(points[0]);
             let along = points[1..]
                 .iter()
                 .map(|point| Vec3::from(*point) - origin)
                 .find(|vector| vector.length() > 1e-12)?;
-            let plane = Plane::orthonormal(
-                points[0],
-                along.to_array(),
-                (-Vec3::from(standard_normal)).to_array(),
-            )?;
+            let plane = Plane::orthonormal(points[0], along.to_array(), outward)?;
             if points
                 .iter()
                 .any(|point| plane.distance_to(*point).is_none_or(|gap| gap.abs() > 1e-8))
@@ -1437,9 +1436,11 @@ fn face_plane(body: &Body, corners: &[Key<Vertex>], ring: [usize; 4]) -> Option<
     let origin = at(0)?;
     let along = at(1)? - origin;
     let across = at(3)? - origin;
-    // Counter-clockwise seen from outside, so `along × across` points in.
-    let normal = across.cross(along).normalize()?;
-    Plane::orthonormal(origin.to_array(), along.to_array(), normal.to_array())
+    // Counter-clockwise seen from outside, so `along × across` points out.
+    // The frame runs along `across`, which keeps each face's parameterisation
+    // what it was before the loops were turned the right way round.
+    let normal = along.cross(across).normalize()?;
+    Plane::orthonormal(origin.to_array(), across.to_array(), normal.to_array())
 }
 
 #[cfg(test)]
