@@ -44,6 +44,8 @@ pub mod loft_general;
 pub mod mass;
 pub mod make;
 pub mod mesh;
+mod march;
+mod near;
 pub(crate) mod nurbs_builder;
 pub mod pcurve;
 pub mod place;

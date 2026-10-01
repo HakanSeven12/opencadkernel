@@ -323,8 +323,30 @@ fn coincident_twin(
             .get(*candidate)
             .and_then(|node| other.surfaces.get(node.surface))
             .is_some_and(|theirs| same_surface(surface, theirs, tolerance))
-            && super::imprint::same_ground(body, face, other, *candidate, tolerance)
+            && (super::imprint::same_ground(body, face, other, *candidate, tolerance)
+                || inside_each_other(body, face, other, *candidate, tolerance))
     })
+}
+
+/// Whether each of two faces on one surface has its inside on the other.
+/// After the imprint a shared wall's two copies cover the same ground, but
+/// where one was cut by a file's spline and the other by the curve that
+/// spline stands for, their corners sit a fit apart and are not the same
+/// vertices — the ground is still the same.
+fn inside_each_other(
+    body: &Body,
+    face: FaceKey,
+    other: &Body,
+    candidate: FaceKey,
+    tolerance: f64,
+) -> bool {
+    let on = |from: &Body, face: FaceKey, to: &Body, candidate: FaceKey| {
+        interior_point(from, face, tolerance).is_some_and(|point| {
+            super::classify::face_distance(to, candidate, point, tolerance)
+                .is_some_and(|gap| gap <= tolerance)
+        })
+    };
+    on(body, face, other, candidate) && on(other, candidate, body, face)
 }
 
 /// Whether two surfaces are the same one, ignoring how each is parameterised.
@@ -490,6 +512,45 @@ pub(super) fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Opti
         return Some(surface.point_at(chosen[0], chosen[1]));
     }
     pcurve::periodic_band_point(surface, &boundary, tolerance)
+        .or_else(|| sliver_point(surface, &boundary, centre))
+}
+
+/// A point standing for a hairline face — two boundary curves a file's fit
+/// tolerance apart, with no inside a point could be put in clear of both.
+/// The middle of its boundary is on the face in every sense that matters for
+/// which side of another solid it lies on. `None` for a face any wider.
+fn sliver_point(
+    surface: &Surface,
+    boundary: &[crate::geom2d::Curve],
+    centre: [f64; 2],
+) -> Option<[f64; 3]> {
+    const STEPS: usize = 32;
+    let walks: Vec<Vec<Vec3>> = boundary
+        .iter()
+        .map(|curve| {
+            (0..=STEPS)
+                .map(|step| {
+                    let [u, v] = curve.point_at(step as f64 / STEPS as f64);
+                    Vec3::from(surface.point_at(u, v))
+                })
+                .collect()
+        })
+        .collect();
+    let first = *walks.first()?.first()?;
+    let extent = walks
+        .iter()
+        .flatten()
+        .map(|point| point.distance(first))
+        .fold(0.0, f64::max);
+    let point = Vec3::from(surface.point_at(centre[0], centre[1]));
+    let gap = walks
+        .iter()
+        .flat_map(|walk| {
+            walk.windows(2)
+                .map(|pair| point.distance_to_segment(pair[0], pair[1]))
+        })
+        .fold(f64::INFINITY, f64::min);
+    (gap <= extent * 1e-3).then_some(point.to_array())
 }
 
 /// A point on a face that is its whole sphere or torus, clear of the slit
@@ -610,6 +671,9 @@ fn copy_face_with_tolerance(result: &mut Body, source: &Body, face: FaceKey, she
             // their own solid meet along it here only if their copies share
             // the edge, and without that the result is a shell of loose
             // faces that still passes every local check.
+            let here = Vec3::from(curve.tangent_at(
+                0.5 * (source_edge.start_parameter + source_edge.end_parameter),
+            ));
             let edge = match find_edge(result, start, end, middle, tolerance) {
                 Some(existing) => existing,
                 None => {
@@ -625,10 +689,18 @@ fn copy_face_with_tolerance(result: &mut Body, source: &Body, face: FaceKey, she
                     })
                 }
             };
-            let reversed = result
-                .edges
-                .get(edge)
-                .is_some_and(|node| node.start != start);
+            // A closed edge starts and ends at one vertex, so which way the
+            // reused one runs is read off its curve: a circle shared by two
+            // solids may be kept by each with its plane facing the other way.
+            let reversed = result.edges.get(edge).is_some_and(|node| {
+                if node.start != node.end {
+                    return node.start != start;
+                }
+                result.curves.get(node.curve).is_some_and(|existing| {
+                    let there = Vec3::from(existing.tangent_at(existing.parameter_at(middle)));
+                    here.dot(there) < 0.0
+                })
+            });
             let reverse_pcurve = flip != reversed;
             let pcurve = match (&source_coedge.pcurve, reverse_pcurve) {
                 (Some(curve), true) => Some(super::split::reverse_closed_pcurve(curve).ok_or(Snag::CutRefused)?),

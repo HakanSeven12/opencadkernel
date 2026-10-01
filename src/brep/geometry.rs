@@ -297,9 +297,9 @@ impl Surface {
     /// In order, and including negative ones — behind the origin is still on
     /// the surface, and a caller counting crossings ahead filters for itself.
     ///
-    /// `None` for a torus: its section is a quartic and this kernel has no
-    /// solver for one. As everywhere else here, that is said rather than
-    /// answered with an empty list a caller would read as "no hits".
+    /// `None` where a spline patch's crossing will not settle. As everywhere
+    /// else here, that is said rather than answered with an empty list a
+    /// caller would read as "no hits".
     pub fn ray_hits(&self, origin: [f64; 3], direction: [f64; 3]) -> Option<Vec<f64>> {
         let start = Vec3::from(origin);
         let along = Vec3::from(direction);
@@ -404,7 +404,7 @@ impl Surface {
                 }
                 Some(hits)
             }
-            Self::Nurbs(_) => None,
+            Self::Nurbs(surface) => nurbs_ray_hits(surface, start, along),
         }
     }
 
@@ -454,9 +454,133 @@ impl Surface {
                     outer
                 }
             }
-            Self::Nurbs(_) => f64::INFINITY,
+            // Unsigned off the patch's side, where the nearest point is on
+            // its edge and the normal says nothing about the side.
+            Self::Nurbs(surface) => {
+                let Some((u, v)) = surface.parameters_at(point) else {
+                    return f64::INFINITY;
+                };
+                let offset = Vec3::from(point) - Vec3::from(surface.point_at_knot(u, v));
+                let side = self
+                    .normal_at(u, v)
+                    .map_or(1.0, |normal| offset.dot(Vec3::from(normal)).signum());
+                offset.length() * if side < 0.0 { -1.0 } else { 1.0 }
+            }
         }
     }
+}
+
+/// Where a ray meets a spline patch: the crossings of a grid of the patch's
+/// own points, each then refined onto the patch itself by Newton's method in
+/// `(u, v, t)`. `None` when a crossing will not settle — a ray grazing the
+/// patch, whose count of crossings is not to be trusted either way.
+fn nurbs_ray_hits(surface: &NurbsSurface3, origin: Vec3, direction: Vec3) -> Option<Vec<f64>> {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let (u_knots, v_knots) = surface.knots();
+    // ponytail: four cells a knot span; a patch folding tighter than that can
+    // hide a pair of crossings, which leaves the parity intact.
+    let cells = |knots: &[f64], low: f64, high: f64| {
+        let spans = knots
+            .windows(2)
+            .filter(|pair| pair[1] > pair[0] && pair[0] >= low && pair[1] <= high)
+            .count();
+        (spans * 4).clamp(8, 96)
+    };
+    let (columns, rows) = (cells(u_knots, u0, u1), cells(v_knots, v0, v1));
+    let at = |i: usize, j: usize| {
+        (
+            u0 + (u1 - u0) * i as f64 / columns as f64,
+            v0 + (v1 - v0) * j as f64 / rows as f64,
+        )
+    };
+    let grid: Vec<Vec<Vec3>> = (0..=columns)
+        .map(|i| {
+            (0..=rows)
+                .map(|j| {
+                    let (u, v) = at(i, j);
+                    Vec3::from(surface.point_at_knot(u, v))
+                })
+                .collect()
+        })
+        .collect();
+    let mut hits: Vec<f64> = Vec::new();
+    for i in 0..columns {
+        for j in 0..rows {
+            let corners = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)];
+            for triangle in [[0, 1, 2], [0, 2, 3]] {
+                let [a, b, c] = triangle.map(|k| corners[k]);
+                let corners = [grid[a.0][a.1], grid[b.0][b.1], grid[c.0][c.1]];
+                let Some((t, beta, gamma)) = ray_triangle(origin, direction, corners) else {
+                    continue;
+                };
+                let ((ua, va), (ub, vb), (uc, vc)) = (at(a.0, a.1), at(b.0, b.1), at(c.0, c.1));
+                let alpha = 1.0 - beta - gamma;
+                let guess = (
+                    alpha * ua + beta * ub + gamma * uc,
+                    alpha * va + beta * vb + gamma * vc,
+                );
+                let t = refine_ray_hit(surface, origin, direction, guess, t)?;
+                if !hits.iter().any(|hit| (hit - t).abs() <= 1e-9 * (1.0 + t.abs())) {
+                    hits.push(t);
+                }
+            }
+        }
+    }
+    hits.sort_by(f64::total_cmp);
+    Some(hits)
+}
+
+/// Where a ray crosses a triangle: its distance and the crossing's second
+/// and third barycentric weights. The edges count as inside — a crossing on
+/// one is found from both its triangles and kept once.
+fn ray_triangle(origin: Vec3, direction: Vec3, [a, b, c]: [Vec3; 3]) -> Option<(f64, f64, f64)> {
+    let (ab, ac) = (b - a, c - a);
+    let cross = direction.cross(ac);
+    let determinant = ab.dot(cross);
+    if determinant.abs() <= f64::EPSILON * ab.length() * ac.length() {
+        return None;
+    }
+    let from = origin - a;
+    let beta = from.dot(cross) / determinant;
+    let back = from.cross(ab);
+    let gamma = direction.dot(back) / determinant;
+    const SLACK: f64 = 1e-9;
+    (beta >= -SLACK && gamma >= -SLACK && beta + gamma <= 1.0 + SLACK)
+        .then(|| (ac.dot(back) / determinant, beta, gamma))
+}
+
+/// A grid crossing pulled onto the patch: `S(u, v) = origin + t·direction`
+/// solved from the grid's guess.
+fn refine_ray_hit(
+    surface: &NurbsSurface3,
+    origin: Vec3,
+    direction: Vec3,
+    (mut u, mut v): (f64, f64),
+    mut t: f64,
+) -> Option<f64> {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let scale = 1.0 + origin.length() + t.abs() * direction.length();
+    for _ in 0..32 {
+        let residual = Vec3::from(surface.point_at_knot(u, v)) - (origin + direction * t);
+        if residual.length() <= 1e-10 * scale {
+            return Some(t);
+        }
+        let (along_u, along_v) = surface.tangents_at_knot(u, v)?;
+        let (along_u, along_v, back) = (Vec3::from(along_u), Vec3::from(along_v), direction * -1.0);
+        let determinant = along_u.dot(along_v.cross(back));
+        if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+            return None;
+        }
+        // Cramer's rule for J·step = -residual, J = [S_u S_v -d].
+        let target = residual * -1.0;
+        u += target.dot(along_v.cross(back)) / determinant;
+        v += along_u.dot(target.cross(back)) / determinant;
+        t += along_u.dot(along_v.cross(target)) / determinant;
+        u = u.clamp(u0, u1);
+        v = v.clamp(v0, v1);
+    }
+    let residual = Vec3::from(surface.point_at_knot(u, v)) - (origin + direction * t);
+    (residual.length() <= 1e-7 * scale).then_some(t)
 }
 
 /// Moves `point` by `distance` along `frame`'s normal.

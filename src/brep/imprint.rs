@@ -18,7 +18,7 @@
 //! failures are returned, and a boolean refuses on them.
 
 use super::bounds::{face_bounds, Aabb};
-use super::geometry::Curve3;
+use super::geometry::{Curve3, Surface};
 use super::intersect::{surfaces, Meeting};
 use super::split::{split_edge, split_face};
 use super::topology::{Body, FaceKey};
@@ -239,6 +239,8 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
         b.face_keys().map(|key| (key, face_bounds(b, key))).collect();
 
     let mut out = Vec::new();
+    let mut soups = None;
+    let mut marched: Vec<(Surface, Surface, Vec<Vec<Vec3>>)> = Vec::new();
     for (one, one_box) in &near {
         for (other, other_box) in &far {
             // A box that could not be computed means "cannot exclude", so
@@ -289,11 +291,138 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
                         out.push(Shared { curves });
                     }
                 }
-                Meeting::Unknown => return Err(Snag::NoClosedForm),
+                // No closed form for the pair. Their meshes may still show
+                // the two faces never come near; where they do cross, the
+                // crossing is traced onto both surfaces instead.
+                Meeting::Unknown => {
+                    let soups = soups.get_or_insert_with(|| {
+                        (
+                            super::near::FaceSoups::of(a, tolerance),
+                            super::near::FaceSoups::of(b, tolerance),
+                        )
+                    });
+                    if super::near::apart(&soups.0, *one, &soups.1, *other, tolerance) {
+                        continue;
+                    }
+                    let known = match marched
+                        .iter()
+                        .position(|(s, t, _)| s == one_surface && t == other_surface)
+                    {
+                        Some(index) => index,
+                        None => {
+                            marched.push((
+                                one_surface.clone(),
+                                other_surface.clone(),
+                                Vec::new(),
+                            ));
+                            marched.len() - 1
+                        }
+                    };
+                    let curves = soups
+                        .0
+                        .triangles(*one)
+                        .zip(soups.1.triangles(*other))
+                        .and_then(|(first, second)| {
+                            super::march::traced(
+                                one_surface,
+                                first,
+                                other_surface,
+                                second,
+                                &mut marched[known].2,
+                                tolerance,
+                            )
+                        })
+                        .ok_or(Snag::NoClosedForm)?;
+                    let curves = curves
+                        .into_iter()
+                        .flat_map(|curve| {
+                            along_edges(a, &curve, tolerance)
+                                .or_else(|| along_edges(b, &curve, tolerance))
+                                .unwrap_or_else(|| vec![curve])
+                        })
+                        .collect();
+                    out.push(Shared { curves });
+                }
             }
         }
     }
     Ok(out)
+}
+
+/// The curves of a body's own edges that a traced curve runs along, if it
+/// runs along them all the way. A shaft fitted in a hole meets the hole's
+/// fillet where the hole already does, along an edge the file saved as a
+/// spline: the traced curve is that edge again, a fit apart, and cutting
+/// with both peels hairline slivers off between them. The edge's own curve
+/// cuts the same and agrees with the vertices already there.
+fn along_edges(body: &Body, curve: &Curve3, tolerance: f64) -> Option<Vec<Curve3>> {
+    const SAMPLES: usize = 16;
+    let Curve3::Nurbs(spline) = curve else {
+        return None;
+    };
+    let (start, end) = spline.domain();
+    let points: Vec<Vec3> = (0..=SAMPLES)
+        .map(|index| {
+            Vec3::from(curve.point_at(start + (end - start) * index as f64 / SAMPLES as f64))
+        })
+        .collect();
+    let extent = points
+        .iter()
+        .map(|point| point.distance(points[0]))
+        .fold(0.0, f64::max);
+    let fit = tolerance.max(extent * 1e-3);
+    let reach = |samples: &[Vec3]| {
+        let low = samples.iter().fold(samples[0], |low, p| {
+            Vec3::new(low.x.min(p.x), low.y.min(p.y), low.z.min(p.z))
+        });
+        let high = samples.iter().fold(samples[0], |high, p| {
+            Vec3::new(high.x.max(p.x), high.y.max(p.y), high.z.max(p.z))
+        });
+        (low, high)
+    };
+    let (low, high) = reach(&points);
+    // Only edges near the curve at all are worth the nearest-point search.
+    let edges: Vec<&Curve3> = body
+        .edges
+        .iter()
+        .filter_map(|(_, edge)| {
+            let curve = body.curves.get(edge.curve)?;
+            let samples: Vec<Vec3> = (0..=8)
+                .map(|index| {
+                    Vec3::from(curve.point_at(
+                        edge.start_parameter
+                            + (edge.end_parameter - edge.start_parameter) * index as f64 / 8.0,
+                    ))
+                })
+                .collect();
+            let (edge_low, edge_high) = reach(&samples);
+            let margin = edge_low.distance(edge_high) * 0.25 + fit;
+            let apart = edge_low.x > high.x + margin
+                || edge_low.y > high.y + margin
+                || edge_low.z > high.z + margin
+                || edge_high.x < low.x - margin
+                || edge_high.y < low.y - margin
+                || edge_high.z < low.z - margin;
+            (!apart).then_some(curve)
+        })
+        .collect();
+    let mut used = vec![false; edges.len()];
+    for point in &points {
+        // Along the edge's whole curve, not just its span: a file keeps the
+        // whole of an intersection loop as the curve of the part its face
+        // still has, and the rest of the loop is the same curve again.
+        let nearest = edges.iter().position(|edge| {
+            Vec3::from(edge.point_at(edge.parameter_at(point.to_array()))).distance(*point) <= fit
+        })?;
+        used[nearest] = true;
+    }
+    let mut out: Vec<Curve3> = Vec::new();
+    for (edge, used) in edges.into_iter().zip(used) {
+        if used && !out.contains(edge) {
+            out.push(edge.clone());
+        }
+    }
+    Some(out)
 }
 
 /// Cuts every face of `body` that one of `curves` crosses.

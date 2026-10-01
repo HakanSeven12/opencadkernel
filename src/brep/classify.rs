@@ -199,7 +199,12 @@ pub(super) fn whole_closed_face(body: &Body, face: FaceKey) -> bool {
 }
 
 /// How far `point` is from a face, or `None` if that cannot be measured.
-fn face_distance(body: &Body, face: FaceKey, point: [f64; 3], tolerance: f64) -> Option<f64> {
+pub(super) fn face_distance(
+    body: &Body,
+    face: FaceKey,
+    point: [f64; 3],
+    tolerance: f64,
+) -> Option<f64> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
     let gap = surface.distance_to(point).abs();
