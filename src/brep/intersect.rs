@@ -51,6 +51,11 @@ pub enum Meeting {
 /// `tolerance` decides when two directions count as parallel and when a
 /// near-tangency is treated as a touch.
 pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
+    // One surface twice, of whatever kind — a spline patch included, which
+    // has no closed form to compare by.
+    if a == b {
+        return Meeting::Coincident;
+    }
     match (a, b) {
         (Surface::Plane(one), Surface::Plane(other)) => planes(one, other, tolerance),
         (Surface::Plane(plane), Surface::Sphere(sphere))
@@ -74,6 +79,10 @@ pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
         (Surface::Torus(torus), Surface::Cylinder(cylinder))
         | (Surface::Cylinder(cylinder), Surface::Torus(torus)) => {
             torus_cylinder(torus, cylinder, tolerance)
+        }
+        // One torus twice — a fillet both solids of an assembly carry.
+        (Surface::Torus(one), Surface::Torus(other)) if same_torus(one, other, tolerance) => {
+            Meeting::Coincident
         }
         (Surface::Cone(cone), Surface::Cylinder(cylinder))
         | (Surface::Cylinder(cylinder), Surface::Cone(cone)) => coaxial_conics(
@@ -167,6 +176,17 @@ fn revolution_profile(
 /// their meridians cross, each crossing swept round. A torus against a plane
 /// square to its axis, a coaxial torus, a sphere or a cone on its axis
 /// (#1563's knurled hubs and bearings).
+/// Whether two tori are one: the same centre, axis and radii.
+fn same_torus(one: &super::Torus, other: &super::Torus, tolerance: f64) -> bool {
+    let (Some(first), Some(second)) = (one.frame.normal(), other.frame.normal()) else {
+        return false;
+    };
+    Vec3::from(one.frame.origin).distance(Vec3::from(other.frame.origin)) <= tolerance
+        && Vec3::from(first).is_parallel_to(Vec3::from(second), tolerance)
+        && (one.major_radius - other.major_radius).abs() <= tolerance
+        && (one.minor_radius - other.minor_radius).abs() <= tolerance
+}
+
 fn coaxial_revolutions(a: &Surface, b: &Surface, tolerance: f64) -> Option<Meeting> {
     let axis_of = |surface: &Surface| -> Option<(Vec3, Vec3)> {
         let frame = match surface {

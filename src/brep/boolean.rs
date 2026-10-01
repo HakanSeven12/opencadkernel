@@ -524,7 +524,7 @@ fn sliver_point(
     boundary: &[crate::geom2d::Curve],
     centre: [f64; 2],
 ) -> Option<[f64; 3]> {
-    const STEPS: usize = 32;
+    const STEPS: usize = 256;
     let walks: Vec<Vec<Vec3>> = boundary
         .iter()
         .map(|curve| {

@@ -762,6 +762,30 @@ fn band_parity(
     let top = top + (top - point[1]) + 1.0;
     let first = ((low - point[0]) / period).floor() as i64 - 1;
     let last = ((high - point[0]) / period).ceil() as i64 + 1;
+    // Each piece's box, so the line is only tried against pieces it can meet.
+    let boxes: Vec<[[f64; 2]; 2]> = boundary
+        .iter()
+        .map(|curve| {
+            let points: Vec<[f64; 2]> = match curve {
+                Curve::Polyline(polyline)
+                    if polyline.vertices.iter().all(|vertex| vertex.bulge == 0.0) =>
+                {
+                    polyline.vertices.iter().map(|vertex| vertex.position).collect()
+                }
+                _ => (0..=16).map(|step| curve.point_at(step as f64 / 16.0)).collect(),
+            };
+            let mut low = [f64::INFINITY; 2];
+            let mut high = [f64::NEG_INFINITY; 2];
+            for point in &points {
+                for axis in 0..2 {
+                    low[axis] = low[axis].min(point[axis]);
+                    high[axis] = high[axis].max(point[axis]);
+                }
+            }
+            let pad = (high[0] - low[0]).hypot(high[1] - low[1]) * 0.05 + period * 1e-3;
+            [[low[0] - pad, low[1] - pad], [high[0] + pad, high[1] + pad]]
+        })
+        .collect();
     let mut crossings: Vec<[f64; 2]> = Vec::new();
     for turn in first..=last {
         let u = point[0] + turn as f64 * period;
@@ -771,7 +795,10 @@ fn band_parity(
             start: [u, point[1]],
             end: [u + period * 1e-3, top],
         });
-        for curve in boundary {
+        for (curve, bounds) in boundary.iter().zip(&boxes) {
+            if u < bounds[0][0] || u > bounds[1][0] || point[1] > bounds[1][1] {
+                continue;
+            }
             for crossing in crate::geom2d::intersect(&ray, curve, tolerance) {
                 // Where two boundary pieces meet, both report the joint —
                 // a turn apart, where a wrapping loop comes round.

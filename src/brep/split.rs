@@ -274,7 +274,12 @@ fn split_face_in_place(
         }
         _ => None,
     };
+    // Boxes in (u, v), so a copy of the cutter a turn away, or an edge
+    // nowhere near it, is passed over without the crossing search.
+    let piece_boxes: Vec<Option<[[f64; 2]; 2]>> =
+        boundary_parts.iter().map(|(_, piece)| uv_box(piece)).collect();
     let mut crossings_of = |shifted_cutter: Option<&crate::geom2d::Curve>| -> Option<()> {
+        let cutter_box = shifted_cutter.and_then(uv_box);
         for (coedge, flat_edge) in &boundary_parts {
             let edge_key = body.coedges.get(*coedge)?.edge;
             let edge = body.edges.get(edge_key)?.clone();
@@ -291,6 +296,16 @@ fn split_face_in_place(
                 }
                 (Some(_), Some(_), Curve3::Circle(_)) | (None, _, _) => continue,
                 (Some(shifted_cutter), _, _) => {
+                    let index = boundary_parts.iter().position(|(key, _)| key == coedge)?;
+                    if let (Some(one), Some(other)) = (cutter_box, piece_boxes[index]) {
+                        if one[1][0] < other[0][0]
+                            || other[1][0] < one[0][0]
+                            || one[1][1] < other[0][1]
+                            || other[1][1] < one[0][1]
+                        {
+                            continue;
+                        }
+                    }
                     cross(shifted_cutter, flat_edge, Tolerance::new(tolerance))
                         .into_iter()
                         .map(|crossing| surface.point_at(crossing.point[0], crossing.point[1]))
@@ -414,6 +429,11 @@ fn split_face_in_place(
     }
     if landings.is_empty() {
         let period = closed_period(cutter)?;
+        // A closed cutter crossing no edge is wholly inside the face or
+        // wholly out of it; out of it, nothing more needs asking.
+        if inside(0.0) == Some(false) && inside(period * 0.5) == Some(false) {
+            return None;
+        }
         // A closed cutter that already is one of the face's edges was cut
         // before: the landings skip it as their own curve, and cutting
         // between the loops again peeled a sliver off the same band for ever
@@ -656,6 +676,47 @@ fn split_face_in_place(
         }
     };
 
+    // However the containment tests read, a cut cannot run far outside the
+    // face it divides: one that does has gone the long way round a closed
+    // cutter, across the rest of the surface.
+    {
+        let mut low = Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY);
+        let mut high = Vec3::new(f64::NEG_INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (coedge, _) in &boundary_parts {
+            let Some(edge) =
+                body.coedges.get(*coedge).and_then(|coedge| body.edges.get(coedge.edge))
+            else {
+                continue;
+            };
+            let Some(curve) = body.curves.get(edge.curve) else {
+                continue;
+            };
+            for step in 0..=8 {
+                let t = edge.start_parameter
+                    + (edge.end_parameter - edge.start_parameter) * step as f64 / 8.0;
+                let p = Vec3::from(curve.point_at(t));
+                low = Vec3::new(low.x.min(p.x), low.y.min(p.y), low.z.min(p.z));
+                high = Vec3::new(high.x.max(p.x), high.y.max(p.y), high.z.max(p.z));
+            }
+        }
+        if low.is_finite() && high.is_finite() {
+            let pad = low.distance(high) + tolerance * 10.0;
+            let outside = (0..=8).any(|step| {
+                let t = start_parameter + (end_parameter - start_parameter) * step as f64 / 8.0;
+                let p = Vec3::from(cutter.point_at(t));
+                p.x < low.x - pad
+                    || p.y < low.y - pad
+                    || p.z < low.z - pad
+                    || p.x > high.x + pad
+                    || p.y > high.y + pad
+                    || p.z > high.z + pad
+            });
+            if outside {
+                return None;
+            }
+        }
+    }
+
     // An open cut that ends where it starts encloses nothing.
     if closed_period(cutter).is_none()
         && Vec3::from(cutter.point_at(start_parameter))
@@ -698,6 +759,31 @@ fn split_face_in_place(
     let second = vertex_at(body, &landings[1], tolerance)?;
     if first == second && !same_vertex_landing {
         return None;
+    }
+    // An edge of the face already joining the two corners the same way is
+    // this cut made before — by a copy of the cutter a hair off, say — and
+    // cutting again only peels a sliver off between the two.
+    if first != second {
+        let midway = Vec3::from(cutter.point_at(0.5 * (start_parameter + end_parameter)));
+        let fit = fit_over(start_parameter, end_parameter);
+        let repeated = body.face_coedges(face).iter().any(|coedge| {
+            let Some(edge) =
+                body.coedges.get(*coedge).and_then(|coedge| body.edges.get(coedge.edge))
+            else {
+                return false;
+            };
+            let joins = (edge.start == first && edge.end == second)
+                || (edge.start == second && edge.end == first);
+            joins
+                && body.curves.get(edge.curve).is_some_and(|curve| {
+                    let middle =
+                        curve.point_at(0.5 * (edge.start_parameter + edge.end_parameter));
+                    Vec3::from(middle).distance(midway) <= fit
+                })
+        });
+        if repeated {
+            return None;
+        }
     }
     let ends = [first, second];
     let (start, end) = (ends[start_landing], ends[end_landing]);
@@ -1350,6 +1436,35 @@ fn on_boundary(
         let near = if spline { fit } else { tolerance };
         on_edge(body, *coedge, point, near).unwrap_or(false)
     })
+}
+
+/// A box round a curve in (u, v), padded for what a sampling can miss;
+/// `None` for one without ends.
+fn uv_box(curve: &crate::geom2d::Curve) -> Option<[[f64; 2]; 2]> {
+    if matches!(curve, crate::geom2d::Curve::XLine(_) | crate::geom2d::Curve::Ray(_)) {
+        return None;
+    }
+    let points: Vec<[f64; 2]> = match curve {
+        crate::geom2d::Curve::Polyline(polyline)
+            if polyline.vertices.iter().all(|vertex| vertex.bulge == 0.0) =>
+        {
+            polyline.vertices.iter().map(|vertex| vertex.position).collect()
+        }
+        _ => (0..=32).map(|step| curve.point_at(step as f64 / 32.0)).collect(),
+    };
+    let mut low = [f64::INFINITY; 2];
+    let mut high = [f64::NEG_INFINITY; 2];
+    for point in &points {
+        for axis in 0..2 {
+            low[axis] = low[axis].min(point[axis]);
+            high[axis] = high[axis].max(point[axis]);
+        }
+    }
+    if !low.iter().chain(&high).all(|value| value.is_finite()) {
+        return None;
+    }
+    let pad = ((high[0] - low[0]).hypot(high[1] - low[1])) * 0.05 + 1e-9;
+    Some([[low[0] - pad, low[1] - pad], [high[0] + pad, high[1] + pad]])
 }
 
 /// Whether two curves are one circle, whichever way round each runs.
