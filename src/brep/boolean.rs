@@ -656,11 +656,15 @@ fn copy_face_with_tolerance(result: &mut Body, source: &Body, face: FaceKey, she
                 .clone();
             let start = copy_vertex(result, source, source_edge.start, tolerance)?;
             let end = copy_vertex(result, source, source_edge.end, tolerance)?;
-            // A short straight split can collapse when its two vertices are
-            // sewn within tolerance. Keeping a zero-length coedge leaves an
-            // otherwise valid triangular patch impossible to triangulate.
+            // A short split can collapse when its two vertices are sewn
+            // within tolerance — a straight one, or a stretch of spline
+            // between two cuts a fit apart. Keeping a zero-length coedge
+            // leaves an otherwise valid patch impossible to triangulate.
             // Closed circles still require their single seam vertex.
-            if start == end && matches!(curve, super::Curve3::Line(_)) {
+            if start == end
+                && (matches!(curve, super::Curve3::Line(_))
+                    || source_edge.start != source_edge.end)
+            {
                 continue;
             }
             let middle = curve.point_at(

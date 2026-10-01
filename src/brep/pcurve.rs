@@ -674,6 +674,12 @@ pub(crate) fn contains_parameter(
     tolerance: crate::geom2d::Tolerance,
 ) -> bool {
     let periods = periods(surface);
+    // A band's rims are not polygons, and a polygon test over them reads a
+    // point in one of the band's holes as inside it; counted along `v` the
+    // holes and rims all answer alike.
+    if let Some(inside) = band_parity(periods, boundary, point, tolerance) {
+        return inside;
+    }
     let turns = |period: Option<f64>| match period {
         Some(period) => vec![-period, 0.0, period],
         None => vec![0.0],
@@ -691,44 +697,54 @@ pub(crate) fn contains_parameter(
         return true;
     }
     // Two full-turn loops bound a band without forming a plane polygon.
-    if periodic_band_levels(surface, boundary, tolerance.linear()).is_some_and(|levels| {
+    periodic_band_levels(surface, boundary, tolerance.linear()).is_some_and(|levels| {
         point[1] >= levels[0] - tolerance.linear()
             && point[1] <= levels[1] + tolerance.linear()
-    }) {
-        return true;
-    }
-    band_parity(periods, boundary, point, tolerance)
+    })
 }
 
-/// Whether a point is inside a band whose rims wrap round rather than
-/// close — one rim notched, say, so the band test's two flat levels are not
-/// there. A line from the point straight along `v`, past every rim, crosses
-/// the boundary an odd number of times from inside; the boundary covers one
-/// turn, so the line is tried at every turn it spans.
+/// Whether a point is inside a band — a face whose rims wrap round the
+/// surface rather than close, holes and notches and all. A line from the
+/// point along `v`, past every rim, crosses the boundary an odd number of
+/// times from inside; the boundary covers one turn, so the line is tried at
+/// every turn it spans. `None` for a face that is not a band.
 fn band_parity(
     periods: [Option<f64>; 2],
     boundary: &[Curve],
     point: [f64; 2],
     tolerance: crate::geom2d::Tolerance,
-) -> bool {
+) -> Option<bool> {
     let ([Some(period), None], false) = (periods, boundary.is_empty()) else {
-        return false;
+        return None;
     };
-    // Loops that close in the plane are the polygon test's, already asked;
-    // a loop that wraps comes round a turn along, once. One wrapping loop
-    // alone — a cone's rim, its face running up to the apex — bounds a side
-    // only the apex decides, not a band.
+    // A band has its rims wrap round, each a turn along, in pairs; with no
+    // wrapping loop the face is the polygon test's. One wrapping loop alone
+    // — a cone's rim, its face running up to the apex — bounds a side only
+    // the apex decides, not a band.
     let near =
         |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= tolerance.linear();
-    let wrapping = boundary
-        .iter()
-        .filter(|curve| {
-            let end = curve.point_at(1.0);
-            !boundary.iter().any(|next| near(next.point_at(0.0), end))
-        })
-        .count();
+    // The boundary lists each loop's pieces in order; a loop ends where the
+    // next piece does not take up from it. Pieces walked from a spline meet
+    // only to the walk's accuracy, and a wrap leaves a whole turn between
+    // the loop's two ends.
+    let joined =
+        |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= period * 1e-3;
+    let mut wrapping = 0;
+    let mut loop_start = 0;
+    for (index, curve) in boundary.iter().enumerate() {
+        let end = curve.point_at(1.0);
+        let continues = boundary
+            .get(index + 1)
+            .is_some_and(|next| joined(next.point_at(0.0), end));
+        if !continues {
+            if !joined(boundary[loop_start].point_at(0.0), end) {
+                wrapping += 1;
+            }
+            loop_start = index + 1;
+        }
+    }
     if wrapping < 2 || wrapping % 2 == 1 {
-        return false;
+        return None;
     }
     let samples: Vec<[f64; 2]> = boundary
         .iter()
@@ -741,7 +757,7 @@ fn band_parity(
         },
     );
     if point[1] >= top {
-        return false;
+        return Some(false);
     }
     let top = top + (top - point[1]) + 1.0;
     let first = ((low - point[0]) / period).floor() as i64 - 1;
@@ -749,9 +765,11 @@ fn band_parity(
     let mut crossings: Vec<[f64; 2]> = Vec::new();
     for turn in first..=last {
         let u = point[0] + turn as f64 * period;
+        // Slanted a little, so the line never runs along an edge of
+        // constant `u` — a generator, a slot's side.
         let ray = Curve::Line(Line {
             start: [u, point[1]],
-            end: [u, top],
+            end: [u + period * 1e-3, top],
         });
         for curve in boundary {
             for crossing in crate::geom2d::intersect(&ray, curve, tolerance) {
@@ -768,7 +786,7 @@ fn band_parity(
             }
         }
     }
-    crossings.len() % 2 == 1
+    Some(crossings.len() % 2 == 1)
 }
 
 /// An interior point between two full-turn boundary loops.
