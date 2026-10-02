@@ -3903,7 +3903,10 @@ fn surface_span_breaks(
         parameters[1 - fixed_axis] = varying;
         parameters
     });
-    if !angle_exceeds(surface_normal_angle(surface, &parameters)?, max_angle) {
+    // The parameter line's own turning counts as well as the normal's: a
+    // flat spline patch whose isolines curve (a planar face swept along an
+    // arc) has a constant normal, and would otherwise be cut by chords.
+    if !angle_exceeds(surface_path_angle(surface, &parameters)?, max_angle) {
         values.push(from);
         return Some(());
     }
