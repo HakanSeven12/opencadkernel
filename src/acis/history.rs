@@ -959,6 +959,27 @@ fn sweep_history_geometry(
         value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
         value.path_entity_transform,
     )?;
+    // Flag 295: the stored profile is already placed at the path start and
+    // aligned (base point, alignment and profile rotation applied), so it is
+    // swept where it stands.
+    if value.flags_294_296[1] {
+        let start = brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
+        return Ok(SweepHistoryGeometry {
+            plane,
+            wires,
+            path,
+            path_shift: Vec3::ZERO,
+            options: brep::SweepOptions {
+                align: false,
+                base_point: Some(start),
+                rotation: 0.0,
+                twist: value.twist_angle,
+                scale: value.scale_factor,
+                bank: value.bank,
+                surface: surface || !closed,
+            },
+        });
+    }
     let explicit_alignment = value.has_align_start || value.align_option != 0;
     let mut path_shift = Vec3::ZERO;
     let reference_point = if explicit_alignment {
