@@ -4238,6 +4238,7 @@ mod tests {
                 Some(Surface::Plane(_)) => "plane",
                 Some(Surface::Cylinder(_)) => "cylinder",
                 Some(Surface::Cone(_)) => "cone",
+                Some(Surface::EllipticCone(_)) => "elliptic-cone",
                 Some(Surface::Sphere(_)) => "sphere",
                 Some(Surface::Torus(_)) => "torus",
                 Some(Surface::Nurbs(_)) => "nurbs",

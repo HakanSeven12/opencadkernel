@@ -9,8 +9,9 @@ use cadcodec::entities::acis::types::{
     SatSphereSurface, SatSplineSurface, SatStraightCurve, SatTorusSurface, SatVertex, Sense,
 };
 use crate::brep::{
-    Body, Circle3, Coedge, Cone, Curve3, CurveKey, Cylinder, Edge, EdgeKey, Face, Line3, Loop,
-    Lump, Provenance, Shell, SourceRef, Sphere, Surface, SurfaceKey, Torus, Vertex, VertexKey,
+    Body, Circle3, Coedge, Cone, Curve3, CurveKey, Cylinder, Edge, EdgeKey, EllipticCone, Face,
+    Line3, Loop, Lump, Provenance, Shell, SourceRef, Sphere, Surface, SurfaceKey, Torus, Vertex,
+    VertexKey,
 };
 use crate::geom2d::{Curve as Curve2, NurbsCurve};
 use crate::space::{NurbsCurve3, NurbsSurface3, Plane, Vec3};
@@ -541,13 +542,30 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
         let radius = Vec3::new(mx, my, mz).length();
         let base = Plane::orthonormal([cx, cy, cz], [mx, my, mz], [ax, ay, az])?;
         let (sine, cosine) = (cone.sin_half_angle(), cone.cos_half_angle());
-        return Some(if sine.abs() < 1e-12 {
+        let ratio = cone.ratio();
+        let circular = (ratio - 1.0).abs() < 1e-12;
+        return Some(if circular && sine.abs() < 1e-12 {
             Surface::Cylinder(Cylinder { base, radius })
-        } else {
+        } else if circular {
             Surface::Cone(Cone {
                 base,
                 radius,
                 half_angle: -sine.atan2(cosine),
+            })
+        } else {
+            // An elliptical section, which is how native ACIS authors every
+            // elliptical cylinder and cone: the one record the circular
+            // kinds are the ratio-one special case of. Lifting it as a
+            // circle would put the whole section several units off.
+            Surface::EllipticCone(EllipticCone {
+                base,
+                radius,
+                ratio,
+                half_angle: if sine.abs() < 1e-12 {
+                    0.0
+                } else {
+                    -sine.atan2(cosine)
+                },
             })
         });
     }

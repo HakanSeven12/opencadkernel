@@ -192,7 +192,7 @@ fn moved_pcurve(
     let handed = if reflects { -1.0 } else { 1.0 };
     let factors = match surface {
         Surface::Plane(_) => [scale, handed * scale],
-        Surface::Cylinder(_) | Surface::Cone(_) => [handed, scale],
+        Surface::Cylinder(_) | Surface::Cone(_) | Surface::EllipticCone(_) => [handed, scale],
         Surface::Sphere(_) | Surface::Torus(_) => [handed, 1.0],
         Surface::Nurbs(_) => [1.0, 1.0],
     };
@@ -243,6 +243,13 @@ fn move_surface(surface: &Surface, place: &Placement, scale: f64) -> Option<Surf
             base: place.frame(&cone.base)?,
             radius: cone.radius * scale,
             // An angle is what a similarity leaves alone.
+            half_angle: cone.half_angle,
+        }),
+        Surface::EllipticCone(cone) => Surface::EllipticCone(super::geometry::EllipticCone {
+            base: place.frame(&cone.base)?,
+            radius: cone.radius * scale,
+            // Both a shape and an angle: what a similarity leaves alone.
+            ratio: cone.ratio,
             half_angle: cone.half_angle,
         }),
         Surface::Sphere(sphere) => Surface::Sphere(super::geometry::Sphere {

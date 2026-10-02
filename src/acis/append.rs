@@ -456,11 +456,29 @@ pub(super) fn surface_record(surface: &Surface) -> Option<(&'static str, Vec<Sat
         ),
         Surface::Cylinder(cylinder) => (
             "cone-surface",
-            cone_tokens(origin, normal, u, cylinder.radius, 0.0),
+            cone_tokens(origin, normal, u, cylinder.radius, 1.0, 0.0),
         ),
         Surface::Cone(cone) => (
             "cone-surface",
-            cone_tokens(origin, normal, u, cone.radius, cone.half_angle),
+            cone_tokens(
+                origin,
+                normal,
+                u,
+                cone.radius,
+                1.0,
+                cone.half_angle,
+            ),
+        ),
+        Surface::EllipticCone(cone) => (
+            "cone-surface",
+            cone_tokens(
+                origin,
+                normal,
+                u,
+                cone.radius,
+                cone.ratio,
+                cone.half_angle,
+            ),
         ),
         Surface::Sphere(sphere) => (
             "sphere-surface",
@@ -485,8 +503,9 @@ pub(super) fn surface_record(surface: &Surface) -> Option<(&'static str, Vec<Sat
     })
 }
 
-/// A cone record, cylinder included — ACIS has no separate cylinder record,
-/// only a cone whose half-angle is zero.
+/// A cone record, cylinder included — ACIS has no separate cylinder or
+/// elliptical-cylinder record, only a cone whose half-angle is zero and
+/// whose section may keep an aspect, the `ratio` of minor over major.
 ///
 /// The radius is carried as the *length* of the major axis, which is how it
 /// is read back; a unit major axis with the radius beside it produces a cone
@@ -497,6 +516,7 @@ fn cone_tokens(
     axis: [f64; 3],
     u: [f64; 3],
     radius: f64,
+    ratio: f64,
     half_angle: f64,
 ) -> Vec<SatToken> {
     let major = (Vec3::from(u) * radius).to_array();
@@ -505,7 +525,7 @@ fn cone_tokens(
         position(origin),
         position(axis),
         position(major),
-        SatToken::Float(1.0),
+        SatToken::Float(ratio),
         SatToken::Ident("I".to_string()),
         SatToken::Ident("I".to_string()),
         SatToken::Float(sine),
