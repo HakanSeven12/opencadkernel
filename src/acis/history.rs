@@ -911,11 +911,28 @@ fn sweep_nurbs_length(curve: &NurbsCurve3) -> f64 {
     }).sum()
 }
 
+/// Transforms that place the embedded profile and path in world space.
+///
+/// With flag 295 both entities are stored already placed (the profile at the
+/// path start, both in world coordinates). The record's matrices then
+/// describe the source profile frame and the placed profile frame; applying
+/// them to the stored geometry again would move it off the path.
+fn sweep_entity_transforms(value: &SolidHistorySweep) -> ([f64; 16], [f64; 16]) {
+    const IDENTITY: [f64; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    if value.flags_294_296[1] {
+        (IDENTITY, IDENTITY)
+    } else {
+        (value.sweep_entity_transform, value.path_entity_transform)
+    }
+}
+
 /// Length of the history path in world units, including its closing segment.
 pub fn sweep_history_path_length(value: &SolidHistorySweep) -> Result<f64, HistoryRebuildError> {
     let path = embedded_sweep_path(
         value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
-        value.path_entity_transform,
+        sweep_entity_transforms(value).1,
     )?;
     let length = match path {
         HistorySweepPath::Planar { plane, curves, .. } => {
@@ -951,13 +968,14 @@ fn sweep_history_geometry(
     value: &SolidHistorySweep,
     surface: bool,
 ) -> Result<SweepHistoryGeometry, HistoryRebuildError> {
+    let (profile_transform, path_transform) = sweep_entity_transforms(value);
     let (plane, wires, closed) = sweep_profile_geometry(
         value.sweep_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
-        value.sweep_entity_transform,
+        profile_transform,
     )?;
     let mut path = embedded_sweep_path(
         value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
-        value.path_entity_transform,
+        path_transform,
     )?;
     // Flag 295: the stored profile is already placed at the path start and
     // aligned (base point, alignment and profile rotation applied), so it is
@@ -1036,9 +1054,10 @@ pub fn sweep_history_placements(
         y_axis: [0.0, 1.0, 0.0],
         z_axis: [0.0, 0.0, 1.0],
     };
+    let (profile_transform, path_transform) = sweep_entity_transforms(value);
     Ok((
-        compose_placements(base, compose_placements(profile, placement(value.sweep_entity_transform)?)),
-        compose_placements(base, compose_placements(path_shift, placement(value.path_entity_transform)?)),
+        compose_placements(base, compose_placements(profile, placement(profile_transform)?)),
+        compose_placements(base, compose_placements(path_shift, placement(path_transform)?)),
     ))
 }
 
@@ -1047,7 +1066,7 @@ pub fn sweep_history_reference_point(value: &SolidHistorySweep) -> Result<[f64; 
     let reference = if value.has_align_start || value.align_option != 0 {
         let path = embedded_sweep_path(
             value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
-            value.path_entity_transform,
+            sweep_entity_transforms(value).1,
         )?;
         brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?
     } else {
@@ -1065,9 +1084,11 @@ pub fn rebuild_sweep_with_mode(
     value: &SolidHistorySweep,
     surface: bool,
 ) -> Result<Body, HistoryRebuildError> {
-    // Nondefault native miter/intersection policies cannot be replaced by
-    // the standard construction without changing the saved object's intent.
-    if value.miter_option != 0 || value.check_intersections {
+    // The reference application builds the same bisector-mitered corner for
+    // every miter option (default, old, new, crimp, bend: 0..=4), on planar
+    // and spatial polyline paths alike. Unknown values and the intersection
+    // check, which can reject a self-intersecting sweep, stay unsupported.
+    if value.miter_option > 4 || value.check_intersections {
         return Err(HistoryRebuildError::Unsupported);
     }
     if !value.scale_factor.is_finite()
