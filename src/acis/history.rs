@@ -1431,16 +1431,17 @@ pub fn rebuild_body(
     operation: &SolidHistoryOperation,
 ) -> Result<Body, HistoryRebuildError> {
     match operation {
+        // Box and wedge history frames sit at the bounding-box centre.
         SolidHistoryOperation::Box(value) => finish(
             brep::make::cuboid(
-                [0.0; 3],
+                [-value.length * 0.5, -value.width * 0.5, -value.height * 0.5],
                 [value.length, value.width, value.height],
             ),
             value.base.transform,
         ),
         SolidHistoryOperation::Wedge(value) => finish(
             brep::make::wedge(
-                [0.0; 3],
+                [-value.length * 0.5, -value.width * 0.5, -value.height * 0.5],
                 value.length,
                 value.width,
                 value.height,
