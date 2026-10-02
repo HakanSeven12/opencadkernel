@@ -134,7 +134,55 @@ fn lift_one(
         lump_pointer = source_lump.next_lump();
     }
 
-    (!body.roots.is_empty()).then_some(body)
+    if body.roots.is_empty() {
+        return None;
+    }
+    // The topology is stored in body space; the body's `transform` record
+    // places it in the world (a moved solid only rewrites that record).
+    let Some(record) = resolve(document, source.transform()) else {
+        return Some(body);
+    };
+    let placed = body_placement(record).and_then(|place| crate::brep::transform(&body, &place));
+    if placed.is_none() {
+        note_broken(loss, record);
+    }
+    placed
+}
+
+/// `world = scale * (p * M) + T`, from the 3x3 row matrix, the translation
+/// and the scale at the head of a `transform` record. SAB groups the rows
+/// and the translation as positions, and some writers put the whole payload
+/// in one long string; all three forms are read.
+fn body_placement(record: &SatRecord) -> Option<crate::brep::Placement> {
+    if record.entity_type != "transform" {
+        return None;
+    }
+    let mut values = Vec::with_capacity(13);
+    for token in &record.tokens {
+        if values.len() >= 13 {
+            break;
+        }
+        if let Some((components, len)) = token.coordinate_components() {
+            values.extend_from_slice(&components[..len]);
+        } else if let Some(value) = token.as_float() {
+            values.push(value);
+        } else if let Some(value) = token.as_integer() {
+            values.push(value as f64);
+        } else if let Some(text) = token.as_string() {
+            values.extend(text.split_ascii_whitespace().map_while(|word| word.parse::<f64>().ok()));
+        }
+    }
+    if values.len() < 13 || !values[..13].iter().all(|value| value.is_finite()) || values[12] <= 0.0 {
+        return None;
+    }
+    let scale = values[12];
+    let row = |at: usize| [scale * values[at], scale * values[at + 1], scale * values[at + 2]];
+    Some(crate::brep::Placement {
+        x_axis: row(0),
+        y_axis: row(3),
+        z_axis: row(6),
+        origin: [values[9], values[10], values[11]],
+    })
 }
 
 fn lift_face(
@@ -155,7 +203,7 @@ fn lift_face(
     };
     let face = body.faces.insert(Face {
         surface,
-        forward: (source.sense() == Sense::Forward) != reversed_v,
+        forward: ((source.sense() == Sense::Forward) != reversed_v) != cone_points_inward(surface_record),
         loops: Vec::new(),
         owner: shell,
         provenance: clean(record),
@@ -640,6 +688,13 @@ fn analytic_surface_reversed(record: &SatRecord) -> bool {
         .is_some_and(|sense| sense == Sense::Reversed)
 }
 
+/// A cone record with a negative cosine has its normal towards the axis (the
+/// inner wall of a swept bend, for example). The kernel's cones and
+/// cylinders always face away from the axis, so the face turns instead.
+fn cone_points_inward(record: &SatRecord) -> bool {
+    SatConeSurface::from_record(record).is_some_and(|cone| cone.cos_half_angle() < 0.0)
+}
+
 fn surface_of(
     document: &SatDocument,
     body: &mut Body,
@@ -682,7 +737,10 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
         // token — reading the token instead turns a disc into a ring.
         let radius = Vec3::new(mx, my, mz).length();
         let base = Plane::orthonormal([cx, cy, cz], [mx, my, mz], [ax, ay, az])?;
+        // Only the ratio shapes the cone; a negative cosine flips the normal,
+        // which `cone_points_inward` carries on the face.
         let (sine, cosine) = (cone.sin_half_angle(), cone.cos_half_angle());
+        let (sine, cosine) = if cosine < 0.0 { (-sine, -cosine) } else { (sine, cosine) };
         return Some(if sine.abs() < 1e-12 {
             Surface::Cylinder(Cylinder { base, radius })
         } else {
