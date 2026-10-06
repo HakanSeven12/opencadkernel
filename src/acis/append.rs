@@ -232,6 +232,80 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
     })
 }
 
+/// Appends a straight-segment polyline as a wire body, the form the
+/// reference modeler keeps a polyline sweep path in. A closed polyline
+/// ends where it starts; an open one's end coedges point at themselves.
+pub fn append_polyline_wire(
+    points: &[[f64; 3]],
+    closed: bool,
+    document: &mut SatDocument,
+) -> Result<Written, Unappendable> {
+    let mut points = points.to_vec();
+    if closed && points.len() > 2 && points.first() == points.last() {
+        points.pop();
+    }
+    let spans = if closed { points.len() } else { points.len().saturating_sub(1) };
+    if spans == 0 || points.iter().flatten().any(|value| !value.is_finite()) {
+        return Err(Unappendable::Inconsistent);
+    }
+    let before = document.record_count();
+    let mut vertex_ids = Vec::new();
+    let mut point_ids = Vec::new();
+    for point in &points {
+        point_ids.push(add(document, "point", vec![position(*point)]));
+        vertex_ids.push(add(document, "vertex", Vec::new()));
+    }
+    let mut curves = Vec::new();
+    let mut lengths = Vec::new();
+    for index in 0..spans {
+        let (start, end) = (Vec3::from(points[index]), Vec3::from(points[(index + 1) % points.len()]));
+        let length = start.distance(end);
+        let direction = (end - start).normalize().ok_or(Unappendable::Inconsistent)?;
+        let line = Curve3::Line(crate::brep::Line3 { origin: start.to_array(), direction: direction.to_array() });
+        curves.push(add_curve(document, &line).ok_or(Unappendable::Curve)?);
+        lengths.push(length);
+    }
+    let edges = (0..spans).map(|_| add(document, "edge", Vec::new())).collect::<Vec<_>>();
+    let coedges = (0..spans).map(|_| add(document, "coedge", Vec::new())).collect::<Vec<_>>();
+    let wire = add(document, "wire", Vec::new());
+    let shell = add(document, "shell", Vec::new());
+    let lump = add(document, "lump", Vec::new());
+    let body = add(document, "body", Vec::new());
+    for (index, vertex) in vertex_ids.iter().enumerate() {
+        let edge = edges[index.min(spans - 1)];
+        set(document, *vertex, vec![null(), pointer(edge), pointer(point_ids[index])]);
+    }
+    for index in 0..spans {
+        set(document, edges[index], vec![
+            null(),
+            pointer(vertex_ids[index]),
+            SatToken::Float(0.0),
+            pointer(vertex_ids[(index + 1) % points.len()]),
+            SatToken::Float(lengths[index]),
+            pointer(coedges[index]),
+            pointer(curves[index]),
+            sense(true),
+        ]);
+        let next = if index + 1 < spans { coedges[index + 1] } else if closed { coedges[0] } else { coedges[index] };
+        let previous = if index > 0 { coedges[index - 1] } else if closed { coedges[spans - 1] } else { coedges[0] };
+        set(document, coedges[index], vec![
+            null(),
+            pointer(next),
+            pointer(previous),
+            null(),
+            pointer(edges[index]),
+            sense(true),
+            pointer(wire),
+            null(),
+        ]);
+    }
+    set(document, wire, vec![null(), null(), pointer(coedges[0]), pointer(shell), null(), SatToken::Ident("out".to_string())]);
+    set(document, shell, vec![null(), null(), null(), null(), pointer(wire), pointer(lump)]);
+    set(document, lump, vec![null(), null(), pointer(shell), pointer(body)]);
+    set(document, body, vec![null(), pointer(lump), null(), null()]);
+    Ok(Written { body, records: document.record_count() - before })
+}
+
 const NULL: i32 = -1;
 
 /// The record after `key` in an ownership list, or null at the end.
