@@ -19,6 +19,8 @@ pub enum HistoryRebuildError {
     InvalidBrep,
     Fillet(brep::FilletError),
     Chamfer(brep::ChamferError),
+    /// The reference modeler's error code for an operation it refuses.
+    Modeling(u32),
 }
 
 impl std::fmt::Display for HistoryRebuildError {
@@ -30,6 +32,7 @@ impl std::fmt::Display for HistoryRebuildError {
             Self::InvalidBrep => formatter.write_str("invalid solid history B-rep"),
             Self::Fillet(error) => write!(formatter, "solid history fillet failed: {error}"),
             Self::Chamfer(error) => write!(formatter, "solid history chamfer failed: {error}"),
+            Self::Modeling(code) => write!(formatter, "modeling operation error {code}"),
         }
     }
 }
@@ -1212,6 +1215,9 @@ pub fn rebuild_sweep_with_mode(
         };
     }
     let geometry = sweep_history_geometry(value, surface)?;
+    if let Some(code) = brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options) {
+        return Err(HistoryRebuildError::Modeling(code));
+    }
     finish(
         brep::sweep_path(
             geometry.plane,
@@ -1221,6 +1227,13 @@ pub fn rebuild_sweep_with_mode(
         ),
         value.base.transform,
     )
+}
+
+/// The reference modeler's error code when it refuses a sweep record: a
+/// twist (115065) or scale (5016) along a path with a corner.
+pub fn sweep_history_refusal(value: &SolidHistorySweep) -> Option<u32> {
+    let geometry = sweep_history_geometry(value, false).ok()?;
+    brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options)
 }
 
 fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {

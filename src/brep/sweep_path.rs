@@ -5,7 +5,7 @@
 //! General paths use tolerance-controlled cubic transport patches, rational
 //! in the profile parameter, with shared rims and rails between patches.
 
-use super::geometry::{Curve3, Surface};
+use super::geometry::{Circle3, Curve3, Surface};
 use super::nurbs_builder::{RationalCurve2, RationalCurve3};
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, FaceKey, Loop, Lump, Shell, ShellKey, Vertex,
@@ -205,6 +205,39 @@ fn conic_anchor(pieces: &[Curve]) -> Option<[f64; 2]> {
     Some(pieces[index].point_at(if senses[index] { parameter } else { 1.0 - parameter }))
 }
 
+/// The reference modeler refuses to twist or scale along a path with a
+/// corner (a mitred joint cannot change the section on both sides), and to
+/// bank along a planar path with a corner. Returns its modeling error code:
+/// 5016 for a scale, else 115065 for a twist, else 115007 for banking.
+pub fn sweep_corner_refusal(path: SweepPath<'_>, options: SweepOptions) -> Option<u32> {
+    let planar = matches!(path, SweepPath::Planar { .. });
+    let pieces = path_pieces(path)?;
+    let start = pieces.first()?.point(0.0);
+    let end = pieces.last()?.point(1.0);
+    let extent = pieces.iter().map(|piece| piece.length()).sum::<f64>();
+    corner_refusal(&pieces, start.distance(end) <= extent.max(1.0) * 1e-9, planar, options)?
+}
+
+fn corner_refusal(pieces: &[Piece], closed: bool, planar: bool, options: SweepOptions) -> Option<Option<u32>> {
+    let joints = pieces.windows(2).map(|pair| (&pair[0], &pair[1]))
+        .chain(closed.then(|| (pieces.last().unwrap(), &pieces[0])));
+    let mut cornered = false;
+    for (before, after) in joints {
+        cornered |= before.tangent(1.0)?.dot(after.tangent(0.0)?) < 1.0 - 1e-9;
+    }
+    Some(if !cornered {
+        None
+    } else if (options.scale - 1.0).abs() > 1e-12 {
+        Some(5016)
+    } else if options.twist.abs() > 1e-12 {
+        Some(115065)
+    } else if options.bank && planar {
+        Some(115007)
+    } else {
+        None
+    })
+}
+
 /// Sweeps an outer profile and optional holes along a connected spatial path.
 /// A single open wire produces a sheet even when `surface` is false.
 ///
@@ -232,6 +265,7 @@ pub fn sweep_path(
     if wires.iter().any(|wire| !wire.closed) && wires.len() != 1 {
         return None;
     }
+    let planar = matches!(path, SweepPath::Planar { .. });
     let pieces = path_pieces(path)?;
     let start = pieces.first()?.point(0.0);
     let tangent = pieces.first()?.tangent(0.0)?;
@@ -241,15 +275,7 @@ pub fn sweep_path(
         return None;
     }
     let closed = start.distance(end) <= extent.max(1.0) * 1e-9;
-    // The reference modeler refuses to twist or scale along a path with a
-    // corner (a mitred joint cannot change the section on both sides).
-    let joints = pieces.windows(2).map(|pair| (&pair[0], &pair[1]))
-        .chain(closed.then(|| (pieces.last().unwrap(), &pieces[0])));
-    let mut cornered = false;
-    for (before, after) in joints {
-        cornered |= before.tangent(1.0)?.dot(after.tangent(0.0)?) < 1.0 - 1e-9;
-    }
-    if cornered && (options.twist.abs() > 1e-12 || (options.scale - 1.0).abs() > 1e-12) {
+    if corner_refusal(&pieces, closed, planar, options)?.is_some() {
         return None;
     }
     let mut source_wires = wires.iter().map(|wire| wire.source.clone()).collect::<Vec<_>>();
@@ -315,10 +341,28 @@ pub fn sweep_path(
         }
     }
 
+    // A round tube with a corner on a circular run keeps its runs exact and
+    // joins them as the reference modeler does.
+    if !sheet && wires.len() == 1 && options.twist.abs() <= 1e-12 && (options.scale - 1.0).abs() <= 1e-12 {
+        if let Some((centre, radius)) = profile_circle(&source_wires[0]) {
+            if let Some(body) = circular_tube(&pieces, first, centre, radius, closed) {
+                return Some(body);
+            }
+        }
+        if let Some(body) = planar_band(&pieces, first, &source_wires, closed) {
+            return Some(body);
+        }
+    }
+
     let radius = wires.iter().flat_map(|wire| &wire.curves)
         .flat_map(|curve| &curve.points)
         .map(|p| Vec3::from(profile_plane.point_at(*p)).distance(base))
         .fold(1.0_f64, f64::max) * options.scale.max(1.0);
+    if closed && !sheet {
+        if let Some(body) = closed_turned_polyline(&pieces, first, &source_wires, &wires, options, radius) {
+            return Some(body);
+        }
+    }
     let patches = transported_patches(&pieces, first, options,
         extent, radius, closed)?;
     // A sheet need not sweep out any volume (for example an in-plane line
@@ -345,6 +389,27 @@ fn analytic_ruled_faces(body: &mut Body) -> Option<()> {
         .map(f64::abs)
         .fold(1.0_f64, f64::max);
     let tolerance = size * 1e-9;
+    // Straight spline edges become lines between their vertices.
+    for key in body.edge_keys().collect::<Vec<_>>() {
+        let edge = body.edges.get(key)?;
+        let Some(Curve3::Nurbs(curve)) = body.curves.get(edge.curve) else { continue };
+        let (start, end) = (Vec3::from(body.vertices.get(edge.start)?.point), Vec3::from(body.vertices.get(edge.end)?.point));
+        let Some(direction) = (end - start).normalize() else { continue };
+        let straight = curve.control_points().iter().all(|point| {
+            let offset = Vec3::from(*point) - start;
+            (offset - direction * offset.dot(direction)).length() <= tolerance
+        });
+        if !straight { continue; }
+        let shared = body.edges.iter().filter(|(_, other)| other.curve == edge.curve).count() > 1;
+        let line = Curve3::Line(super::geometry::Line3 { origin: start.to_array(), direction: (end - start).to_array() });
+        let old = edge.curve;
+        let new = body.curves.insert(line);
+        let target = body.edges.get_mut(key)?;
+        target.curve = new;
+        target.start_parameter = 0.0;
+        target.end_parameter = 1.0;
+        if !shared { body.curves.remove(old); }
+    }
     for face in body.face_keys().collect::<Vec<_>>() {
         let (old, forward) = body.faces.get(face).map(|face| (face.surface, face.forward))?;
         let Some(Surface::Nurbs(surface)) = body.surfaces.get(old) else { continue };
@@ -671,6 +736,841 @@ fn loop_area(body: &Body, face: FaceKey, ring: &[CoedgeKey]) -> Option<f64> {
         sum + points[index].cross(points[(index + 1) % points.len()])
     });
     Some(area.dot(normal).abs() * 0.5)
+}
+
+/// The centre and radius of a profile that is one whole circle.
+fn profile_circle(wire: &[Curve]) -> Option<([f64; 2], f64)> {
+    let pieces = expanded(wire)?;
+    let Curve::Arc(first) = pieces.first()? else { return None };
+    let mut sweep = 0.0;
+    for piece in &pieces {
+        let Curve::Arc(arc) = piece else { return None };
+        let scale = first.radius.abs().max(1.0) * 1e-10;
+        if (arc.centre[0] - first.centre[0]).hypot(arc.centre[1] - first.centre[1]) > scale
+            || (arc.radius - first.radius).abs() > scale
+        {
+            return None;
+        }
+        sweep += arc.sweep();
+    }
+    ((sweep - TAU).abs() <= 1e-9 && first.radius > 0.0).then_some((first.centre, first.radius))
+}
+
+/// One run of a tube: straight, or turning about an axis.
+#[derive(Clone, Copy)]
+enum TubeRun {
+    Straight { from: Vec3, to: Vec3 },
+    Turn { centre: Vec3, axis: Vec3, angle: f64 },
+}
+
+/// The circular section of a tube at a frame.
+struct TubeSection { centre: Vec3, normal: Vec3, x: Vec3 }
+
+fn tube_section(frame: Frame, centre: [f64; 2], tangent: Vec3) -> Option<TubeSection> {
+    Some(TubeSection { centre: frame.point(centre), normal: tangent, x: frame.x.normalize()? })
+}
+
+/// A run's swept solid, for point membership near a corner: the infinite
+/// cylinder or the whole torus, limited to the run's own extent.
+struct TubeSolid { run: TubeRun, start: Vec3, radius: f64 }
+
+impl TubeSolid {
+    /// Signed distance to the tube surface (negative inside) and whether the
+    /// point lies within the run's extent.
+    fn probe(&self, point: Vec3) -> (f64, bool) {
+        match self.run {
+            TubeRun::Straight { from, to } => {
+                let direction = (to - from).normalize().unwrap_or(Vec3::X);
+                let length = from.distance(to);
+                let offset = point - self.start;
+                let along = offset.dot(direction);
+                let across = (offset - direction * along).length();
+                (across - self.radius, (-1e-12..=length + 1e-12).contains(&along))
+            }
+            TubeRun::Turn { centre, axis, angle } => {
+                let radial = self.start - centre;
+                let height = radial.dot(axis);
+                let base = centre + axis * height;
+                let first = (self.start - base).normalize().unwrap_or(Vec3::X);
+                let offset = point - base;
+                let z = offset.dot(axis);
+                let flat = offset - axis * z;
+                let major = (self.start - base).length();
+                let gap = ((flat.length() - major).powi(2) + z * z).sqrt() - self.radius;
+                let mut turned = axis.dot(first.cross(flat)).atan2(first.dot(flat));
+                if turned < -1e-12 { turned += TAU; }
+                (gap, turned <= angle + 1e-12)
+            }
+        }
+    }
+
+    fn contains(&self, point: Vec3) -> bool {
+        let (gap, within) = self.probe(point);
+        gap < 0.0 && within
+    }
+}
+
+/// A point of a run's surface swept from a section point, `t` in [0, 1]
+/// along the run.
+fn run_point(run: TubeRun, section: Vec3, t: f64) -> Vec3 {
+    match run {
+        TubeRun::Straight { from, to } => section + (to - from) * t,
+        TubeRun::Turn { centre, axis, angle } => centre + rotate(section - centre, axis, angle * t),
+    }
+}
+
+fn run_length(run: TubeRun, section: Vec3) -> f64 {
+    match run {
+        TubeRun::Straight { from, to } => from.distance(to),
+        TubeRun::Turn { centre, axis, angle } => {
+            let offset = section - centre;
+            (offset - axis * offset.dot(axis)).length() * angle
+        }
+    }
+}
+
+fn tube_surface(run: TubeRun, section: &TubeSection, radius: f64) -> Option<Surface> {
+    match run {
+        TubeRun::Straight { .. } => Some(Surface::Cylinder(super::geometry::Cylinder {
+            base: Plane::orthonormal(section.centre.to_array(), section.x.to_array(), section.normal.to_array())?,
+            radius,
+        })),
+        TubeRun::Turn { centre, axis, angle } => {
+            let offset = section.centre - centre;
+            let base = centre + axis * offset.dot(axis);
+            let radial = section.centre - base;
+            let major = radial.length();
+            if major <= radius * (1.0 + 1e-9) { return None; }
+            Some(Surface::Torus(super::geometry::Torus {
+                // The seam lies opposite the middle of the run, away from its ends.
+                frame: Plane::orthonormal(base.to_array(), (rotate(radial, axis, angle * 0.5) * (1.0 / major)).to_array(), axis.to_array())?,
+                major_radius: major,
+                minor_radius: radius,
+            }))
+        }
+    }
+}
+
+fn circle_curve(section: &TubeSection, radius: f64) -> Option<Curve3> {
+    Some(Curve3::Circle(Circle3 {
+        plane: Plane::orthonormal(section.centre.to_array(), section.x.to_array(), section.normal.to_array())?,
+        radius,
+    }))
+}
+
+/// Builds a circular tube along straight and circular runs meeting at
+/// corners where at least one circular run takes part. Each run keeps its
+/// exact cylinder or torus. At a corner the outer side is closed by straight
+/// extensions of both runs to the mitre plane; on the inner side the two runs
+/// meet along the curve where their surfaces cross, which is how the
+/// reference modeler joins a curved run at a corner.
+fn circular_tube(pieces: &[Piece], first: Frame, centre: [f64; 2], radius: f64, closed: bool) -> Option<Body> {
+    let runs = pieces.iter().map(|piece| match piece {
+        Piece::Line(from, to) => Some(TubeRun::Straight { from: *from, to: *to }),
+        Piece::Planar(..) => circular_run(piece).map(|(centre, axis, angle)| TubeRun::Turn { centre, axis, angle }),
+        Piece::Spline(..) => None,
+    }).collect::<Option<Vec<_>>>()?;
+    let count = runs.len();
+    let joints = if closed { count } else { count - 1 };
+    let corner = |index: usize| -> Option<bool> {
+        let (before, after) = (&pieces[index], &pieces[(index + 1) % count]);
+        Some(before.tangent(1.0)?.dot(after.tangent(0.0)?) < 1.0 - 1e-12)
+    };
+    let mut wanted = false;
+    for joint in 0..joints {
+        if corner(joint)? && (matches!(runs[joint], TubeRun::Turn { .. }) || matches!(runs[(joint + 1) % count], TubeRun::Turn { .. })) {
+            wanted = true;
+        }
+    }
+    if !wanted { return None; }
+
+    // Section frames at both ends of every run.
+    let mut starts = Vec::with_capacity(count);
+    let mut ends = Vec::with_capacity(count);
+    let mut frame = first;
+    for (index, (piece, run)) in pieces.iter().zip(&runs).enumerate() {
+        if index > 0 {
+            let point = piece.point(0.0);
+            frame = moved(frame, pieces[index - 1].tangent(1.0)?, piece.tangent(0.0)?, point, point)?;
+        }
+        if (frame.x.cross(frame.y).normalize()?.dot(piece.tangent(0.0)?) - 1.0).abs() > 1e-9
+            || (frame.x.length() - 1.0).abs() > 1e-9 || (frame.y.length() - 1.0).abs() > 1e-9
+            || frame.x.dot(frame.y).abs() > 1e-9
+        {
+            return None;
+        }
+        starts.push(frame);
+        frame = match *run {
+            TubeRun::Straight { from, to } => Frame { origin: frame.origin + (to - from), ..frame },
+            TubeRun::Turn { centre, axis, angle } => Frame {
+                origin: centre + rotate(frame.origin - centre, axis, angle),
+                x: rotate(frame.x, axis, angle),
+                y: rotate(frame.y, axis, angle),
+            },
+        };
+        ends.push(frame);
+    }
+    let size = starts.iter().chain(&ends).map(|frame| frame.origin.length()).fold(radius, f64::max);
+    let tolerance = size * 1e-10;
+    if closed {
+        let point = pieces[0].point(0.0);
+        let back = moved(ends[count - 1], pieces[count - 1].tangent(1.0)?, pieces[0].tangent(0.0)?, point, point)?;
+        if frame_error(back, starts[0], radius) > tolerance * 10.0 { return None; }
+    }
+
+    let mut body = Body::new();
+    let lump = body.lumps.insert(Lump { shells: Vec::new(), provenance: Provenance::Synthesized });
+    let shell = body.shells.insert(Shell { faces: Vec::new(), owner: lump, provenance: Provenance::Synthesized });
+    let vertex = |body: &mut Body, point: Vec3| body.vertices.insert(Vertex { point: point.to_array(), provenance: Provenance::Synthesized });
+    let edge = |body: &mut Body, curve: Curve3, from: VertexKey, to: VertexKey, low: f64, high: f64| {
+        let curve = body.curves.insert(curve);
+        body.edges.insert(Edge { curve, start_parameter: low, end_parameter: high, start: from, end: to, coedges: Vec::new(), provenance: Provenance::Synthesized })
+    };
+    // A whole circle as one closed edge.
+    let full_circle = |body: &mut Body, section: &TubeSection| -> Option<EdgeKey> {
+        let point = section.centre + section.x * radius;
+        let at = vertex(body, point);
+        Some(edge(body, circle_curve(section, radius)?, at, at, 0.0, TAU))
+    };
+    // The arc of a closed curve between two points that contains `through`.
+    let arc_edge = |body: &mut Body, curve: Curve3, from: (VertexKey, Vec3), to: (VertexKey, Vec3), through: Vec3| -> Option<EdgeKey> {
+        let wrap = |value: f64, base: f64| base + (value - base).rem_euclid(TAU);
+        let a = curve.parameter_at(from.1.to_array());
+        let b = wrap(curve.parameter_at(to.1.to_array()), a);
+        let m = wrap(curve.parameter_at(through.to_array()), a);
+        Some(if m < b {
+            edge(body, curve, from.0, to.0, a, b)
+        } else {
+            let start = curve.parameter_at(to.1.to_array());
+            let end = wrap(a, start);
+            edge(body, curve, to.0, from.0, start, end)
+        })
+    };
+
+    // Per run: the loop at each end, as edges in order, and the faces.
+    let mut start_loops: Vec<Vec<EdgeKey>> = vec![Vec::new(); count];
+    let mut end_loops: Vec<Vec<EdgeKey>> = vec![Vec::new(); count];
+    // Extension faces: surface, loop edges, and the side vector at an edge.
+    let mut extensions: Vec<(Surface, Vec<EdgeKey>, Vec3)> = Vec::new();
+    // The inner curves' images on the two runs' surfaces, by edge and run.
+    let mut traces: Vec<(EdgeKey, usize, NurbsCurve)> = Vec::new();
+    for joint in 0..joints {
+        let (a, b) = (joint, (joint + 1) % count);
+        let point = pieces[b].point(0.0);
+        let d1 = pieces[a].tangent(1.0)?;
+        let d2 = pieces[b].tangent(0.0)?;
+        let end = tube_section(ends[a], centre, d1)?;
+        let start = tube_section(starts[b], centre, d2)?;
+        if !corner(joint)? {
+            let rim = full_circle(&mut body, &end)?;
+            end_loops[a].push(rim);
+            start_loops[b].push(rim);
+            continue;
+        }
+        let normal = (d1 + d2).normalize()?;
+        let binormal = d1.cross(d2).normalize()?;
+        // The section points on the corner's binormal line split the outer
+        // side, closed by the extensions, from the inner side.
+        let offset = end.centre - point;
+        let along = offset.dot(binormal);
+        let away = (offset - binormal * along).length();
+        if away >= radius * (1.0 - 1e-9) { return None; }
+        let half = (radius * radius - away * away).sqrt();
+        let j1 = point + binormal * (along - half);
+        let j2 = point + binormal * (along + half);
+        let (v1, v2) = (vertex(&mut body, j1), vertex(&mut body, j2));
+        // Outer and inner middle points of the end section.
+        let outer_dir = (-d2 + d1 * d2.dot(d1)).normalize()?;
+        let outer_end = end.centre + (outer_dir * radius);
+        let outer_start = start.centre + ((d1 - d2 * d1.dot(d2)).normalize()? * radius);
+        // The mitre ellipse: the end section carried along d1 onto the plane.
+        let tilt = (normal - d1 * normal.dot(d1)).normalize()?;
+        let side = d1.cross(tilt);
+        let lift = |vector: Vec3| vector - d1 * (vector.dot(normal) / d1.dot(normal));
+        let shift = -(end.centre - point).dot(normal) / d1.dot(normal);
+        let ellipse_centre = end.centre + d1 * shift;
+        let major = lift(tilt * radius);
+        let ellipse_plane = Plane::orthonormal(ellipse_centre.to_array(), major.normalize()?.to_array(), major.cross(side).normalize()?.to_array())?;
+        let ellipse_again = || Curve3::Ellipse(super::geometry::Ellipse3 { plane: ellipse_plane, major_radius: major.length(), minor_radius: radius });
+        let ellipse = ellipse_again();
+        let outer_mitre = outer_end + d1 * (-(outer_end - point).dot(normal) / d1.dot(normal));
+        let mitre = arc_edge(&mut body, ellipse, (v1, j1), (v2, j2), outer_mitre)?;
+        // The inner curve: the rest of the mitre between two straight runs,
+        // else where each section point of run b, carried along its run,
+        // leaves run a.
+        let both_straight = matches!(runs[a], TubeRun::Straight { .. }) && matches!(runs[b], TubeRun::Straight { .. });
+        let inner_end = end.centre - outer_dir * radius;
+        let inner_mitre = inner_end + d1 * (-(inner_end - point).dot(normal) / d1.dot(normal));
+        let inner = if both_straight {
+            vec![arc_edge(&mut body, ellipse_again(), (v2, j2), (v1, j1), inner_mitre)?]
+        } else {
+        let solid = TubeSolid { run: runs[a], start: tube_section(starts[a], centre, pieces[a].tangent(0.0)?)?.centre, radius };
+        let inner_dir = -((d1 - d2 * d1.dot(d2)).normalize()?);
+        let from = j2 - start.centre;
+        let to = j1 - start.centre;
+        // Turn from j2 to j1 through the inner middle point.
+        let mut span = d2.dot(from.cross(to)).atan2(from.dot(to));
+        let middle = d2.dot(from.cross(inner_dir)).atan2(from.dot(inner_dir));
+        let between = if span > 0.0 { middle > 0.0 && middle < span } else { middle < 0.0 && middle > span };
+        if !between {
+            span += if span > 0.0 { -TAU } else { TAU };
+        }
+        let samples = 48;
+        let mut points = vec![j2];
+        for step in 1..samples {
+            // Denser towards the ends, where the two surfaces touch.
+            let share = (1.0 - (PI * step as f64 / samples as f64).cos()) * 0.5;
+            let section_point = start.centre + rotate(from, d2, span * share);
+            let length = run_length(runs[b], section_point).max(radius);
+            let steps = ((length / (radius / 64.0)).ceil() as usize).clamp(16, 100_000);
+            let mut inside_at = 0.0;
+            let mut outside_at = None;
+            for k in 1..=steps {
+                let t = k as f64 / steps as f64;
+                if !solid.contains(run_point(runs[b], section_point, t)) { outside_at = Some(t); break; }
+                inside_at = t;
+            }
+            let (mut low, mut high) = (inside_at, outside_at?);
+            for _ in 0..80 {
+                let mid = 0.5 * (low + high);
+                if solid.contains(run_point(runs[b], section_point, mid)) { low = mid } else { high = mid }
+            }
+            let found = run_point(runs[b], section_point, 0.5 * (low + high));
+            let (gap, within) = solid.probe(found);
+            if gap.abs() > tolerance * 1e3 || !within { return None; }
+            points.push(found);
+        }
+        points.push(j1);
+        // Two halves, split where the curve reaches deepest into the corner.
+        let middle = points.len() / 2;
+        let vm = vertex(&mut body, points[middle]);
+        let mut halves = Vec::new();
+        let surface_a = tube_surface(runs[a], &tube_section(starts[a], centre, pieces[a].tangent(0.0)?)?, radius)?;
+        let surface_b = tube_surface(runs[b], &start, radius)?;
+        for (part, from, to) in [(&points[..=middle], v2, vm), (&points[middle..], vm, v1)] {
+            let crossing = NurbsCurve3::interpolate_fit(&part.iter().map(|p| p.to_array()).collect::<Vec<_>>(), None, None, crate::space::Parameterization::Uniform)?;
+            let (low, high) = crossing.domain();
+            let key = edge(&mut body, Curve3::Nurbs(crossing), from, to, low, high);
+            // The same points in each surface's parameters, interpolated with
+            // the same parameter values, so each face carries the exact trace.
+            for (run, surface) in [(a, &surface_a), (b, &surface_b)] {
+                let mut uv: Vec<[f64; 2]> = Vec::with_capacity(part.len());
+                for point in part.iter() {
+                    let (mut u, mut v) = surface.parameters_at(point.to_array())?;
+                    if let Some(&[pu, pv]) = uv.last() {
+                        u += TAU * ((pu - u) / TAU).round();
+                        if matches!(surface, Surface::Torus(_)) { v += TAU * ((pv - v) / TAU).round(); }
+                    }
+                    uv.push([u, v]);
+                }
+                let trace = NurbsCurve::interpolate(&uv, None, None, crate::space::Parameterization::Uniform)?;
+                let (start_knot, end_knot) = trace.domain();
+                let knots = trace.knots().iter().map(|k| low + (k - start_knot) / (end_knot - start_knot) * (high - low)).collect();
+                let trace = NurbsCurve::new_strict(trace.degree(), trace.control_points().to_vec(), knots, trace.weights().to_vec())?;
+                traces.push((key, run, trace));
+            }
+            halves.push(key);
+        }
+        halves
+        };
+        // Run a's end: its own outer section edge when it turns, else the
+        // mitre (its straight extension is the same cylinder).
+        if matches!(runs[a], TubeRun::Turn { .. }) {
+            let rim = arc_edge(&mut body, circle_curve(&end, radius)?, (v1, j1), (v2, j2), outer_end)?;
+            end_loops[a].push(rim);
+            end_loops[a].extend(inner.iter().copied());
+            extensions.push((tube_surface(TubeRun::Straight { from: point, to: point + d1 }, &end, radius)?, vec![rim, mitre], d1));
+        } else {
+            end_loops[a].push(mitre);
+            end_loops[a].extend(inner.iter().copied());
+        }
+        if matches!(runs[b], TubeRun::Turn { .. }) {
+            let rim = arc_edge(&mut body, circle_curve(&start, radius)?, (v1, j1), (v2, j2), outer_start)?;
+            start_loops[b].push(rim);
+            start_loops[b].extend(inner.iter().copied());
+            extensions.push((tube_surface(TubeRun::Straight { from: point, to: point + d2 }, &start, radius)?, vec![mitre, rim], d2));
+        } else {
+            start_loops[b].push(mitre);
+            start_loops[b].extend(inner.iter().copied());
+        }
+    }
+    let mut caps = Vec::new();
+    if !closed {
+        let start = tube_section(starts[0], centre, pieces[0].tangent(0.0)?)?;
+        let finish = tube_section(ends[count - 1], centre, pieces[count - 1].tangent(1.0)?)?;
+        let first_rim = full_circle(&mut body, &start)?;
+        let last_rim = full_circle(&mut body, &finish)?;
+        start_loops[0].push(first_rim);
+        end_loops[count - 1].push(last_rim);
+        caps.push((start, first_rim, -1.0));
+        caps.push((finish, last_rim, 1.0));
+    }
+
+    // Faces. A loop is oriented so that the face lies on its left seen from
+    // outside: `side` points from the loop's first edge into the face.
+    let orient = |body: &Body, edges: &[EdgeKey], normal_at: &dyn Fn(Vec3) -> Vec3, side: Vec3| -> Option<Vec<(EdgeKey, bool)>> {
+        let mut circuit = Vec::new();
+        let first = body.edges.get(edges[0])?;
+        let mut at = first.end;
+        circuit.push((edges[0], true));
+        // Chain the rest by shared vertices, whatever order they came in.
+        let mut rest = edges[1..].to_vec();
+        while !rest.is_empty() {
+            let index = rest.iter().position(|key| body.edges.get(*key).is_some_and(|node| node.start == at || node.end == at))?;
+            let key = rest.remove(index);
+            let node = body.edges.get(key)?;
+            if node.start == at { circuit.push((key, true)); at = node.end; } else { circuit.push((key, false)); at = node.start; }
+        }
+        let curve = body.curves.get(first.curve)?;
+        let mid = 0.5 * (first.start_parameter + first.end_parameter);
+        let point = Vec3::from(curve.point_at(mid));
+        let walk = Vec3::from(curve.tangent_at(mid));
+        if normal_at(point).cross(walk).dot(side) < 0.0 {
+            circuit = circuit.into_iter().rev().map(|(edge, forward)| (edge, !forward)).collect();
+        }
+        Some(circuit)
+    };
+    let add_surface_face = |body: &mut Body, surface: Surface, loops: Vec<(Vec<EdgeKey>, Vec3)>, run: Option<usize>| -> Option<()> {
+        let normal_surface = surface.clone();
+        let key = body.surfaces.insert(surface);
+        let face = add_face(body, shell, key, true);
+        for (edges, side) in loops {
+            let normal_at = |point: Vec3| -> Vec3 { outward_normal(&normal_surface, point) };
+            let circuit = orient(body, &edges, &normal_at, side)?;
+            let ring = add_loop(body, face, &circuit, None)?;
+            for coedge in body.loops.get(ring)?.coedges.clone() {
+                let node = body.coedges.get(coedge)?;
+                let trace = traces.iter().find(|(key, owner, _)| *key == node.edge && Some(*owner) == run);
+                if let Some((_, _, curve)) = trace {
+                    let curve = Curve::Nurbs(if node.forward { curve.clone() } else { curve.reversed() });
+                    body.coedges.get_mut(coedge)?.pcurve = Some(curve);
+                }
+            }
+        }
+        Some(())
+    };
+    for index in 0..count {
+        let section = tube_section(starts[index], centre, pieces[index].tangent(0.0)?)?;
+        let surface = tube_surface(runs[index], &section, radius)?;
+        let loops = vec![
+            (start_loops[index].clone(), pieces[index].tangent(0.0)?),
+            (end_loops[index].clone(), -pieces[index].tangent(1.0)?),
+        ];
+        add_surface_face(&mut body, surface, loops, Some(index))?;
+    }
+    for (surface, edges, along) in extensions {
+        // Seen from its first edge an extension face lies ahead along the
+        // run it extends: run a's from its section, run b's from the mitre.
+        add_surface_face(&mut body, surface, vec![(edges, along)], None)?;
+    }
+    for (section, rim, sense) in caps {
+        let plane = Plane::orthonormal(section.centre.to_array(), section.x.to_array(), (section.normal * sense).to_array())?;
+        let rim_edge = body.edges.get(rim)?;
+        let rim_point = Vec3::from(body.curves.get(rim_edge.curve)?.point_at(0.5 * (rim_edge.start_parameter + rim_edge.end_parameter)));
+        add_surface_face(&mut body, Surface::Plane(plane), vec![(vec![rim], section.centre - rim_point)], None)?;
+    }
+    body.lumps.get_mut(lump)?.shells = vec![shell];
+    body.roots = vec![lump];
+    body.validate().is_empty().then_some(body)
+}
+
+/// The outward normal of a tube, extension or cap surface at a point on it.
+fn outward_normal(surface: &Surface, point: Vec3) -> Vec3 {
+    match surface {
+        Surface::Plane(plane) => plane.normal().map(Vec3::from).unwrap_or(Vec3::Z),
+        Surface::Cylinder(cylinder) => {
+            let axis = cylinder.base.normal().map(Vec3::from).unwrap_or(Vec3::Z);
+            let offset = point - Vec3::from(cylinder.base.origin);
+            (offset - axis * offset.dot(axis)).normalize().unwrap_or(Vec3::X)
+        }
+        Surface::Torus(torus) => {
+            let axis = torus.frame.normal().map(Vec3::from).unwrap_or(Vec3::Z);
+            let offset = point - Vec3::from(torus.frame.origin);
+            let flat = (offset - axis * offset.dot(axis)).normalize().unwrap_or(Vec3::X);
+            let ring = Vec3::from(torus.frame.origin) + flat * torus.major_radius;
+            (point - ring).normalize().unwrap_or(Vec3::X)
+        }
+        _ => Vec3::Z,
+    }
+}
+
+/// A closed path of straight runs whose transported section comes back
+/// turned (a non-planar polyline). The runs keep their own transported
+/// sections, as the reference modeler closes such a path: the first section,
+/// carried onto the last run's direction, extends the last run up to the
+/// mitre plane, and the first run reaches back to whichever comes first of
+/// the mitre plane and the last run's lateral faces that look along it.
+/// Polygon profiles only: the pieces are joined by planar Booleans.
+fn closed_turned_polyline(
+    pieces: &[Piece],
+    first: Frame,
+    profile_plane_wires: &[Vec<Curve>],
+    wires: &[Wire],
+    options: SweepOptions,
+    radius: f64,
+) -> Option<Body> {
+    if pieces.len() < 3
+        || !pieces.iter().all(|piece| matches!(piece, Piece::Line(_, _)))
+        || !profile_plane_wires.iter().flatten().all(|curve| matches!(curve, Curve::Line(_)))
+        || options.twist.abs() > 1e-12 || (options.scale - 1.0).abs() > 1e-12
+    {
+        return None;
+    }
+    let start_tangent = pieces.first()?.tangent(0.0)?;
+    let end_tangent = pieces.last()?.tangent(1.0)?;
+    let corner = pieces.first()?.point(0.0);
+    // Split a middle run in two, so that neither half overlaps itself.
+    let Piece::Line(from, to) = pieces[1] else { return None };
+    let middle = from.lerp(to, 0.5);
+    let normal = (start_tangent + end_tangent).normalize()?;
+    let reach = radius * 4.0 / start_tangent.dot(normal).abs().max(0.05);
+    // The first run starts well back past the corner and is cut below.
+    let Piece::Line(_, first_end) = pieces[0] else { return None };
+    let back = Frame { origin: first.origin - start_tangent * reach, ..first };
+    let head = [Piece::Line(corner - start_tangent * reach, first_end), Piece::Line(from, middle)];
+    let mut tail = vec![Piece::Line(middle, to)];
+    tail.extend(pieces[2..].iter().cloned());
+    let length = |part: &[Piece]| part.iter().map(Piece::length).sum::<f64>();
+    let head_patches = transported_patches(&head, back, options, length(&head), radius, false)?;
+    let tail_patches = transported_patches(&tail, head_patches.last()?[3], options, length(&tail), radius, false)?;
+    let last = tail_patches.last()?[3];
+    let carried = moved(last, end_tangent, start_tangent, corner, corner)?;
+    // A section that comes back unturned closes as an ordinary mitre.
+    if frame_error(carried, first, radius) <= radius * 1e-9 {
+        return None;
+    }
+    let mut runs = Vec::new();
+    for patches in [&head_patches, &tail_patches] {
+        let outward = regular_transport(wires, patches)?;
+        let mut part = build_body(wires, patches, false, false, outward)?;
+        analytic_ruled_faces(&mut part);
+        runs.push(part);
+    }
+    let tail_body = runs.pop()?;
+    let head_body = runs.pop()?;
+    let mitre = Plane::orthonormal(corner.to_array(), start_tangent.cross(end_tangent).normalize()?.to_array(), normal.to_array())?;
+    let mut parts = vec![tail_body, super::slice::slice_by_plane(&head_body, mitre).ok()??.positive];
+    // The first section carried onto the last run's direction, swept on
+    // past the corner and cut at the mitre plane.
+    let onto_last = moved(first, start_tangent, end_tangent, corner, corner)?;
+    let ahead = super::sweep::extrude_region(onto_last.plane(), profile_plane_wires, (end_tangent * reach).to_array())?;
+    parts.push(super::slice::slice_by_plane(&ahead, mitre).ok()??.negative);
+    // The first run also reaches back to every lateral face of the last run
+    // that looks along it.
+    let vertices: Vec<[f64; 2]> = profile_plane_wires.iter().flatten().map(|curve| curve.point_at(0.0)).collect();
+    let sum = vertices.iter().fold([0.0, 0.0], |a, p| [a[0] + p[0], a[1] + p[1]]);
+    let centre = last.point([sum[0] / vertices.len() as f64, sum[1] / vertices.len() as f64]);
+    for curve in profile_plane_wires.iter().flatten() {
+        let a = last.point(curve.point_at(0.0));
+        let Some(mut outward) = (last.point(curve.point_at(1.0)) - a).cross(end_tangent).normalize() else { continue };
+        if outward.dot(a - centre) < 0.0 { outward = -outward; }
+        if outward.dot(start_tangent) <= 1e-9 { continue; }
+        let face = Plane::orthonormal(a.to_array(), end_tangent.to_array(), outward.to_array())?;
+        if let Some(cut) = super::slice::slice_by_plane(&head_body, face).ok()? { parts.push(cut.positive); }
+    }
+    let mut parts = parts.into_iter();
+    let mut body = parts.next()?;
+    for part in parts {
+        let tolerance = super::operation_tolerance(&[&body, &part]);
+        body = super::combine(body, part, super::Operation::Union, tolerance).ok()?;
+    }
+    analytic_ruled_faces(&mut body);
+    body.validate().is_empty().then_some(body)
+}
+
+/// One run of a planar path, in the path plane: a segment, or an arc from a
+/// start angle through a signed sweep.
+#[derive(Clone, Copy)]
+enum Run2 {
+    Segment([f64; 2], [f64; 2]),
+    Turn { centre: [f64; 2], radius: f64, start: f64, sweep: f64 },
+}
+
+impl Run2 {
+    fn point(self, t: f64) -> [f64; 2] {
+        match self {
+            Self::Segment(a, b) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t],
+            Self::Turn { centre, radius, start, sweep } => {
+                let angle = start + sweep * t;
+                [centre[0] + radius * angle.cos(), centre[1] + radius * angle.sin()]
+            }
+        }
+    }
+
+    fn tangent(self, t: f64) -> [f64; 2] {
+        match self {
+            Self::Segment(a, b) => {
+                let length = (b[0] - a[0]).hypot(b[1] - a[1]);
+                [(b[0] - a[0]) / length, (b[1] - a[1]) / length]
+            }
+            Self::Turn { start, sweep, .. } => {
+                let angle = start + sweep * t;
+                let sign = sweep.signum();
+                [-angle.sin() * sign, angle.cos() * sign]
+            }
+        }
+    }
+
+    /// The run offset to its left by `distance`.
+    fn offset(self, distance: f64) -> Option<Self> {
+        Some(match self {
+            Self::Segment(a, b) => {
+                let t = self.tangent(0.0);
+                let left = [-t[1] * distance, t[0] * distance];
+                Self::Segment([a[0] + left[0], a[1] + left[1]], [b[0] + left[0], b[1] + left[1]])
+            }
+            Self::Turn { centre, radius, start, sweep } => {
+                let radius = radius - distance * sweep.signum();
+                if radius <= 1e-9 {
+                    return None;
+                }
+                Self::Turn { centre, radius, start, sweep }
+            }
+        })
+    }
+
+    /// The run cut to begin (`at_start`) or end at a point on it.
+    fn trimmed(self, point: [f64; 2], at_start: bool) -> Option<Self> {
+        Some(match self {
+            Self::Segment(a, b) => if at_start { Self::Segment(point, b) } else { Self::Segment(a, point) },
+            Self::Turn { centre, radius, start, sweep } => {
+                let angle = (point[1] - centre[1]).atan2(point[0] - centre[0]);
+                // The turn from the start to the point, along the sweep.
+                let mut along = ((angle - start) * sweep.signum()).rem_euclid(TAU);
+                if along > sweep.abs() + PI {
+                    along -= TAU;
+                }
+                let along = along * sweep.signum();
+                if at_start {
+                    Self::Turn { centre, radius, start: start + along, sweep: sweep - along }
+                } else {
+                    Self::Turn { centre, radius, start, sweep: along }
+                }
+            }
+        })
+        .filter(|run| run.length() > 1e-9)
+    }
+
+    fn length(self) -> f64 {
+        match self {
+            Self::Segment(a, b) => (b[0] - a[0]).hypot(b[1] - a[1]),
+            Self::Turn { radius, sweep, .. } => radius * sweep.abs(),
+        }
+    }
+
+    fn curve(self) -> Curve {
+        match self {
+            Self::Segment(start, end) => Curve::Line(Line { start, end }),
+            Self::Turn { centre, radius, start, sweep } => {
+                let (start_angle, end_angle) = if sweep > 0.0 { (start, start + sweep) } else { (start + sweep, start) };
+                Curve::Arc(Arc { centre, radius, start_angle, end_angle })
+            }
+        }
+    }
+
+    /// Where the whole line or circle of this run meets that of another,
+    /// nearest to `near`.
+    fn meet(self, other: Self, near: [f64; 2]) -> Option<[f64; 2]> {
+        let mut points = Vec::new();
+        match (self, other) {
+            (Self::Segment(a, b), Self::Segment(c, d)) => {
+                let (r, s) = ([b[0] - a[0], b[1] - a[1]], [d[0] - c[0], d[1] - c[1]]);
+                let denominator = r[0] * s[1] - r[1] * s[0];
+                if denominator.abs() <= 1e-12 * r[0].hypot(r[1]) * s[0].hypot(s[1]) {
+                    return None;
+                }
+                let t = ((c[0] - a[0]) * s[1] - (c[1] - a[1]) * s[0]) / denominator;
+                points.push([a[0] + r[0] * t, a[1] + r[1] * t]);
+            }
+            (Self::Segment(a, b), Self::Turn { centre, radius, .. })
+            | (Self::Turn { centre, radius, .. }, Self::Segment(a, b)) => {
+                let r = [b[0] - a[0], b[1] - a[1]];
+                let f = [a[0] - centre[0], a[1] - centre[1]];
+                let qa = r[0] * r[0] + r[1] * r[1];
+                let qb = 2.0 * (f[0] * r[0] + f[1] * r[1]);
+                let qc = f[0] * f[0] + f[1] * f[1] - radius * radius;
+                let discriminant = qb * qb - 4.0 * qa * qc;
+                if discriminant < 0.0 {
+                    return None;
+                }
+                for sign in [-1.0, 1.0] {
+                    let t = (-qb + sign * discriminant.sqrt()) / (2.0 * qa);
+                    points.push([a[0] + r[0] * t, a[1] + r[1] * t]);
+                }
+            }
+            (Self::Turn { centre: c0, radius: r0, .. }, Self::Turn { centre: c1, radius: r1, .. }) => {
+                let d = (c1[0] - c0[0]).hypot(c1[1] - c0[1]);
+                if d <= 1e-12 || d > r0 + r1 || d < (r0 - r1).abs() {
+                    return None;
+                }
+                let along = (d * d + r0 * r0 - r1 * r1) / (2.0 * d);
+                let across = (r0 * r0 - along * along).max(0.0).sqrt();
+                let u = [(c1[0] - c0[0]) / d, (c1[1] - c0[1]) / d];
+                for sign in [-1.0, 1.0] {
+                    points.push([c0[0] + u[0] * along - u[1] * across * sign, c0[1] + u[1] * along + u[0] * across * sign]);
+                }
+            }
+        }
+        let distance = |x: &[f64; 2]| (x[0] - near[0]).hypot(x[1] - near[1]);
+        points.into_iter().min_by(|p, q| distance(p).total_cmp(&distance(q)))
+    }
+}
+
+/// One side of a band: the runs offset by `distance`, joined at corners as
+/// the reference modeler joins a rectangular section: on the outer side
+/// each run carries on straight to where the two meet, on the inner side
+/// the runs are cut where they cross.
+fn band_side(runs: &[Run2], distance: f64, closed: bool) -> Option<Vec<Run2>> {
+    let count = runs.len();
+    let mut sides = runs.iter().map(|run| run.offset(distance)).collect::<Option<Vec<_>>>()?;
+    let mut before = vec![None; count];
+    let mut after = vec![None; count];
+    let joints = if closed { count } else { count - 1 };
+    for index in 0..joints {
+        let next = (index + 1) % count;
+        let (t1, t2) = (runs[index].tangent(1.0), runs[next].tangent(0.0));
+        let turn = t1[0] * t2[1] - t1[1] * t2[0];
+        let smooth = turn.abs() <= 1e-9 && t1[0] * t2[0] + t1[1] * t2[1] > 0.0;
+        if smooth || distance.abs() <= 1e-12 {
+            continue;
+        }
+        let (end, start) = (sides[index].point(1.0), sides[next].point(0.0));
+        if distance * turn > 0.0 {
+            let point = sides[index].meet(sides[next], end)?;
+            sides[index] = sides[index].trimmed(point, false)?;
+            sides[next] = sides[next].trimmed(point, true)?;
+        } else {
+            let reach = Run2::Segment(end, [end[0] + t1[0], end[1] + t1[1]]);
+            let back = Run2::Segment(start, [start[0] + t2[0], start[1] + t2[1]]);
+            let point = reach.meet(back, end)?;
+            match sides[index] {
+                Run2::Segment(a, _) => sides[index] = Run2::Segment(a, point),
+                _ => after[index] = Some(Run2::Segment(end, point)),
+            }
+            match sides[next] {
+                Run2::Segment(_, b) => sides[next] = Run2::Segment(point, b),
+                _ => before[next] = Some(Run2::Segment(point, start)),
+            }
+        }
+    }
+    let mut result = Vec::new();
+    for index in 0..count {
+        result.extend(before[index]);
+        result.push(sides[index]);
+        result.extend(after[index]);
+    }
+    result.retain(|run| run.length() > 1e-9);
+    Some(result)
+}
+
+/// A rectangular section square to a planar path whose corners meet arcs:
+/// the solid is the band its in-plane edges sweep, extruded across the
+/// plane, with exact planar and cylindrical faces.
+fn planar_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], closed: bool) -> Option<Body> {
+    let plane = pieces.iter().find_map(|piece| match piece {
+        Piece::Planar(plane, _, _) => Some(*plane),
+        _ => None,
+    })?;
+    let normal = Vec3::from(plane.normal()?);
+    let origin = Vec3::from(plane.origin);
+    let runs = pieces.iter().map(|piece| Some(match piece {
+        Piece::Line(a, b) => {
+            let scale = a.length().max(b.length()).max(1.0) * 1e-9;
+            if (*a - origin).dot(normal).abs() > scale || (*b - origin).dot(normal).abs() > scale {
+                return None;
+            }
+            Run2::Segment(plane.project(a.to_array())?, plane.project(b.to_array())?)
+        }
+        Piece::Planar(other, _, _) => {
+            if Vec3::from(other.normal()?).dot(normal).abs() < 1.0 - 1e-12
+                || (Vec3::from(other.origin) - origin).dot(normal).abs() > 1e-9 * origin.length().max(1.0)
+            {
+                return None;
+            }
+            // A circular arc, however it is represented: the circle through
+            // its ends and middle, which every other sample must lie on.
+            let at = |t: f64| plane.project(piece.point(t).to_array());
+            let (p0, pm, p1) = (at(0.0)?, at(0.5)?, at(1.0)?);
+            let (b, c) = ([pm[0] - p0[0], pm[1] - p0[1]], [p1[0] - p0[0], p1[1] - p0[1]]);
+            let denominator = 2.0 * (b[0] * c[1] - b[1] * c[0]);
+            if denominator.abs() <= 1e-12 * piece.length() * piece.length() {
+                return None;
+            }
+            let (bb, cc) = (b[0] * b[0] + b[1] * b[1], c[0] * c[0] + c[1] * c[1]);
+            let centre = [p0[0] + (c[1] * bb - b[1] * cc) / denominator, p0[1] + (b[0] * cc - c[0] * bb) / denominator];
+            let radius = (p0[0] - centre[0]).hypot(p0[1] - centre[1]);
+            for t in [0.125, 0.25, 0.375, 0.625, 0.75, 0.875] {
+                let q = at(t)?;
+                if ((q[0] - centre[0]).hypot(q[1] - centre[1]) - radius).abs() > 1e-9 * radius.max(1.0) {
+                    return None;
+                }
+            }
+            let angle = |q: [f64; 2]| (q[1] - centre[1]).atan2(q[0] - centre[0]);
+            let sign = denominator.signum();
+            let sweep = sign * ((angle(p1) - angle(p0)) * sign).rem_euclid(TAU);
+            if sweep.abs() <= 1e-12 {
+                return None;
+            }
+            Run2::Turn { centre, radius, start: angle(p0), sweep }
+        }
+        _ => return None,
+    })).collect::<Option<Vec<_>>>()?;
+    // Only where a corner meets an arc; the general sweep handles the rest.
+    let count = runs.len();
+    let joints = if closed { count } else { count - 1 };
+    let corner_on_turn = (0..joints).any(|index| {
+        let next = (index + 1) % count;
+        let (t1, t2) = (runs[index].tangent(1.0), runs[next].tangent(0.0));
+        t1[0] * t2[0] + t1[1] * t2[1] < 1.0 - 1e-9
+            && (matches!(runs[index], Run2::Turn { .. }) || matches!(runs[next], Run2::Turn { .. }))
+    });
+    if !corner_on_turn {
+        return None;
+    }
+    // The placed section: a rectangle with sides across and along the plane.
+    let start = pieces.first()?.point(0.0);
+    let left = normal.cross(pieces.first()?.tangent(0.0)?).normalize()?;
+    let [wire] = profile else { return None };
+    if wire.len() != 4 {
+        return None;
+    }
+    let (mut across, mut height) = (Vec::new(), Vec::new());
+    for curve in wire {
+        let Curve::Line(line) = curve else { return None };
+        let (a, b) = (first.point(line.start), first.point(line.end));
+        let direction = (b - a).normalize()?;
+        if direction.dot(normal).abs() < 1.0 - 1e-9 && direction.dot(left).abs() < 1.0 - 1e-9 {
+            return None;
+        }
+        across.push((a - start).dot(left));
+        height.push((a - start).dot(normal));
+    }
+    let bounds = |values: &[f64]| values.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+    let ((right, outer), (bottom, top)) = (bounds(&across), bounds(&height));
+    if outer - right <= 1e-9 || top - bottom <= 1e-9 {
+        return None;
+    }
+    let one = band_side(&runs, outer, closed)?;
+    let other = band_side(&runs, right, closed)?;
+    let mut loops = Vec::new();
+    if closed {
+        let area = |ring: &[Run2]| ring.iter().map(|run| {
+            let (a, b) = (run.point(0.0), run.point(1.0));
+            a[0] * b[1] - a[1] * b[0]
+        }).sum::<f64>().abs();
+        let (outside, inside) = if area(&one) >= area(&other) { (&one, &other) } else { (&other, &one) };
+        loops.push(outside.iter().map(|run| run.curve()).collect::<Vec<_>>());
+        loops.push(inside.iter().map(|run| run.curve()).collect::<Vec<_>>());
+    } else {
+        let mut ring = one.iter().map(|run| run.curve()).collect::<Vec<_>>();
+        ring.push(Curve::Line(Line { start: one.last()?.point(1.0), end: other.last()?.point(1.0) }));
+        ring.extend(other.iter().rev().map(|run| run.curve()));
+        ring.push(Curve::Line(Line { start: other.first()?.point(0.0), end: one.first()?.point(0.0) }));
+        loops.push(ring);
+    }
+    let base = Plane::from_axes((origin + normal * bottom).to_array(), plane.x_axis, plane.y_axis);
+    let body = super::sweep::extrude_region(base, &loops, (normal * (top - bottom)).to_array())?;
+    body.validate().is_empty().then_some(body)
 }
 
 fn rotationally_invariant(wires: &[Vec<Curve>]) -> bool {
