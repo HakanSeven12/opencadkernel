@@ -8,7 +8,8 @@
 use super::geometry::{Curve3, Surface};
 use super::nurbs_builder::{RationalCurve2, RationalCurve3};
 use super::topology::{
-    Body, Coedge, Edge, EdgeKey, Face, FaceKey, Loop, Lump, Shell, ShellKey, Vertex, VertexKey,
+    Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, FaceKey, Loop, Lump, Shell, ShellKey, Vertex,
+    VertexKey,
 };
 use super::Provenance;
 use super::Placement;
@@ -83,6 +84,11 @@ pub fn sweep_profile_group_base(profiles: &[(Plane, Vec<Vec<Curve>>)]) -> Option
 /// Directed first point of a valid bounded path.
 pub fn sweep_path_start(path: SweepPath<'_>) -> Option<[f64; 3]> {
     Some(path_pieces(path)?.first()?.point(0.0).to_array())
+}
+
+/// Unit tangent where a sweep path starts.
+pub fn sweep_path_tangent(path: SweepPath<'_>) -> Option<[f64; 3]> {
+    Some(path_pieces(path)?.first()?.tangent(0.0)?.to_array())
 }
 
 /// Rigid placement of the original profile onto the first sweep section.
@@ -235,6 +241,17 @@ pub fn sweep_path(
         return None;
     }
     let closed = start.distance(end) <= extent.max(1.0) * 1e-9;
+    // The reference modeler refuses to twist or scale along a path with a
+    // corner (a mitred joint cannot change the section on both sides).
+    let joints = pieces.windows(2).map(|pair| (&pair[0], &pair[1]))
+        .chain(closed.then(|| (pieces.last().unwrap(), &pieces[0])));
+    let mut cornered = false;
+    for (before, after) in joints {
+        cornered |= before.tangent(1.0)?.dot(after.tangent(0.0)?) < 1.0 - 1e-9;
+    }
+    if cornered && (options.twist.abs() > 1e-12 || (options.scale - 1.0).abs() > 1e-12) {
+        return None;
+    }
     let mut source_wires = wires.iter().map(|wire| wire.source.clone()).collect::<Vec<_>>();
     let base = Vec3::from(options.base_point
         .or_else(|| sweep_profile_base(profile_plane, &source_wires))?);
@@ -307,7 +324,353 @@ pub fn sweep_path(
     // A sheet need not sweep out any volume (for example an in-plane line
     // translated sideways), so only solid sections use the volume check.
     let outward = if sheet { up >= 0.0 } else { regular_transport(&wires, &patches)? };
-    build_body(&wires, &patches, sheet, closed, outward)
+    let body = build_body(&wires, &patches, sheet, closed, outward)?;
+    if options.twist.abs() <= 1e-12 && (options.scale - 1.0).abs() <= 1e-12 {
+        let mut exact = body.clone();
+        if analytic_ruled_faces(&mut exact).is_some() && exact.validate().is_empty() {
+            return Some(exact);
+        }
+    }
+    Some(body)
+}
+
+/// Faces swept along straight and circular runs without twist or scaling
+/// lie on planes, cylinders, cones, spheres and tori. Store those surfaces
+/// exactly and let neighbouring faces on one surface share a face, as the
+/// reference modeler does: a round profile gives one tube per run, and a
+/// flat side shared by coplanar runs one face.
+fn analytic_ruled_faces(body: &mut Body) -> Option<()> {
+    let size = body.vertices.iter()
+        .flat_map(|(_, vertex)| vertex.point)
+        .map(f64::abs)
+        .fold(1.0_f64, f64::max);
+    let tolerance = size * 1e-9;
+    for face in body.face_keys().collect::<Vec<_>>() {
+        let (old, forward) = body.faces.get(face).map(|face| (face.surface, face.forward))?;
+        let Some(Surface::Nurbs(surface)) = body.surfaces.get(old) else { continue };
+        let found = ruled_analytic(surface, tolerance).or_else(|| revolved_analytic(surface, tolerance));
+        let Some((analytic, agrees)) = found else { continue };
+        let surface = body.surfaces.insert(analytic);
+        let target = body.faces.get_mut(face)?;
+        target.surface = surface;
+        target.forward = forward == agrees;
+        body.surfaces.remove(old);
+        for coedge in body.face_coedges(face) {
+            body.coedges.get_mut(coedge)?.pcurve = None;
+        }
+    }
+    loop {
+        let joinable = body.edge_keys().find(|edge| joins_one_surface(body, *edge, tolerance));
+        let Some(edge) = joinable else { break };
+        dissolve_edge(body, edge)?;
+    }
+    Some(())
+}
+
+/// A plane or circular cylinder that a ruled patch lies on exactly, and
+/// whether that surface's natural normal agrees with the patch's.
+fn ruled_analytic(surface: &NurbsSurface3, tolerance: f64) -> Option<(Surface, bool)> {
+    let mut direction: Option<Vec3> = None;
+    for (row, weights) in surface.control_points().iter().zip(surface.weights()) {
+        let start = Vec3::from(*row.first()?);
+        let along = (Vec3::from(*row.last()?) - start).normalize()?;
+        match direction {
+            Some(direction) if direction.cross(along).length() > 1e-9 || direction.dot(along) < 0.0 => return None,
+            Some(_) => {}
+            None => direction = Some(along),
+        }
+        for (point, weight) in row.iter().zip(weights) {
+            let offset = Vec3::from(*point) - start;
+            if (offset - along * offset.dot(along)).length() > tolerance
+                || (weight - weights[0]).abs() > weights[0].abs() * 1e-12
+            {
+                return None;
+            }
+        }
+    }
+    let direction = direction?;
+    let origin = Vec3::from(surface.point_at(0.0, 0.0));
+    let flat = |point: Vec3| point - direction * (point - origin).dot(direction);
+    let samples = (0..=8).map(|step| flat(Vec3::from(surface.point_at(step as f64 / 8.0, 0.0))))
+        .collect::<Vec<_>>();
+    let natural = Vec3::from(surface.normal_at(0.5, 0.5)?);
+    let middle = Vec3::from(surface.point_at(0.5, 0.5));
+    let chord = samples.iter().map(|point| *point - origin).find(|chord| chord.length() > tolerance)?;
+    let normal = direction.cross(chord).normalize()?;
+    let mut controls = surface.control_points().iter().flatten().map(|point| Vec3::from(*point));
+    if controls.all(|point| (point - origin).dot(normal).abs() <= tolerance) {
+        let plane = Plane::orthonormal(origin.to_array(), direction.to_array(), normal.to_array())?;
+        return Some((Surface::Plane(plane), normal.dot(natural) > 0.0));
+    }
+    // The circle through the first, middle and last section points.
+    let (a, b, c) = (samples[0], samples[4], samples[8]);
+    let (ab, ac) = (b - a, c - a);
+    let axis = ab.cross(ac);
+    if axis.length() <= tolerance * tolerance.max(1.0) {
+        return None;
+    }
+    let centre = a + (axis.cross(ab) * ac.dot(ac) + ac.cross(axis) * ab.dot(ab)) * (0.5 / axis.dot(axis));
+    let radius = a.distance(centre);
+    if axis.cross(direction).length() > axis.length() * 1e-9
+        || samples.iter().any(|point| (point.distance(centre) - radius).abs() > tolerance)
+    {
+        return None;
+    }
+    let x_axis = (a - centre) * (1.0 / radius);
+    let base = Plane::orthonormal(centre.to_array(), x_axis.to_array(), direction.to_array())?;
+    let outward = flat(middle) - centre;
+    Some((Surface::Cylinder(super::geometry::Cylinder { base, radius }), outward.dot(natural) > 0.0))
+}
+
+/// The plane, cylinder, cone, sphere or torus that a patch turned exactly
+/// about one axis lies on, and whether its natural normal agrees with the
+/// patch's.
+fn revolved_analytic(surface: &NurbsSurface3, tolerance: f64) -> Option<(Surface, bool)> {
+    // Each section point runs round a circle about the common axis.
+    let mut axis: Option<(Vec3, Vec3)> = None;
+    let mut meridian = Vec::new();
+    for step in 0..=8 {
+        let u = step as f64 / 8.0;
+        let ring = [0.0, 0.25, 0.5, 0.75, 1.0].map(|v| Vec3::from(surface.point_at(u, v)));
+        let (a, b, c) = (ring[0], ring[2], ring[4]);
+        let (ab, ac) = (b - a, c - a);
+        let normal = ab.cross(ac);
+        if normal.length() <= tolerance * tolerance.max(1.0) {
+            // A point on the axis stays put.
+            if ring.iter().any(|point| point.distance(a) > tolerance) { return None; }
+            meridian.push(a);
+            continue;
+        }
+        let centre = a + (normal.cross(ab) * ac.dot(ac) + ac.cross(normal) * ab.dot(ab)) * (0.5 / normal.dot(normal));
+        let radius = a.distance(centre);
+        if ring.iter().any(|point| (point.distance(centre) - radius).abs() > tolerance) { return None; }
+        let direction = normal.normalize()?;
+        match axis {
+            Some((origin, along)) => {
+                let offset = centre - origin;
+                if along.cross(direction).length() > 1e-9
+                    || (offset - along * offset.dot(along)).length() > tolerance
+                {
+                    return None;
+                }
+            }
+            None => axis = Some((centre, direction)),
+        }
+        meridian.push(a);
+    }
+    let (origin, along) = axis?;
+    // Section points as (distance from the axis, height along it).
+    let polar = |point: Vec3| {
+        let offset = point - origin;
+        let height = offset.dot(along);
+        ((offset - along * height).length(), height)
+    };
+    let section = meridian.iter().map(|point| polar(*point)).collect::<Vec<_>>();
+    let radial = (meridian[0] - origin) - along * (meridian[0] - origin).dot(along);
+    let x_axis = radial.normalize().or_else(|| along.cross(Vec3::X).normalize()).or_else(|| along.cross(Vec3::Y).normalize())?;
+    let natural = Vec3::from(surface.normal_at(0.5, 0.5)?);
+    let middle = Vec3::from(surface.point_at(0.5, 0.5));
+    let (middle_radius, middle_height) = polar(middle);
+    let middle_radial = ((middle - origin) - along * middle_height).normalize()?;
+    let (r0, h0) = section[0];
+    let (r1, h1) = section[8];
+    let frame_at = |height: f64| Plane::orthonormal((origin + along * height).to_array(), x_axis.to_array(), along.to_array());
+    if section.iter().all(|(radius, _)| (radius - r0).abs() <= tolerance) && r0 > tolerance {
+        let base = frame_at(h0)?;
+        let surface = Surface::Cylinder(super::geometry::Cylinder { base, radius: r0 });
+        return Some((surface, middle_radial.dot(natural) > 0.0));
+    }
+    if section.iter().all(|(_, height)| (height - h0).abs() <= tolerance) {
+        let plane = frame_at(h0)?;
+        return Some((Surface::Plane(plane), along.dot(natural) > 0.0));
+    }
+    // A straight meridian: a cone.
+    let chord = (r1 - r0, h1 - h0);
+    let length = chord.0.hypot(chord.1);
+    let off_line = |(radius, height): (f64, f64)| ((radius - r0) * chord.1 - (height - h0) * chord.0).abs() / length;
+    if length > tolerance && section.iter().all(|point| off_line(*point) <= tolerance) {
+        let slope = chord.0 / chord.1;
+        let half_angle = (-slope).atan();
+        let (radius, height) = if r0 >= r1 { (r0, h0) } else { (r1, h1) };
+        let base = frame_at(height)?;
+        let outward = middle_radial + along * half_angle.tan();
+        let surface = Surface::Cone(super::geometry::Cone { base, radius, half_angle });
+        return Some((surface, outward.dot(natural) > 0.0));
+    }
+    // A circular meridian: a torus, or a sphere about a centre on the axis.
+    let (a, b, c) = (section[0], section[4], section[8]);
+    let determinant = 2.0 * (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1));
+    if determinant.abs() <= tolerance * tolerance.max(1.0) { return None; }
+    let square = |(x, y): (f64, f64)| x * x + y * y;
+    let centre = (
+        (square(a) * (b.1 - c.1) + square(b) * (c.1 - a.1) + square(c) * (a.1 - b.1)) / determinant,
+        (square(a) * (c.0 - b.0) + square(b) * (a.0 - c.0) + square(c) * (b.0 - a.0)) / determinant,
+    );
+    let minor = (a.0 - centre.0).hypot(a.1 - centre.1);
+    if section.iter().any(|point| ((point.0 - centre.0).hypot(point.1 - centre.1) - minor).abs() > tolerance) {
+        return None;
+    }
+    let outward = (middle_radial * (middle_radius - centre.0) + along * (middle_height - centre.1)).normalize()?;
+    let agrees = outward.dot(natural) > 0.0;
+    let frame = frame_at(centre.1)?;
+    if centre.0.abs() <= tolerance {
+        return Some((Surface::Sphere(super::geometry::Sphere { frame, radius: minor }), agrees));
+    }
+    let torus = super::geometry::Torus { frame, major_radius: centre.0, minor_radius: minor };
+    Some((Surface::Torus(torus), agrees))
+}
+
+/// Whether an edge separates two faces of one analytic surface, both facing
+/// the same way, so that it can be removed.
+fn joins_one_surface(body: &Body, edge: EdgeKey, tolerance: f64) -> bool {
+    let Some(edge) = body.edges.get(edge) else { return false };
+    let [first, second] = edge.coedges[..] else { return false };
+    let side = |coedge| {
+        let ring = body.coedges.get(coedge)?.owner;
+        let face = body.loops.get(ring)?.owner;
+        let value = body.faces.get(face)?;
+        Some((face, ring, value.forward, body.surfaces.get(value.surface)?))
+    };
+    let (Some((face_a, loop_a, forward_a, surface_a)), Some((face_b, loop_b, forward_b, surface_b))) =
+        (side(first), side(second))
+    else {
+        return false;
+    };
+    if face_a == face_b && loop_a != loop_b {
+        return false;
+    }
+    match (surface_a, surface_b) {
+        (Surface::Plane(a), Surface::Plane(b)) => {
+            let (Some(normal_a), Some(normal_b)) = (a.normal(), b.normal()) else { return false };
+            let (normal_a, normal_b) = (Vec3::from(normal_a), Vec3::from(normal_b));
+            let facing = if forward_a == forward_b { 1.0 } else { -1.0 };
+            normal_a.dot(normal_b) * facing > 1.0 - 1e-12
+                && (Vec3::from(b.origin) - Vec3::from(a.origin)).dot(normal_a).abs() <= tolerance
+        }
+        (Surface::Cylinder(a), Surface::Cylinder(b)) => {
+            let (Some(axis_a), Some(axis_b)) = (a.base.normal(), b.base.normal()) else { return false };
+            let (axis_a, axis_b) = (Vec3::from(axis_a), Vec3::from(axis_b));
+            let offset = Vec3::from(b.base.origin) - Vec3::from(a.base.origin);
+            forward_a == forward_b
+                && (a.radius - b.radius).abs() <= tolerance
+                && axis_a.cross(axis_b).length() <= 1e-9
+                && (offset - axis_a * offset.dot(axis_a)).length() <= tolerance
+        }
+        (Surface::Cone(a), Surface::Cone(b)) => {
+            let (Some(axis_a), Some(axis_b)) = (a.base.normal(), b.base.normal()) else { return false };
+            let (axis_a, axis_b) = (Vec3::from(axis_a), Vec3::from(axis_b));
+            let offset = Vec3::from(b.base.origin) - Vec3::from(a.base.origin);
+            let radius_a_at_b = a.radius - offset.dot(axis_a) * a.half_angle.tan();
+            forward_a == forward_b
+                && axis_a.dot(axis_b) > 1.0 - 1e-12
+                && (a.half_angle - b.half_angle).abs() <= 1e-9
+                && (offset - axis_a * offset.dot(axis_a)).length() <= tolerance
+                && (radius_a_at_b - b.radius).abs() <= tolerance
+        }
+        (Surface::Sphere(a), Surface::Sphere(b)) => {
+            forward_a == forward_b
+                && (a.radius - b.radius).abs() <= tolerance
+                && Vec3::from(a.frame.origin).distance(Vec3::from(b.frame.origin)) <= tolerance
+        }
+        (Surface::Torus(a), Surface::Torus(b)) => {
+            let (Some(axis_a), Some(axis_b)) = (a.frame.normal(), b.frame.normal()) else { return false };
+            forward_a == forward_b
+                && Vec3::from(axis_a).cross(Vec3::from(axis_b)).length() <= 1e-9
+                && Vec3::from(a.frame.origin).distance(Vec3::from(b.frame.origin)) <= tolerance
+                && (a.major_radius - b.major_radius).abs() <= tolerance
+                && (a.minor_radius - b.minor_radius).abs() <= tolerance
+        }
+        _ => false,
+    }
+}
+
+/// Removes an edge between two faces of one surface: their loops are joined,
+/// or, when both uses already belong to one loop, that loop is split in two.
+fn dissolve_edge(body: &mut Body, edge: EdgeKey) -> Option<()> {
+    let [first, second] = body.edges.get(edge)?.coedges[..] else { return None };
+    let loop_a = body.coedges.get(first)?.owner;
+    let loop_b = body.coedges.get(second)?.owner;
+    let face_a = body.loops.get(loop_a)?.owner;
+    let face_b = body.loops.get(loop_b)?.owner;
+    // A ring rotated to start just after `coedge`, without it.
+    let after = |ring: &[CoedgeKey], coedge: CoedgeKey| -> Option<Vec<CoedgeKey>> {
+        let at = ring.iter().position(|key| *key == coedge)?;
+        Some(ring[at + 1..].iter().chain(&ring[..at]).copied().collect())
+    };
+    if loop_a == loop_b {
+        let ring = after(&body.loops.get(loop_a)?.coedges, first)?;
+        let split = ring.iter().position(|key| *key == second)?;
+        let (inner, outer) = (ring[..split].to_vec(), ring[split + 1..].to_vec());
+        // Two uses running straight back on each other leave one ring, or
+        // none at all when they were the whole of it.
+        let (keep, moved) = if loop_area(body, face_a, &inner)? > loop_area(body, face_a, &outer)? {
+            (inner, outer)
+        } else {
+            (outer, inner)
+        };
+        if keep.is_empty() {
+            body.loops.remove(loop_a);
+            body.faces.get_mut(face_a)?.loops.retain(|key| *key != loop_a);
+        } else {
+            body.loops.get_mut(loop_a)?.coedges = keep;
+        }
+        if !moved.is_empty() {
+            let ring = body.loops.insert(Loop { coedges: moved.clone(), owner: face_a, provenance: Provenance::Synthesized });
+            for coedge in moved {
+                body.coedges.get_mut(coedge)?.owner = ring;
+            }
+            body.faces.get_mut(face_a)?.loops.push(ring);
+        }
+    } else {
+        let mut ring = after(&body.loops.get(loop_a)?.coedges, first)?;
+        let tail = after(&body.loops.get(loop_b)?.coedges, second)?;
+        for coedge in &tail {
+            body.coedges.get_mut(*coedge)?.owner = loop_a;
+        }
+        ring.extend(tail);
+        body.loops.get_mut(loop_a)?.coedges = ring;
+        body.loops.remove(loop_b);
+        let others = body.faces.get(face_b)?.loops.iter().copied().filter(|key| *key != loop_b).collect::<Vec<_>>();
+        for other in others {
+            body.loops.get_mut(other)?.owner = face_a;
+            body.faces.get_mut(face_a)?.loops.push(other);
+        }
+        let face = body.faces.remove(face_b)?;
+        body.shells.get_mut(face.owner)?.faces.retain(|key| *key != face_b);
+        body.surfaces.remove(face.surface);
+    }
+    body.coedges.remove(first);
+    body.coedges.remove(second);
+    let removed = body.edges.remove(edge)?;
+    if !body.edges.iter().any(|(_, edge)| edge.curve == removed.curve) {
+        body.curves.remove(removed.curve);
+    }
+    for vertex in [removed.start, removed.end] {
+        if !body.edges.iter().any(|(_, edge)| edge.start == vertex || edge.end == vertex) {
+            body.vertices.remove(vertex);
+        }
+    }
+    Some(())
+}
+
+/// The area a loop encloses across its face's axis, from the polygon of its
+/// coedge start points; it only orders the two loops a split leaves.
+fn loop_area(body: &Body, face: FaceKey, ring: &[CoedgeKey]) -> Option<f64> {
+    let normal = match body.surfaces.get(body.faces.get(face)?.surface)? {
+        Surface::Plane(plane) => Vec3::from(plane.normal()?),
+        Surface::Cylinder(cylinder) => Vec3::from(cylinder.base.normal()?),
+        _ => return Some(0.0),
+    };
+    let points = ring.iter()
+        .map(|coedge| {
+            let (start, _) = body.coedge_vertices(*coedge)?;
+            Some(Vec3::from(body.vertices.get(start)?.point))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let area = (0..points.len()).fold(Vec3::ZERO, |sum, index| {
+        sum + points[index].cross(points[(index + 1) % points.len()])
+    });
+    Some(area.dot(normal).abs() * 0.5)
 }
 
 fn rotationally_invariant(wires: &[Vec<Curve>]) -> bool {
@@ -589,8 +952,81 @@ fn twist_frame(frame: Frame, point: Vec3, angle: f64, scale: f64) -> Option<Fram
         x: rotate(frame.x, normal, angle) * scale, y: rotate(frame.y, normal, angle) * scale })
 }
 
-/// Cubic Bezier control frames of one path patch.
-type Patch = [Frame; 4];
+/// Cubic Bezier control frames of one path patch, with their weights: one
+/// for transport fits, rational for an exact turn about a circular run.
+#[derive(Clone, Copy)]
+struct Patch { frames: [Frame; 4], weights: [f64; 4] }
+
+impl std::ops::Index<usize> for Patch {
+    type Output = Frame;
+    fn index(&self, index: usize) -> &Frame { &self.frames[index] }
+}
+
+impl std::ops::IndexMut<usize> for Patch {
+    fn index_mut(&mut self, index: usize) -> &mut Frame { &mut self.frames[index] }
+}
+
+/// The circle a planar piece runs round: centre, unit axis (turning the
+/// piece positively) and the angle it turns through.
+fn circular_run(piece: &Piece) -> Option<(Vec3, Vec3, f64)> {
+    let Piece::Planar(plane, curve, _) = piece else { return None };
+    if !matches!(curve, Curve::Arc(_) | Curve::Nurbs(_)) { return None; }
+    let (a, b, c) = (piece.point(0.0), piece.point(0.5), piece.point(1.0));
+    let (ab, ac) = (b - a, c - a);
+    let normal = ab.cross(ac);
+    if normal.length() <= 1e-12 * ab.length().max(ac.length()).max(1.0).powi(2) { return None; }
+    let centre = a + (normal.cross(ab) * ac.dot(ac) + ac.cross(normal) * ab.dot(ab)) * (0.5 / normal.dot(normal));
+    let radius = a.distance(centre);
+    let tolerance = radius.max(1.0) * 1e-10;
+    if (0..=16).any(|step| (piece.point(step as f64 / 16.0).distance(centre) - radius).abs() > tolerance) {
+        return None;
+    }
+    let plane_normal = Vec3::from(plane.normal()?);
+    let axis = if (a - centre).cross(piece.tangent(0.0)?).dot(plane_normal) >= 0.0 { plane_normal } else { -plane_normal };
+    let (from, to) = (a - centre, c - centre);
+    let mut angle = axis.dot(from.cross(to)).atan2(from.dot(to));
+    // The middle point decides whether the run goes the long way round.
+    if angle <= 0.0 || axis.dot((b - centre).cross(to)) < 0.0 { angle += TAU; }
+    if angle > TAU { angle -= TAU; }
+    (angle > 1e-9).then_some((centre, axis, angle))
+}
+
+/// Exact rational patches turning `start` about the axis through `centre`,
+/// each a quarter turn at most.
+fn turning_patches(start: Frame, centre: Vec3, axis: Vec3, angle: f64, result: &mut Vec<Patch>) {
+    let spans = (angle / (PI / 2.0) - 1e-9).ceil().max(1.0) as usize;
+    let step = angle / spans as f64;
+    let turned = |frame: Frame, by: f64| Frame {
+        origin: centre + rotate(frame.origin - centre, axis, by),
+        x: rotate(frame.x, axis, by),
+        y: rotate(frame.y, axis, by),
+    };
+    // The middle control of a rational quadratic arc lies 1/cos(step/2) out
+    // from the axis; along the axis nothing moves.
+    let cosine = (step * 0.5).cos();
+    let spread = |value: Vec3| axis * axis.dot(value) + (value - axis * axis.dot(value)) * (1.0 / cosine);
+    for span in 0..spans {
+        let first = turned(start, step * span as f64);
+        let last = turned(start, step * (span + 1) as f64);
+        let middle = turned(start, step * (span as f64 + 0.5));
+        let corner = Frame {
+            origin: centre + spread(middle.origin - centre),
+            x: spread(middle.x),
+            y: spread(middle.y),
+        };
+        // Degree elevation of weights (1, cos, 1).
+        let inner = 1.0 + 2.0 * cosine;
+        result.push(Patch {
+            frames: [
+                first,
+                first.plus(corner.times(2.0 * cosine)).times(1.0 / inner),
+                corner.times(2.0 * cosine).plus(last).times(1.0 / inner),
+                last,
+            ],
+            weights: [1.0, inner / 3.0, inner / 3.0, 1.0],
+        });
+    }
+}
 
 fn transported_patches(
     pieces: &[Piece], first: Frame, options: SweepOptions,
@@ -623,9 +1059,6 @@ fn transported_patches(
         let b = (first.x - axis * first.x.dot(axis)).normalize()?;
         axis.dot(a.cross(b)).atan2(a.dot(b))
     } else { 0.0 };
-    let bank_rolls = if options.bank && pieces.iter().all(|piece| matches!(piece, Piece::Line(_, _))) {
-        polyline_bank_rolls(pieces, &walks, closed)?
-    } else { vec![0.0; pieces.len() + 1] };
     let mut patches = Vec::new();
     let mut travelled = 0.0;
     for (index, piece) in pieces.iter().enumerate() {
@@ -635,8 +1068,7 @@ fn transported_patches(
             let slot = parameters.partition_point(|parameter| *parameter <= t).saturating_sub(1).min(parameters.len() - 2);
             let raw = curved_transport(frames[slot], piece, parameters[slot], t, options.bank)?;
             let fraction = (travelled + piece.length_to(t)) / total;
-            let bank_roll = bank_rolls[index] + (bank_rolls[index + 1] - bank_rolls[index]) * piece.length_to(t) / length;
-            twist_frame(raw, piece.point(t), options.twist * fraction + closure_roll * fraction + bank_roll,
+            twist_frame(raw, piece.point(t), options.twist * fraction + closure_roll * fraction,
                 1.0 + (options.scale - 1.0) * fraction)
         };
         let raw_start = evaluate_raw(0.0)?;
@@ -660,8 +1092,19 @@ fn transported_patches(
         cuts.extend((1..subdivisions).map(|i| i as f64 / subdivisions as f64));
         cuts.sort_by(f64::total_cmp);
         cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
-        for span in cuts.windows(2) {
-            fit_patch(&evaluate, span[0], span[1], radius, total.max(radius) * 1e-7, 0, &mut patches)?;
+        // An untwisted, unscaled run round a circle that meets its neighbours
+        // without a corner is an exact turn: keep it exact rather than fitted.
+        let delta = delta_start.origin.length() + delta_start.x.length() + delta_start.y.length()
+            + delta_end.origin.length() + delta_end.x.length() + delta_end.y.length();
+        let exact = (options.twist.abs() + closure_roll.abs() <= 1e-12
+            && (options.scale - 1.0).abs() <= 1e-12 && delta <= 1e-12)
+            .then(|| circular_run(piece)).flatten();
+        if let Some((centre, axis, angle)) = exact {
+            turning_patches(evaluate(0.0)?, centre, axis, angle, &mut patches);
+        } else {
+            for span in cuts.windows(2) {
+                fit_patch(&evaluate, span[0], span[1], radius, total.max(radius) * 1e-7, 0, &mut patches)?;
+            }
         }
         travelled += length;
     }
@@ -678,37 +1121,6 @@ fn transported_patches(
         patches.last_mut()?[3] = start;
     }
     Some(patches)
-}
-
-fn polyline_bank_rolls(pieces: &[Piece], walks: &[(Vec<f64>, Vec<Frame>)], closed: bool) -> Option<Vec<f64>> {
-    let mut angles = vec![None; pieces.len() + 1];
-    for index in 0..pieces.len() {
-        if index == 0 && !closed { continue; }
-        let previous = if index == 0 { pieces.len() - 1 } else { index - 1 };
-        let incoming = pieces[previous].tangent(1.0)?;
-        let outgoing = pieces[index].tangent(0.0)?;
-        let cross = incoming.cross(outgoing);
-        if cross.length() <= 1e-10 { continue; }
-        let normal = cross.normalize()?;
-        let tangent = (incoming + outgoing).normalize()?;
-        let frame = walks[index].1[0];
-        let up = transport(frame.y, outgoing, tangent)?;
-        let up = (up - tangent * up.dot(tangent)).normalize()?;
-        angles[index] = Some(tangent.dot(up.cross(normal)).atan2(up.dot(normal)));
-    }
-    let Some(phase) = angles.iter().flatten().next().copied() else { return Some(vec![0.0; pieces.len() + 1]); };
-    let mut rolls = vec![0.0; pieces.len() + 1];
-    let mut previous = 0.0;
-    for index in 1..pieces.len() {
-        if let Some(angle) = angles[index] {
-            let mut roll = angle - phase;
-            roll += ((previous - roll) / TAU).round() * TAU;
-            previous = roll;
-        }
-        rolls[index] = previous;
-    }
-    rolls[pieces.len()] = if closed { 0.0 } else { previous };
-    Some(rolls)
 }
 
 fn divide_path(piece: &Piece, a: f64, b: f64, depth: usize, result: &mut Vec<f64>) -> Option<()> {
@@ -730,15 +1142,21 @@ fn divide_path(piece: &Piece, a: f64, b: f64, depth: usize, result: &mut Vec<f64
 
 fn bezier(p: &Patch, t: f64) -> Frame {
     let s = 1.0 - t;
-    p[0].times(s * s * s).plus(p[1].times(3.0 * s * s * t))
-        .plus(p[2].times(3.0 * s * t * t)).plus(p[3].times(t * t * t))
+    let basis = [s * s * s, 3.0 * s * s * t, 3.0 * s * t * t, t * t * t];
+    let weight = (0..4).map(|i| basis[i] * p.weights[i]).sum::<f64>();
+    (0..4).fold(p[0].times(0.0), |sum, i| sum.plus(p[i].times(basis[i] * p.weights[i] / weight)))
 }
 
 fn bezier_derivative(p: &Patch, t: f64) -> Frame {
     let s = 1.0 - t;
-    p[1].minus(p[0]).times(3.0 * s * s)
-        .plus(p[2].minus(p[1]).times(6.0 * s * t))
-        .plus(p[3].minus(p[2]).times(3.0 * t * t))
+    let basis = [s * s * s, 3.0 * s * s * t, 3.0 * s * t * t, t * t * t];
+    let slope = [-3.0 * s * s, 3.0 * s * s - 6.0 * s * t, 6.0 * s * t - 3.0 * t * t, 3.0 * t * t];
+    let weight = (0..4).map(|i| basis[i] * p.weights[i]).sum::<f64>();
+    let weight_slope = (0..4).map(|i| slope[i] * p.weights[i]).sum::<f64>();
+    let point = bezier(p, t);
+    (0..4).fold(point.times(-weight_slope / weight), |sum, i| {
+        sum.plus(p[i].times(slope[i] * p.weights[i] / weight))
+    })
 }
 
 /// A locally folded transport is not a regular swept body, even when its
@@ -801,8 +1219,8 @@ fn fit_patch(
     let q2 = evaluate(a + (b - a) * 2.0 / 3.0)?;
     let c = q1.times(27.0).minus(p0.times(8.0)).minus(p3);
     let d = q2.times(27.0).minus(p0).minus(p3.times(8.0));
-    let patch = [p0, c.times(2.0).minus(d).times(1.0 / 18.0),
-        d.times(2.0).minus(c).times(1.0 / 18.0), p3];
+    let patch = Patch { frames: [p0, c.times(2.0).minus(d).times(1.0 / 18.0),
+        d.times(2.0).minus(c).times(1.0 / 18.0), p3], weights: [1.0; 4] };
     let mut error = 0.0_f64;
     for t in [0.125, 0.25, 0.5, 0.75, 0.875] {
         error = error.max(frame_error(bezier(&patch, t), evaluate(a + (b - a) * t)?, radius));
@@ -850,14 +1268,17 @@ fn build_body(wires: &[Wire], patches: &[Patch], sheet: bool, closed_path: bool,
         for (band, patch) in patches.iter().enumerate() {
             let rails = coords.iter().enumerate().map(|(index, point)| {
                 let curve = RationalCurve3 { degree: 3, knots: cubic_knots(),
-                    points: patch.iter().map(|frame| frame.point(*point).to_array()).collect(), weights: vec![1.0; 4] };
+                    points: patch.frames.iter().map(|frame| frame.point(*point).to_array()).collect(),
+                    weights: patch.weights.to_vec() };
                 add_curve_edge(&mut body, &curve, vertices[band][index], vertices[band + 1][index])
             }).collect::<Option<Vec<_>>>()?;
             for (index, curve) in wire.curves.iter().enumerate() {
                 let next = (index + 1) % coords.len();
                 let points = curve.points.iter().map(|point|
-                    patch.iter().map(|frame| frame.point(*point).to_array()).collect()).collect();
-                let weights = curve.weights.iter().map(|weight| vec![*weight; 4]).collect();
+                    patch.frames.iter().map(|frame| frame.point(*point).to_array()).collect()).collect();
+                let weights = curve.weights.iter()
+                    .map(|weight| patch.weights.iter().map(|along| weight * along).collect())
+                    .collect();
                 let surface = NurbsSurface3::new_strict(curve.degree, 3, points,
                     curve.knots.clone(), cubic_knots(), weights)?;
                 let surface = body.surfaces.insert(Surface::Nurbs(surface));

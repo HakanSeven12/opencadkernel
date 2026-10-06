@@ -1106,3 +1106,99 @@ fn note_broken(loss: &mut Loss, record: &SatRecord) {
         loss.broken.push(index as usize);
     }
 }
+
+/// One span of a wire body, in the order the wire runs.
+#[derive(Debug, Clone)]
+pub struct WireSpan {
+    /// The edge's curve (a line, circle, ellipse or spline).
+    pub curve: Curve3,
+    /// Where the span starts along the wire.
+    pub start: [f64; 3],
+    /// Where the span ends along the wire.
+    pub end: [f64; 3],
+    /// Whether the wire runs along the curve's own direction.
+    pub along_curve: bool,
+}
+
+/// The spans of the first wire in a wire body (a polyline the modeler keeps
+/// as a body), from its open end, or from the coedge the wire names when it
+/// is closed. The body's transform, if any, is applied.
+pub fn lift_wire(document: &SatDocument) -> Option<Vec<WireSpan>> {
+    let wire = document.wires().into_iter().next()?;
+    let first = wire
+        .record()
+        .pointers()
+        .into_iter()
+        .find(|pointer| resolve(document, *pointer).is_some_and(|record| record.is_a("coedge")))?;
+    let index = |pointer| resolve(document, pointer).and_then(index_of);
+    // An open wire's first coedge is its own predecessor; a closed one is a
+    // ring, walked from the coedge the wire names.
+    let mut start = first;
+    let mut visited = std::collections::HashSet::new();
+    loop {
+        visited.insert(index(start)?);
+        let previous = SatCoedge::from_record(resolve(document, start)?)?.prev();
+        match index(previous) {
+            Some(at) if at != index(start)? && !visited.contains(&at) => start = previous,
+            Some(at) if at != index(start)? => {
+                start = first;
+                break;
+            }
+            _ => break,
+        }
+    }
+    let mut spans = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut pointer = start;
+    while let Some(record) = resolve(document, pointer) {
+        if !seen.insert(index_of(record)?) {
+            break;
+        }
+        let coedge = SatCoedge::from_record(record)?;
+        let edge = SatEdge::from_record(resolve(document, coedge.edge())?)?;
+        let point = |pointer| -> Option<[f64; 3]> {
+            let vertex = SatVertex::from_record(resolve(document, pointer)?)?;
+            let (x, y, z) = SatPoint::from_record(resolve(document, vertex.point())?)?.position();
+            Some([x, y, z])
+        };
+        // An edge runs from its start vertex to its end vertex and a reversed
+        // coedge runs it backwards; either sense turns it against the curve.
+        let coedge_forward = coedge.sense() == Sense::Forward;
+        let (from, to) = (point(edge.start_vertex())?, point(edge.end_vertex())?);
+        spans.push(WireSpan {
+            curve: read_curve(document, resolve(document, edge.curve())?)?,
+            start: if coedge_forward { from } else { to },
+            end: if coedge_forward { to } else { from },
+            along_curve: (edge.sense() == Sense::Forward) == coedge_forward,
+        });
+        pointer = coedge.next();
+    }
+    let placement = document
+        .bodies()
+        .first()
+        .and_then(|body| resolve(document, body.transform()))
+        .and_then(body_placement);
+    if let Some(place) = placement {
+        let scale = place.scale()?;
+        for span in &mut spans {
+            span.start = place.point(span.start);
+            span.end = place.point(span.end);
+            span.curve = match &span.curve {
+                Curve3::Line(line) => Curve3::Line(Line3 {
+                    origin: place.point(line.origin),
+                    direction: place.vector(line.direction),
+                }),
+                Curve3::Circle(circle) => Curve3::Circle(Circle3 {
+                    plane: Plane::from_axes(
+                        place.point(circle.plane.origin),
+                        place.vector(circle.plane.x_axis),
+                        place.vector(circle.plane.y_axis),
+                    ),
+                    radius: circle.radius * scale,
+                }),
+                _ => return None,
+            };
+        }
+    }
+    (!spans.is_empty()).then_some(spans)
+}
