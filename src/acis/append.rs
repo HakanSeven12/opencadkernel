@@ -241,11 +241,20 @@ pub fn append_polyline_wire(
     document: &mut SatDocument,
 ) -> Result<Written, Unappendable> {
     let mut points = points.to_vec();
-    if closed && points.len() > 2 && points.first() == points.last() {
+    // A closed list may repeat its first point at the end, to rounding.
+    let extent = points
+        .iter()
+        .map(|point| Vec3::from(*point).distance(Vec3::from(points[0])))
+        .fold(0.0, f64::max);
+    let repeated = |a: [f64; 3], b: [f64; 3]| Vec3::from(a).distance(Vec3::from(b)) <= extent * 1e-12;
+    if closed && points.len() > 2 && repeated(points[0], points[points.len() - 1]) {
         points.pop();
     }
     let spans = if closed { points.len() } else { points.len().saturating_sub(1) };
-    if spans == 0 || points.iter().flatten().any(|value| !value.is_finite()) {
+    if spans == 0
+        || (closed && points.len() < 3)
+        || points.iter().flatten().any(|value| !value.is_finite())
+    {
         return Err(Unappendable::Inconsistent);
     }
     let before = document.record_count();

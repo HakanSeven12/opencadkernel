@@ -19,8 +19,8 @@ pub enum HistoryRebuildError {
     InvalidBrep,
     Fillet(brep::FilletError),
     Chamfer(brep::ChamferError),
-    /// The reference modeler's error code for an operation it refuses.
-    Modeling(u32),
+    /// A sweep the record asks for that a cornered path refuses.
+    Refused(brep::SweepRefusal),
 }
 
 impl std::fmt::Display for HistoryRebuildError {
@@ -32,7 +32,7 @@ impl std::fmt::Display for HistoryRebuildError {
             Self::InvalidBrep => formatter.write_str("invalid solid history B-rep"),
             Self::Fillet(error) => write!(formatter, "solid history fillet failed: {error}"),
             Self::Chamfer(error) => write!(formatter, "solid history chamfer failed: {error}"),
-            Self::Modeling(code) => write!(formatter, "modeling operation error {code}"),
+            Self::Refused(why) => write!(formatter, "sweep refused: {why:?} along a path with a corner"),
         }
     }
 }
@@ -1215,8 +1215,8 @@ pub fn rebuild_sweep_with_mode(
         };
     }
     let geometry = sweep_history_geometry(value, surface)?;
-    if let Some(code) = brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options) {
-        return Err(HistoryRebuildError::Modeling(code));
+    if let Some(why) = brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options) {
+        return Err(HistoryRebuildError::Refused(why));
     }
     finish(
         brep::sweep_path(
@@ -1229,9 +1229,9 @@ pub fn rebuild_sweep_with_mode(
     )
 }
 
-/// The reference modeler's error code when it refuses a sweep record: a
-/// twist (115065) or scale (5016) along a path with a corner.
-pub fn sweep_history_refusal(value: &SolidHistorySweep) -> Option<u32> {
+/// Why a sweep record is refused: a twist or scale along a path with a
+/// corner, or banking along a planar one.
+pub fn sweep_history_refusal(value: &SolidHistorySweep) -> Option<brep::SweepRefusal> {
     let geometry = sweep_history_geometry(value, false).ok()?;
     brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options)
 }

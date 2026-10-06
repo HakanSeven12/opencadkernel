@@ -205,11 +205,26 @@ fn conic_anchor(pieces: &[Curve]) -> Option<[f64; 2]> {
     Some(pieces[index].point_at(if senses[index] { parameter } else { 1.0 - parameter }))
 }
 
-/// The reference modeler refuses to twist or scale along a path with a
-/// corner (a mitred joint cannot change the section on both sides), and to
-/// bank along a planar path with a corner. Returns its modeling error code:
-/// 5016 for a scale, else 115065 for a twist, else 115007 for banking.
-pub fn sweep_corner_refusal(path: SweepPath<'_>, options: SweepOptions) -> Option<u32> {
+/// Why a sweep along a path with a corner is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepRefusal {
+    /// The section would scale across a mitred joint.
+    Scale,
+    /// The section would twist across a mitred joint.
+    Twist,
+    /// Banking along a planar path with a corner.
+    Bank,
+}
+
+/// Whether two path tangents meet at a corner rather than run on smoothly.
+fn is_corner(before: Vec3, after: Vec3) -> bool {
+    before.dot(after) < 1.0 - 1e-9
+}
+
+/// Recorded sweeps refuse to twist or scale along a path with a corner (a
+/// mitred joint cannot change the section on both sides), and to bank along
+/// a planar path with a corner, as the reference modeler does.
+pub fn sweep_corner_refusal(path: SweepPath<'_>, options: SweepOptions) -> Option<SweepRefusal> {
     let planar = matches!(path, SweepPath::Planar { .. });
     let pieces = path_pieces(path)?;
     let start = pieces.first()?.point(0.0);
@@ -218,21 +233,26 @@ pub fn sweep_corner_refusal(path: SweepPath<'_>, options: SweepOptions) -> Optio
     corner_refusal(&pieces, start.distance(end) <= extent.max(1.0) * 1e-9, planar, options)?
 }
 
-fn corner_refusal(pieces: &[Piece], closed: bool, planar: bool, options: SweepOptions) -> Option<Option<u32>> {
+fn corner_refusal(
+    pieces: &[Piece],
+    closed: bool,
+    planar: bool,
+    options: SweepOptions,
+) -> Option<Option<SweepRefusal>> {
     let joints = pieces.windows(2).map(|pair| (&pair[0], &pair[1]))
         .chain(closed.then(|| (pieces.last().unwrap(), &pieces[0])));
     let mut cornered = false;
     for (before, after) in joints {
-        cornered |= before.tangent(1.0)?.dot(after.tangent(0.0)?) < 1.0 - 1e-9;
+        cornered |= is_corner(before.tangent(1.0)?, after.tangent(0.0)?);
     }
     Some(if !cornered {
         None
     } else if (options.scale - 1.0).abs() > 1e-12 {
-        Some(5016)
+        Some(SweepRefusal::Scale)
     } else if options.twist.abs() > 1e-12 {
-        Some(115065)
+        Some(SweepRefusal::Twist)
     } else if options.bank && planar {
-        Some(115007)
+        Some(SweepRefusal::Bank)
     } else {
         None
     })
@@ -265,7 +285,6 @@ pub fn sweep_path(
     if wires.iter().any(|wire| !wire.closed) && wires.len() != 1 {
         return None;
     }
-    let planar = matches!(path, SweepPath::Planar { .. });
     let pieces = path_pieces(path)?;
     let start = pieces.first()?.point(0.0);
     let tangent = pieces.first()?.tangent(0.0)?;
@@ -275,9 +294,6 @@ pub fn sweep_path(
         return None;
     }
     let closed = start.distance(end) <= extent.max(1.0) * 1e-9;
-    if corner_refusal(&pieces, closed, planar, options)?.is_some() {
-        return None;
-    }
     let mut source_wires = wires.iter().map(|wire| wire.source.clone()).collect::<Vec<_>>();
     let base = Vec3::from(options.base_point
         .or_else(|| sweep_profile_base(profile_plane, &source_wires))?);
@@ -467,8 +483,9 @@ fn ruled_analytic(surface: &NurbsSurface3, tolerance: f64) -> Option<(Surface, b
         let plane = Plane::orthonormal(origin.to_array(), direction.to_array(), normal.to_array())?;
         return Some((Surface::Plane(plane), normal.dot(natural) > 0.0));
     }
-    // The circle through the first, middle and last section points.
-    let (a, b, c) = (samples[0], samples[4], samples[8]);
+    // The circle through three distinct section points (a whole circle's
+    // first and last coincide).
+    let (a, b, c) = (samples[0], samples[3], samples[6]);
     let (ab, ac) = (b - a, c - a);
     let axis = ab.cross(ac);
     if axis.length() <= tolerance * tolerance.max(1.0) {
@@ -563,7 +580,7 @@ fn revolved_analytic(surface: &NurbsSurface3, tolerance: f64) -> Option<(Surface
         return Some((surface, outward.dot(natural) > 0.0));
     }
     // A circular meridian: a torus, or a sphere about a centre on the axis.
-    let (a, b, c) = (section[0], section[4], section[8]);
+    let (a, b, c) = (section[0], section[3], section[6]);
     let determinant = 2.0 * (a.0 * (b.1 - c.1) + b.0 * (c.1 - a.1) + c.0 * (a.1 - b.1));
     if determinant.abs() <= tolerance * tolerance.max(1.0) { return None; }
     let square = |(x, y): (f64, f64)| x * x + y * y;
@@ -874,7 +891,7 @@ fn circular_tube(pieces: &[Piece], first: Frame, centre: [f64; 2], radius: f64, 
     let joints = if closed { count } else { count - 1 };
     let corner = |index: usize| -> Option<bool> {
         let (before, after) = (&pieces[index], &pieces[(index + 1) % count]);
-        Some(before.tangent(1.0)?.dot(after.tangent(0.0)?) < 1.0 - 1e-12)
+        Some(is_corner(before.tangent(1.0)?, after.tangent(0.0)?))
     };
     let mut wanted = false;
     for joint in 0..joints {
@@ -1052,7 +1069,8 @@ fn circular_tube(pieces: &[Piece], first: Frame, centre: [f64; 2], radius: f64, 
             let (low, high) = crossing.domain();
             let key = edge(&mut body, Curve3::Nurbs(crossing), from, to, low, high);
             // The same points in each surface's parameters, interpolated with
-            // the same parameter values, so each face carries the exact trace.
+            // the same parameter values, so each face carries the same trace
+            // (they agree at the samples; between them both are fits).
             for (run, surface) in [(a, &surface_a), (b, &surface_b)] {
                 let mut uv: Vec<[f64; 2]> = Vec::with_capacity(part.len());
                 for point in part.iter() {
@@ -1264,7 +1282,9 @@ fn closed_turned_polyline(
         let a = last.point(curve.point_at(0.0));
         let Some(mut outward) = (last.point(curve.point_at(1.0)) - a).cross(end_tangent).normalize() else { continue };
         if outward.dot(a - centre) < 0.0 { outward = -outward; }
-        if outward.dot(start_tangent) <= 1e-9 { continue; }
+        // A face nearly along the first run would be cut far behind the
+        // corner, at a reach set only by the fallback above.
+        if outward.dot(start_tangent) <= 1e-3 { continue; }
         let face = Plane::orthonormal(a.to_array(), end_tangent.to_array(), outward.to_array())?;
         if let Some(cut) = super::slice::slice_by_plane(&head_body, face).ok()? { parts.push(cut.positive); }
     }
@@ -2256,4 +2276,34 @@ fn add_loop(body: &mut Body, face: FaceKey, circuit: &[(EdgeKey, bool)],
     }
     body.faces.get_mut(face)?.loops.push(ring);
     Some(ring)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geom2d::Circle;
+
+    fn round_profile() -> Vec<Vec<Curve>> {
+        vec![vec![Curve::Circle(Circle { centre: [0.0, 0.0], radius: 1.0 })]]
+    }
+
+    const BENT: [[f64; 3]; 3] = [[0.0, 0.0, 0.0], [0.0, 0.0, 10.0], [10.0, 0.0, 10.0]];
+
+    #[test]
+    fn a_round_profile_round_a_corner_has_exact_faces() {
+        let path = SweepPath::Polyline3d { points: &BENT, closed: false };
+        let body = sweep_path(Plane::XY, &round_profile(), path, SweepOptions::default()).unwrap();
+        assert!(body.validate().is_empty());
+        let surfaces = || body.faces.iter().filter_map(|(_, face)| body.surfaces.get(face.surface));
+        assert!(surfaces().any(|surface| matches!(surface, Surface::Cylinder(_))));
+        assert!(!surfaces().any(|surface| matches!(surface, Surface::Nurbs(_))));
+    }
+
+    #[test]
+    fn a_twist_round_a_corner_builds_but_a_record_refuses_it() {
+        let path = || SweepPath::Polyline3d { points: &BENT, closed: false };
+        let options = SweepOptions { twist: 1.0, ..SweepOptions::default() };
+        assert!(sweep_path(Plane::XY, &round_profile(), path(), options).is_some());
+        assert_eq!(sweep_corner_refusal(path(), options), Some(SweepRefusal::Twist));
+    }
 }
