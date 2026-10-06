@@ -33,6 +33,8 @@ struct ExistingFillet {
     cut: Halfspace,
     cylinder: Cylinder,
     forward: bool,
+    /// Outward normals of the two planar faces the fillet rounds between.
+    sides: [Vec3; 2],
 }
 
 /// Why one or more selected edges could not be filleted.
@@ -552,6 +554,77 @@ pub fn fillet_edges(
         return result;
     }
 
+    match fillet_convex(body, &selected, radius) {
+        Err(
+            error @ (FilletError::RadiusTooLargeOrInteracting
+            | FilletError::UnsupportedEndCondition(_)
+            | FilletError::InvalidResult),
+        ) => refillet_from_sharp(body, &selected, radius).ok_or(error),
+        result => result,
+    }
+}
+
+/// An edge next to an earlier fillet of the same radius: rebuild the sharp
+/// body from its planar faces and round the earlier edges together with the
+/// new ones, so the corner between them gets the same seam or patch an
+/// all-at-once selection would. Earlier fillets of another radius, or a body
+/// whose planar faces do not rebuild it, are left to the caller's error.
+fn refillet_from_sharp(body: &Body, selected: &[EdgeKey], radius: f64) -> Option<Body> {
+    let tolerance = operation_tolerance(&[body]);
+    let existing = existing_fillets(body)?;
+    if existing.is_empty()
+        || existing
+            .iter()
+            .any(|fillet| (fillet.cylinder.radius - radius).abs() > tolerance)
+    {
+        return None;
+    }
+    let mut halfspaces = Vec::new();
+    for (_, face) in body.faces.iter() {
+        let Some(Surface::Plane(plane)) = body.surfaces.get(face.surface) else {
+            continue;
+        };
+        let mut normal = Vec3::from(plane.normal()?);
+        if !face.forward {
+            normal = -normal;
+        }
+        halfspaces.push(Halfspace {
+            origin: Vec3::from(plane.origin),
+            normal,
+            offset: normal.dot(Vec3::from(plane.origin)),
+            added: false,
+        });
+    }
+    // `convex_body` reports one marked face; which one does not matter here.
+    halfspaces.first_mut()?.added = true;
+    let (sharp, _) = convex_body(&halfspaces, tolerance)?;
+    // An edge of the sharp body is named by the outward normals of its faces.
+    let same = |a: Vec3, b: Vec3| a.dot(b) > 1.0 - 1e-8;
+    let find = |pair: [Vec3; 2]| {
+        sharp.edges.iter().find_map(|(key, _)| {
+            let frame = edge_frame(&sharp, key)?;
+            let normals = [frame.first_normal, frame.second_normal];
+            ((same(normals[0], pair[0]) && same(normals[1], pair[1]))
+                || (same(normals[0], pair[1]) && same(normals[1], pair[0])))
+            .then_some(key)
+        })
+    };
+    let mut edges = Vec::with_capacity(existing.len() + selected.len());
+    for fillet in &existing {
+        edges.push(find(fillet.sides)?);
+    }
+    for edge in selected {
+        let frame = edge_frame(body, *edge)?;
+        edges.push(find([frame.first_normal, frame.second_normal])?);
+    }
+    fillet_convex(&sharp, &edges, radius).ok()
+}
+
+/// Rounds straight edges of a convex planar body, keeping earlier fillets.
+fn fillet_convex(body: &Body, selected: &[EdgeKey], radius: f64) -> Result<Body, FilletError> {
+    let mut selected = selected.to_vec();
+    selected.sort_by_key(EdgeKey::slot);
+    selected.dedup();
     let tolerance = operation_tolerance(&[body]);
     let existing = existing_fillets(body).ok_or(FilletError::UnsupportedExistingFillet)?;
     let old_corners = existing_corners(body).ok_or(FilletError::UnsupportedExistingFillet)?;
@@ -1053,6 +1126,7 @@ fn existing_fillets(body: &Body) -> Option<Vec<ExistingFillet>> {
             },
             cylinder: cylinder.clone(),
             forward: face.forward,
+            sides: [side_normals[0], side_normals[1]],
         });
     }
     Some(found)
@@ -1568,6 +1642,38 @@ mod tests {
 
         assert!(result.validate().is_empty());
         assert!(result.faces.len() > body.faces.len());
+    }
+
+    /// Rounding one box edge and then an adjacent one ends with the same
+    /// corner as rounding both at once.
+    #[test]
+    fn adjacent_edge_after_a_fillet_of_the_same_radius() {
+        let body = cuboid([0.0; 3], [8.0, 6.0, 4.0]).unwrap();
+        let face = body.face_keys().next().unwrap();
+        let edges = body
+            .face_coedges(face)
+            .into_iter()
+            .map(|coedge| body.coedges.get(coedge).unwrap().edge)
+            .collect::<Vec<_>>();
+        let together = fillet_edges(&body, &edges[0..2], 0.5).unwrap();
+
+        let first = fillet_edges(&body, &edges[0..1], 0.5).unwrap();
+        let first_frame = edge_frame(&body, edges[1]).unwrap();
+        let next = first
+            .edges
+            .iter()
+            .find_map(|(key, _)| {
+                let frame = edge_frame(&first, key)?;
+                let same = |a: Vec3, b: Vec3| a.dot(b) > 1.0 - 1e-8;
+                let (a, b) = (frame.first_normal, frame.second_normal);
+                let (c, d) = (first_frame.first_normal, first_frame.second_normal);
+                ((same(a, c) && same(b, d)) || (same(a, d) && same(b, c))).then_some(key)
+            })
+            .unwrap();
+        let second = fillet_edges(&first, &[next], 0.5).unwrap();
+
+        assert!(second.validate().is_empty());
+        assert_eq!(second.faces.len(), together.faces.len());
     }
 
     #[test]
