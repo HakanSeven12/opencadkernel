@@ -19,6 +19,8 @@ pub enum HistoryRebuildError {
     InvalidBrep,
     Fillet(brep::FilletError),
     Chamfer(brep::ChamferError),
+    /// The reference modeler's error code for an operation it refuses.
+    Modeling(u32),
 }
 
 impl std::fmt::Display for HistoryRebuildError {
@@ -30,6 +32,7 @@ impl std::fmt::Display for HistoryRebuildError {
             Self::InvalidBrep => formatter.write_str("invalid solid history B-rep"),
             Self::Fillet(error) => write!(formatter, "solid history fillet failed: {error}"),
             Self::Chamfer(error) => write!(formatter, "solid history chamfer failed: {error}"),
+            Self::Modeling(code) => write!(formatter, "modeling operation error {code}"),
         }
     }
 }
@@ -217,6 +220,85 @@ fn spline_curve(
     Ok(PlanarCurve::new(plane, Curve::Nurbs(nurbs)))
 }
 
+/// The spans of a polyline the modeler keeps as a wire body.
+fn body_wire_spans(entity: &EmbeddedEntity) -> Option<Vec<crate::acis::WireSpan>> {
+    let EmbeddedEntity::Body { acis_data, .. } = entity else {
+        return None;
+    };
+    crate::acis::lift_wire(&acis_data.parse()?)
+}
+
+/// A planar wire body as a bulged polyline in its own plane: lines and
+/// circular arcs, open or closed.
+fn wire_polyline(spans: &[crate::acis::WireSpan]) -> Result<PlanarCurve, HistoryRebuildError> {
+    let points = spans
+        .iter()
+        .flat_map(|span| [span.start, span.end])
+        .collect::<Vec<_>>();
+    let first = Vec3::from(spans.first().ok_or(HistoryRebuildError::InvalidParameters)?.start);
+    let arc_normal = spans.iter().find_map(|span| match &span.curve {
+        brep::Curve3::Circle(circle) => circle.plane.normal(),
+        _ => None,
+    });
+    let normal = match arc_normal {
+        Some(normal) => Vec3::from(normal),
+        // Newell's normal of the vertex chain.
+        None => (0..points.len()).fold(Vec3::ZERO, |sum, index| {
+            let a = Vec3::from(points[index]) - first;
+            let b = Vec3::from(points[(index + 1) % points.len()]) - first;
+            sum + a.cross(b)
+        }),
+    }
+    .normalize()
+    .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let x_axis = points
+        .iter()
+        .map(|point| Vec3::from(*point) - first)
+        .map(|chord| chord - normal * chord.dot(normal))
+        .find(|chord| chord.length() > 1e-12)
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let plane = Plane::orthonormal(first.to_array(), x_axis.to_array(), normal.to_array())
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let tolerance = coplanarity_tolerance(&points);
+    if points.iter().any(|point| !plane.contains(*point, tolerance)) {
+        return Err(HistoryRebuildError::Unsupported);
+    }
+    let mut vertices = Vec::with_capacity(spans.len() + 1);
+    for span in spans {
+        let bulge = match &span.curve {
+            brep::Curve3::Line(_) => 0.0,
+            brep::Curve3::Circle(circle) => {
+                let axis = Vec3::from(circle.plane.normal().ok_or(HistoryRebuildError::InvalidParameters)?);
+                let axis = if span.along_curve { axis } else { -axis };
+                let centre = Vec3::from(circle.plane.origin);
+                let (a, b) = (Vec3::from(span.start) - centre, Vec3::from(span.end) - centre);
+                let mut sweep = a.cross(b).dot(axis).atan2(a.dot(b));
+                if sweep <= 1e-12 {
+                    sweep += std::f64::consts::TAU;
+                }
+                if axis.dot(normal).abs() < 1.0 - 1e-9 || sweep >= std::f64::consts::TAU - 1e-9 {
+                    return Err(HistoryRebuildError::Unsupported);
+                }
+                (sweep / 4.0).tan() * axis.dot(normal).signum()
+            }
+            _ => return Err(HistoryRebuildError::Unsupported),
+        };
+        vertices.push(PolylineVertex {
+            position: plane.project(span.start).ok_or(HistoryRebuildError::InvalidParameters)?,
+            bulge,
+        });
+    }
+    let last = spans.last().ok_or(HistoryRebuildError::InvalidParameters)?.end;
+    let closed = Vec3::from(last).distance(first) <= tolerance.max(1e-9);
+    if !closed {
+        vertices.push(PolylineVertex {
+            position: plane.project(last).ok_or(HistoryRebuildError::InvalidParameters)?,
+            bulge: 0.0,
+        });
+    }
+    Ok(PlanarCurve::new(plane, Curve::Polyline(Polyline { vertices, closed })))
+}
+
 fn embedded_curve(entity: &EmbeddedEntity) -> Result<PlanarCurve, HistoryRebuildError> {
     match entity {
         EmbeddedEntity::Line(value) => straight_curve(value.start, value.end),
@@ -278,6 +360,9 @@ fn embedded_curve(entity: &EmbeddedEntity) -> Result<PlanarCurve, HistoryRebuild
                 }),
             ))
         }
+        EmbeddedEntity::Body { .. } => wire_polyline(
+            &body_wire_spans(entity).ok_or(HistoryRebuildError::InvalidParameters)?,
+        ),
         EmbeddedEntity::Spline(value) => spline_curve(value),
         EmbeddedEntity::LwPolyline(value) => {
             if value.vertices.len() < 2 {
@@ -796,6 +881,27 @@ fn embedded_sweep_path(
     entity: &EmbeddedEntity,
     transform: [f64; 16],
 ) -> Result<HistorySweepPath, HistoryRebuildError> {
+    // A polyline kept as a wire body: straight spans are a 3D polyline;
+    // a planar chain with arcs is swept as a bulged polyline in its plane.
+    if let Some(spans) = body_wire_spans(entity) {
+        let place = placement(transform)?;
+        if place.scale().is_none() {
+            return Err(HistoryRebuildError::InvalidTransform);
+        }
+        if spans.iter().all(|span| matches!(span.curve, brep::Curve3::Line(_))) {
+            let mut points = std::iter::once(spans[0].start)
+                .chain(spans.iter().map(|span| span.end))
+                .map(|point| place.point(point))
+                .collect::<Vec<_>>();
+            let closed = points.len() > 2
+                && Vec3::from(points[0]).distance(Vec3::from(*points.last().unwrap()))
+                    <= coplanarity_tolerance(&points).max(1e-9);
+            if closed {
+                points.pop();
+            }
+            return Ok(HistorySweepPath::Polyline3d { points, closed });
+        }
+    }
     if let EmbeddedEntity::Spline(value) = entity {
         let degree = value.degree.max(1) as usize;
         let fit_method = !value.fit_points.is_empty() && value.control_points.len() <= degree;
@@ -978,10 +1084,12 @@ fn sweep_history_geometry(
         path_transform,
     )?;
     // Flag 295: the stored profile is already placed at the path start and
-    // aligned (base point, alignment and profile rotation applied), so it is
-    // swept where it stands.
+    // aligned (base point and alignment applied), so it is swept where it
+    // stands, turned by the profile rotation about the start tangent.
     if value.flags_294_296[1] {
         let start = brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
+        let tangent = Vec3::from(brep::sweep_path_tangent(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?);
+        let facing = Vec3::from(plane.normal().ok_or(HistoryRebuildError::InvalidParameters)?).dot(tangent);
         return Ok(SweepHistoryGeometry {
             plane,
             wires,
@@ -990,7 +1098,7 @@ fn sweep_history_geometry(
             options: brep::SweepOptions {
                 align: false,
                 base_point: Some(start),
-                rotation: 0.0,
+                rotation: if facing < 0.0 { -value.align_angle } else { value.align_angle },
                 twist: value.twist_angle,
                 scale: value.scale_factor,
                 bank: value.bank,
@@ -1018,7 +1126,8 @@ fn sweep_history_geometry(
         path,
         path_shift,
         options: brep::SweepOptions {
-            align: explicit_alignment && value.align_option != 0,
+            // Option 2 translates the profile to the path without turning it.
+            align: explicit_alignment && value.align_option == 1,
             base_point: Some(reference_point),
             rotation: value.align_angle,
             twist: value.twist_angle,
@@ -1086,9 +1195,8 @@ pub fn rebuild_sweep_with_mode(
 ) -> Result<Body, HistoryRebuildError> {
     // The reference application builds the same bisector-mitered corner for
     // every miter option (default, old, new, crimp, bend: 0..=4), on planar
-    // and spatial polyline paths alike. Unknown values and the intersection
-    // check, which can reject a self-intersecting sweep, stay unsupported.
-    if value.miter_option > 4 || value.check_intersections {
+    // and spatial polyline paths alike. Unknown values stay unsupported.
+    if value.miter_option > 4 {
         return Err(HistoryRebuildError::Unsupported);
     }
     if !value.scale_factor.is_finite()
@@ -1107,6 +1215,9 @@ pub fn rebuild_sweep_with_mode(
         };
     }
     let geometry = sweep_history_geometry(value, surface)?;
+    if let Some(code) = brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options) {
+        return Err(HistoryRebuildError::Modeling(code));
+    }
     finish(
         brep::sweep_path(
             geometry.plane,
@@ -1116,6 +1227,13 @@ pub fn rebuild_sweep_with_mode(
         ),
         value.base.transform,
     )
+}
+
+/// The reference modeler's error code when it refuses a sweep record: a
+/// twist (115065) or scale (5016) along a path with a corner.
+pub fn sweep_history_refusal(value: &SolidHistorySweep) -> Option<u32> {
+    let geometry = sweep_history_geometry(value, false).ok()?;
+    brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options)
 }
 
 fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {

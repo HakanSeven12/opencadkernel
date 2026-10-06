@@ -90,7 +90,8 @@ pub use sweep::{
     extrude_tapered,
 };
 pub use sweep_path::{
-    sweep_path, sweep_path_start, sweep_profile_base, sweep_profile_group_base,
+    sweep_corner_refusal, sweep_path, sweep_path_start, sweep_path_tangent, sweep_profile_base,
+    sweep_profile_group_base,
     sweep_profile_placement, SweepOptions, SweepPath,
 };
 pub use thicken::{thicken, ThickenError};
