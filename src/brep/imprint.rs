@@ -367,10 +367,17 @@ fn align_edge_vertices(source: &Body, target: &mut Body, tolerance: f64) {
                 continue;
             };
             let mut parameter = curve.parameter_at(point);
-            if matches!(curve, Curve3::Circle(_) | Curve3::Ellipse(_)) {
+            let period = match curve {
+                Curve3::Circle(_) | Curve3::Ellipse(_) => Some(std::f64::consts::TAU),
+                Curve3::Nurbs(spline) if spline.periodicity() => {
+                    let (start, end) = spline.domain();
+                    Some(end - start)
+                }
+                _ => None,
+            };
+            if let Some(period) = period {
                 let middle = 0.5 * (edge.start_parameter + edge.end_parameter);
-                parameter += std::f64::consts::TAU
-                    * ((middle - parameter) / std::f64::consts::TAU).round();
+                parameter += period * ((middle - parameter) / period).round();
             }
             let span = edge.end_parameter - edge.start_parameter;
             if span == 0.0 {
@@ -945,6 +952,17 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
     let mut out = Vec::new();
     let mut soups = None;
     let mut marched: Vec<(Surface, Surface, Vec<Vec<Vec3>>)> = Vec::new();
+    let mut untraced: Vec<usize> = Vec::new();
+    // Where a traced curve may run: inside both bodies' boxes, a little over.
+    let common = match (super::bounds::body_bounds(a), super::bounds::body_bounds(b)) {
+        (Some(first), Some(second)) => {
+            let low = Vec3::from(std::array::from_fn(|i| first.min[i].max(second.min[i])));
+            let high = Vec3::from(std::array::from_fn(|i| first.max[i].min(second.max[i])));
+            let margin = tolerance + low.distance(high) * 1e-3;
+            (low - Vec3::new(margin, margin, margin), high + Vec3::new(margin, margin, margin))
+        }
+        _ => (Vec3::new(f64::MIN, f64::MIN, f64::MIN), Vec3::new(f64::MAX, f64::MAX, f64::MAX)),
+    };
     for (one, one_box) in &near {
         for (other, other_box) in &far {
             // A box that could not be computed means "cannot exclude", so
@@ -1069,9 +1087,10 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
                     if super::near::apart(&soups.0, *one, &soups.1, *other, tolerance) {
                         continue;
                     }
-                    let known = match marched
-                        .iter()
-                        .position(|(s, t, _)| s == one_surface && t == other_surface)
+                    let known = match marched.iter().position(|(s, t, _)| {
+                        same_surface(s, one_surface, tolerance)
+                            && same_surface(t, other_surface, tolerance)
+                    })
                     {
                         Some(index) => index,
                         None => {
@@ -1094,10 +1113,18 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
                                 other_surface,
                                 second,
                                 &mut marched[known].2,
+                                common,
                                 tolerance,
                             )
-                        })
-                        .ok_or(Snag::NoClosedForm)?;
+                        });
+                    // Faces that come near without a crossing to start from
+                    // are settled once every pair is done: a meeting traced
+                    // from another pair of the same surfaces already runs
+                    // past them, whole.
+                    let Some(curves) = curves else {
+                        untraced.push(known);
+                        continue;
+                    };
                     let curves = curves
                         .into_iter()
                         .flat_map(|curve| {
@@ -1111,7 +1138,23 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
             }
         }
     }
+    if untraced.iter().any(|known| marched[*known].2.is_empty()) {
+        return Err(Snag::NoClosedForm);
+    }
     Ok(out)
+}
+
+/// One surface whatever frame it is measured in: the eight faces of a
+/// divided sphere each carry their own, and a curve traced on one of them
+/// is the same curve on all.
+fn same_surface(one: &Surface, other: &Surface, tolerance: f64) -> bool {
+    let near = |a: [f64; 3], b: [f64; 3]| Vec3::from(a).distance(Vec3::from(b)) <= tolerance;
+    match (one, other) {
+        (Surface::Sphere(a), Surface::Sphere(b)) => {
+            near(a.frame.origin, b.frame.origin) && (a.radius - b.radius).abs() <= tolerance
+        }
+        _ => one == other,
+    }
 }
 
 /// The curves of a body's own edges that a traced curve runs along, if it

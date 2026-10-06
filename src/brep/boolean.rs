@@ -24,10 +24,10 @@
 //! classified, a coincident pair. Refusing is cheap; a leaking solid is not.
 
 use super::classify::{contains_point, Containment};
-use super::geometry::Surface;
+use super::geometry::{Curve3, Line3, Surface};
 use super::imprint::{imprint, Snag};
 use super::pcurve;
-use super::topology::{Body, Face, FaceKey, Lump, Shell};
+use super::topology::{Body, CoedgeKey, EdgeKey, Face, FaceKey, Lump, Shell, VertexKey};
 use super::Provenance;
 use crate::geom2d::Curve;
 use crate::space::Vec3;
@@ -128,7 +128,184 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
         return Err(Snag::CutRefused);
     }
     regroup_shells(&mut result, tolerance)?;
+    merge_coplanar_faces(&mut result, tolerance);
     Ok(result)
+}
+
+/// Joins what the cut left split along a line it no longer needs: coplanar
+/// neighbours, such as the side of a box and of the prism pulled from its
+/// top, become one face, and straight edges left in line become one edge.
+/// A body that would not validate afterwards is left as it was.
+fn merge_coplanar_faces(body: &mut Body, tolerance: f64) {
+    let mut merged = body.clone();
+    let mut changed = false;
+    loop {
+        let next = merged
+            .edges
+            .keys()
+            .find(|edge| coplanar_split(&merged, *edge, tolerance).is_some());
+        let Some(edge) = next else { break };
+        if join_faces(&mut merged, edge, tolerance).is_none() {
+            return;
+        }
+        changed = true;
+    }
+    if !changed {
+        return;
+    }
+    loop {
+        let next = merged.vertices.keys().find(|vertex| collinear_pair(&merged, *vertex).is_some());
+        let Some(vertex) = next else { break };
+        if join_edges(&mut merged, vertex).is_none() {
+            return;
+        }
+    }
+    if merged.validate().is_empty() {
+        *body = merged;
+    }
+}
+
+fn owner_face(body: &Body, coedge: CoedgeKey) -> Option<FaceKey> {
+    Some(body.loops.get(body.coedges.get(coedge)?.owner)?.owner)
+}
+
+/// The two faces a straight edge splits one plane into, when it is the only
+/// edge they share and neither carries parameter-space curves.
+fn coplanar_split(body: &Body, key: EdgeKey, tolerance: f64) -> Option<[FaceKey; 2]> {
+    let edge = body.edges.get(key)?;
+    if edge.coedges.len() != 2 || !matches!(body.curves.get(edge.curve)?, Curve3::Line(_)) {
+        return None;
+    }
+    let faces = [owner_face(body, edge.coedges[0])?, owner_face(body, edge.coedges[1])?];
+    if faces[0] == faces[1] {
+        return None;
+    }
+    let mut planes = [(Vec3::from([0.0; 3]), 0.0); 2];
+    for (slot, face) in faces.iter().enumerate() {
+        let face = body.faces.get(*face)?;
+        let Surface::Plane(plane) = body.surfaces.get(face.surface)? else {
+            return None;
+        };
+        let normal = Vec3::from(plane.normal()?) * if face.forward { 1.0 } else { -1.0 };
+        planes[slot] = (normal, normal.dot(Vec3::from(plane.origin)));
+    }
+    if planes[0].0.dot(planes[1].0) < 1.0 - 1e-9 || (planes[0].1 - planes[1].1).abs() > tolerance {
+        return None;
+    }
+    let edges_of = |face: FaceKey| -> Option<Vec<EdgeKey>> {
+        let mut edges = Vec::new();
+        for ring in &body.faces.get(face)?.loops {
+            for coedge in &body.loops.get(*ring)?.coedges {
+                let coedge = body.coedges.get(*coedge)?;
+                if coedge.pcurve.is_some() {
+                    return None;
+                }
+                edges.push(coedge.edge);
+            }
+        }
+        Some(edges)
+    };
+    let second = edges_of(faces[1])?;
+    let shared = edges_of(faces[0])?.into_iter().filter(|edge| second.contains(edge)).count();
+    (shared == 1).then_some(faces)
+}
+
+/// Splices the second face's loop into the first's across their edge.
+fn join_faces(body: &mut Body, key: EdgeKey, tolerance: f64) -> Option<()> {
+    let [keep, gone] = coplanar_split(body, key, tolerance)?;
+    let edge = body.edges.remove(key)?;
+    let (kept_use, gone_use) = if owner_face(body, edge.coedges[0])? == keep {
+        (edge.coedges[0], edge.coedges[1])
+    } else {
+        (edge.coedges[1], edge.coedges[0])
+    };
+    let kept_loop = body.coedges.remove(kept_use)?.owner;
+    let gone_loop = body.coedges.remove(gone_use)?.owner;
+    let gone_ring = body.loops.remove(gone_loop)?.coedges;
+    let at = gone_ring.iter().position(|coedge| *coedge == gone_use)?;
+    let spliced = gone_ring[at + 1..].iter().chain(&gone_ring[..at]).copied().collect::<Vec<_>>();
+    for coedge in &spliced {
+        body.coedges.get_mut(*coedge)?.owner = kept_loop;
+    }
+    let ring = &mut body.loops.get_mut(kept_loop)?.coedges;
+    let at = ring.iter().position(|coedge| *coedge == kept_use)?;
+    ring.splice(at..=at, spliced);
+
+    let face = body.faces.remove(gone)?;
+    for ring in face.loops.iter().filter(|ring| **ring != gone_loop) {
+        body.loops.get_mut(*ring)?.owner = keep;
+        body.faces.get_mut(keep)?.loops.push(*ring);
+    }
+    body.shells.get_mut(face.owner)?.faces.retain(|other| *other != gone);
+    if !body.faces.iter().any(|(_, other)| other.surface == face.surface) {
+        body.surfaces.remove(face.surface);
+    }
+    Some(())
+}
+
+/// Two straight edges meeting in line at a vertex nothing else uses, both
+/// between the same two faces.
+fn collinear_pair(body: &Body, vertex: VertexKey) -> Option<[EdgeKey; 2]> {
+    let mut edges = body
+        .edges
+        .iter()
+        .filter(|(_, edge)| edge.start == vertex || edge.end == vertex)
+        .map(|(key, _)| key);
+    let pair = [edges.next()?, edges.next()?];
+    if edges.next().is_some() {
+        return None;
+    }
+    let mut directions = [Vec3::from([0.0; 3]); 2];
+    let mut faces = [Vec::new(), Vec::new()];
+    for (slot, key) in pair.iter().enumerate() {
+        let edge = body.edges.get(*key)?;
+        if edge.start == edge.end
+            || edge.coedges.len() != 2
+            || !matches!(body.curves.get(edge.curve)?, Curve3::Line(_))
+        {
+            return None;
+        }
+        let start = Vec3::from(body.vertices.get(edge.start)?.point);
+        let end = Vec3::from(body.vertices.get(edge.end)?.point);
+        directions[slot] = (end - start).normalize()?;
+        faces[slot] = edge
+            .coedges
+            .iter()
+            .map(|coedge| owner_face(body, *coedge))
+            .collect::<Option<Vec<_>>>()?;
+        faces[slot].sort_by_key(FaceKey::slot);
+    }
+    (directions[0].dot(directions[1]).abs() > 1.0 - 1e-12 && faces[0] == faces[1]).then_some(pair)
+}
+
+/// Extends the first edge over the second through `vertex`.
+fn join_edges(body: &mut Body, vertex: VertexKey) -> Option<()> {
+    let [keep, gone] = collinear_pair(body, vertex)?;
+    let removed = body.edges.remove(gone)?;
+    let far = if removed.start == vertex { removed.end } else { removed.start };
+    for coedge in &removed.coedges {
+        let owner = body.coedges.remove(*coedge)?.owner;
+        body.loops.get_mut(owner)?.coedges.retain(|other| other != coedge);
+    }
+    body.vertices.remove(vertex);
+    let edge = body.edges.get_mut(keep)?;
+    if edge.start == vertex {
+        edge.start = far;
+    } else {
+        edge.end = far;
+    }
+    let (start, end) = (edge.start, edge.end);
+    let from = Vec3::from(body.vertices.get(start)?.point);
+    let to = Vec3::from(body.vertices.get(end)?.point);
+    let curve = body.curves.insert(Curve3::Line(Line3 {
+        origin: from.to_array(),
+        direction: (to - from).to_array(),
+    }));
+    let edge = body.edges.get_mut(keep)?;
+    edge.curve = curve;
+    edge.start_parameter = 0.0;
+    edge.end_parameter = 1.0;
+    Some(())
 }
 
 /// A whole sphere that `other` cuts, rebuilt in eight faces, each with its
@@ -150,9 +327,11 @@ fn divided_sphere(body: &Body, other: &Body, tolerance: f64) -> Option<Body> {
             .get(key)
             .and_then(|face| other.surfaces.get(face.surface))
             .is_some_and(|wall| {
+                // A meeting with no closed form is traced, and the trace
+                // needs the divided faces as much as a circle does.
                 matches!(
                     super::intersect::surfaces(surface, wall, tolerance),
-                    super::intersect::Meeting::Curves(_)
+                    super::intersect::Meeting::Curves(_) | super::intersect::Meeting::Unknown
                 )
             })
     });
@@ -967,8 +1146,8 @@ mod tests {
         let bounds = body_bounds(&result).unwrap();
         assert_eq!(bounds.min, [0.0; 3]);
         assert_eq!(bounds.max, [10.0, 10.0, 20.0]);
-        // Five sides each, and the two that met are gone.
-        assert_eq!(result.faces.len(), 10);
+        // The two that met are gone, and the sides join across the seam.
+        assert_eq!(result.faces.len(), 6);
         assert!(result.validate().is_empty());
         assert_eq!(result.euler_characteristic(), 2);
     }
@@ -1029,6 +1208,30 @@ mod tests {
                 at(0).cross(at(1)).dot(at(2)) / 6.0
             })
             .sum()
+    }
+
+    #[test]
+    fn a_sphere_and_a_cylinder_off_its_centre_combine() {
+        // Their walls meet in curves with no closed form: two loops round the
+        // cylinder through the sphere, or one where it only grazes the side.
+        for (axis, radius) in [([3.0, 0.0], 4.0), ([8.0, 0.0], 4.0)] {
+            let sphere = crate::brep::make::sphere([0.0; 3], 10.0).unwrap();
+            let rod = cylinder([axis[0], axis[1], -20.0], radius, 40.0).unwrap();
+            let tolerance = crate::brep::operation_tolerance(&[&sphere, &rod]);
+            let both = (volume(&sphere), volume(&rod));
+            let joined = combine(sphere.clone(), rod.clone(), Operation::Union, tolerance).unwrap();
+            let shared =
+                combine(sphere.clone(), rod.clone(), Operation::Intersection, tolerance).unwrap();
+            let drilled = combine(sphere, rod, Operation::Difference, tolerance).unwrap();
+            for result in [&joined, &shared, &drilled] {
+                assert!(result.validate().is_empty());
+            }
+            let (joined, shared, drilled) = (volume(&joined), volume(&shared), volume(&drilled));
+            // Within the meshing; a wall lost or kept twice is far more.
+            assert!(shared > 0.0);
+            assert!((joined + shared - both.0 - both.1).abs() < both.0 * 1e-2);
+            assert!((drilled + shared - both.0).abs() < both.0 * 1e-2);
+        }
     }
 
     #[test]

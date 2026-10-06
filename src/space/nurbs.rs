@@ -601,9 +601,18 @@ impl NurbsCurve3 {
                 best_distance = here;
             }
         }
-        let mut low = from + (to - from) * best.saturating_sub(1) as f64 / steps as f64;
-        let mut high = from + (to - from) * (best + 1).min(steps) as f64 / steps as f64;
-        for _ in 0..24 {
+        // A closed curve's nearest point may lie just round the seam from
+        // the best sample, so its bracket runs past the domain's ends.
+        let (below, above) = if self.closed {
+            (best as f64 - 1.0, best as f64 + 1.0)
+        } else {
+            (best.saturating_sub(1) as f64, (best + 1).min(steps) as f64)
+        };
+        let mut low = from + (to - from) * below / steps as f64;
+        let mut high = from + (to - from) * above / steps as f64;
+        // Down to rounding: a corner placed on the curve is found on it again
+        // within a modelling tolerance, not a sampling one.
+        for _ in 0..64 {
             let third = (high - low) / 3.0;
             let one = low + third;
             let two = high - third;
@@ -613,7 +622,7 @@ impl NurbsCurve3 {
                 low = one;
             }
         }
-        0.5 * (low + high)
+        wrap_parameter(0.5 * (low + high), from, to, self.closed)
     }
 
     /// Solve tangency from an external point near a knot-parameter seed.

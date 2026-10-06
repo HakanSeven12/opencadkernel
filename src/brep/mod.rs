@@ -28,6 +28,7 @@
 
 pub mod arena;
 pub mod blend;
+mod blend_local;
 pub mod boolean;
 pub mod bounds;
 mod chamfer_circular;

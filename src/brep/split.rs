@@ -19,7 +19,7 @@
 //! short, its ring no longer closes, and the failure surfaces later as a
 //! boolean that loses a wall.
 
-use super::geometry::Curve3;
+use super::geometry::{Circle3, Curve3, Ellipse3};
 use super::pcurve;
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, FaceKey, Loop, LoopKey, Vertex, VertexKey,
@@ -309,6 +309,7 @@ fn split_face_in_place(
                     cross(shifted_cutter, flat_edge, Tolerance::new(tolerance))
                         .into_iter()
                         .map(|crossing| surface.point_at(crossing.point[0], crossing.point[1]))
+                        .map(|point| onto_both(&curve, cutter, point, tolerance))
                         .collect()
                 }
             };
@@ -502,16 +503,20 @@ fn split_face_in_place(
         // sense alone says nothing about which way increasing its parameter
         // winds: intersection circles can use the opposite plane normal.
         // The island follows the face and the new hole runs the other way.
-        let (cutter_plane, winding) = match cutter {
-            Curve3::Circle(circle) => (&circle.plane, 1.0),
-            Curve3::Ellipse(ellipse) => (&ellipse.plane, 1.0),
-            Curve3::PlanarSpline { plane, curve } => {
-                (plane, crate::geom2d::Curve::Nurbs(curve.clone()).enclosed_area())
+        let alignment = match cutter {
+            Curve3::Circle(Circle3 { plane, .. }) | Curve3::Ellipse(Ellipse3 { plane, .. }) => {
+                Vec3::from(plane.normal()?).dot(Vec3::from(surface.normal_at(u, v)?))
             }
+            Curve3::PlanarSpline { plane, curve } => {
+                Vec3::from(plane.normal()?).dot(Vec3::from(surface.normal_at(u, v)?))
+                    * crate::geom2d::Curve::Nurbs(curve.clone()).enclosed_area()
+            }
+            // A closed curve traced across a curved face has no plane of its
+            // own; its image winds in (u, v), which turns the way the
+            // surface's own normal does.
+            Curve3::Nurbs(_) => flat_cutter.enclosed_area(),
             _ => return None,
         };
-        let alignment = Vec3::from(cutter_plane.normal()?)
-            .dot(Vec3::from(surface.normal_at(u, v)?)) * winding;
         if !alignment.is_finite() || alignment == 0.0 {
             return None;
         }
@@ -1311,6 +1316,46 @@ fn split_closed_between_loops(
     body.faces.get_mut(other)?.loops = moved_loops;
     body.shells.get_mut(node.owner)?.faces.push(other);
     Some([face, other])
+}
+
+/// A crossing read off sampled parameter-space images, moved onto both
+/// curves it is where: a spline's image is a fit off the spline, and a
+/// corner left there is a fit off the edge the other body cuts along it.
+fn onto_both(edge: &Curve3, cutter: &Curve3, point: [f64; 3], tolerance: f64) -> [f64; 3] {
+    if !matches!(cutter, Curve3::Nurbs(_)) {
+        return point;
+    }
+    // Newton on edge(s) = cutter(t), in least squares: both run on one
+    // surface, so where they cross the residual vanishes.
+    let speed = |curve: &Curve3, at: f64| {
+        let step = 1e-6 * at.abs().max(1.0);
+        (Vec3::from(curve.point_at(at + step)) - Vec3::from(curve.point_at(at - step)))
+            / (2.0 * step)
+    };
+    let (mut s, mut t) = (edge.parameter_at(point), cutter.parameter_at(point));
+    for _ in 0..32 {
+        let gap = Vec3::from(edge.point_at(s)) - Vec3::from(cutter.point_at(t));
+        if gap.length() <= tolerance * 0.01 {
+            break;
+        }
+        let (along, across) = (speed(edge, s), -speed(cutter, t));
+        let (aa, ab, bb) = (along.dot(along), along.dot(across), across.dot(across));
+        let det = aa * bb - ab * ab;
+        if det.abs() <= f64::EPSILON * aa * bb {
+            return point;
+        }
+        let (ra, rb) = (along.dot(gap), across.dot(gap));
+        s -= (bb * ra - ab * rb) / det;
+        t -= (aa * rb - ab * ra) / det;
+    }
+    let landed = edge.point_at(s);
+    // A step that ran off to another crossing is no refinement.
+    if Vec3::from(landed).distance(Vec3::from(point)) > 0.1 * Vec3::from(point).length().max(1.0)
+        || Vec3::from(landed).distance(Vec3::from(cutter.point_at(t))) > tolerance
+    {
+        return point;
+    }
+    landed
 }
 
 fn closed_period(curve: &Curve3) -> Option<f64> {

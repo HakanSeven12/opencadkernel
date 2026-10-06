@@ -28,6 +28,7 @@ pub(super) fn traced(
     other: &Surface,
     second: &[[Vec3; 3]],
     known: &mut Vec<Vec<Vec3>>,
+    bodies: (Vec3, Vec3),
     tolerance: f64,
 ) -> Option<Vec<Curve3>> {
     // Near enough that the meshes could hide a meeting, yet not crossing:
@@ -36,7 +37,12 @@ pub(super) fn traced(
     if seeds.is_empty() {
         return None;
     }
-    let reach = shared_bounds(first, second)?;
+    // Walked through the whole overlap of the two bodies, not just of these
+    // faces: a curve that comes back round is then traced closed once, rather
+    // than as pieces ending inside the faces of the other body, which no cut
+    // of those faces could use (a sphere cut by a cylinder off its axis).
+    shared_bounds(first, second)?;
+    let reach = bodies;
     let size = reach.0.distance(reach.1).max(tolerance);
     let mut walks: Vec<Walk> = Vec::new();
     for seed in seeds {
@@ -63,16 +69,51 @@ pub(super) fn traced(
         .into_iter()
         .filter(|walk| walk.points.len() >= 2)
         .map(|walk| {
-            let points: Vec<[f64; 3]> = walk.points.iter().map(|point| point.to_array()).collect();
-            // A closed curve leaves and arrives the same way, so the spline
-            // has no corner where it was joined.
-            let tangent = walk
-                .closed
-                .then(|| (walk.points[1] - walk.points[0]).normalize())
-                .flatten()
-                .map(Vec3::to_array);
-            NurbsCurve3::interpolate_fit(&points, tangent, tangent, Parameterization::Chord)
-                .map(Curve3::Nurbs)
+            let points: Vec<[f64; 3]> = if walk.closed {
+                evened(one, other, &walk.points, tolerance)
+            } else {
+                walk.points.iter().map(|point| point.to_array()).collect()
+            };
+            // A closed curve is periodic: no corner where it was joined, and
+            // a cut may start from wherever it crosses a face's boundary.
+            if walk.closed {
+                NurbsCurve3::interpolate_periodic(&points, Parameterization::Chord)
+            } else {
+                NurbsCurve3::interpolate_fit(&points, None, None, Parameterization::Chord)
+            }
+            .map(Curve3::Nurbs)
+        })
+        .collect()
+}
+
+/// A closed walk's points again, evenly spaced round it and settled back
+/// onto both surfaces. The walk starts with short steps and closes with a
+/// long one, and a periodic spline through spacing that uneven swings off
+/// the meeting near the join by more than a corner placed there may be.
+fn evened(one: &Surface, other: &Surface, points: &[Vec3], tolerance: f64) -> Vec<[f64; 3]> {
+    let lengths: Vec<f64> = points
+        .windows(2)
+        .scan(0.0, |total, pair| {
+            *total += pair[0].distance(pair[1]);
+            Some(*total)
+        })
+        .collect();
+    let total = lengths.last().copied().unwrap_or(0.0);
+    let count = points.len().saturating_sub(1);
+    if count < 3 || total <= 0.0 {
+        return points.iter().map(|point| point.to_array()).collect();
+    }
+    let mut segment = 0;
+    (0..count)
+        .map(|index| {
+            let at = total * index as f64 / count as f64;
+            while lengths[segment] < at {
+                segment += 1;
+            }
+            let before = if segment == 0 { 0.0 } else { lengths[segment - 1] };
+            let fraction = (at - before) / (lengths[segment] - before).max(f64::MIN_POSITIVE);
+            let guess = points[segment].lerp(points[segment + 1], fraction);
+            settle(one, other, guess, tolerance).unwrap_or(guess).to_array()
         })
         .collect()
 }
