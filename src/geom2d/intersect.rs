@@ -17,13 +17,13 @@
 //! determinant test would make the test scale with the drawing's units and
 //! mean nothing.
 
+use std::f64::consts::TAU;
+
 use super::Ellipse;
 
 /// Below this, two directions are parallel and there is no single crossing.
 const DETERMINANT_EPSILON: f64 = 1e-10;
 
-/// Below this, a quadratic has a double root: the line grazes the conic.
-const DISCRIMINANT_EPSILON: f64 = 1e-14;
 
 /// Below this, a direction is too short to define a line at all.
 const DEGENERATE_DIRECTION: f64 = 1e-20;
@@ -59,6 +59,9 @@ pub fn line_line(p: [f64; 2], d: [f64; 2], q: [f64; 2], e: [f64; 2]) -> Option<(
 /// Returns the line parameters: empty when they miss, one value where the
 /// line is tangent, two otherwise, ordered by increasing `t`.
 pub fn line_circle(p: [f64; 2], d: [f64; 2], centre: [f64; 2], radius: f64) -> Vec<f64> {
+    if radius <= 0.0 {
+        return Vec::new();
+    }
     let fx = p[0] - centre[0];
     let fy = p[1] - centre[1];
     let a = d[0] * d[0] + d[1] * d[1];
@@ -66,16 +69,24 @@ pub fn line_circle(p: [f64; 2], d: [f64; 2], centre: [f64; 2], radius: f64) -> V
         return Vec::new();
     }
     let b = 2.0 * (fx * d[0] + fy * d[1]);
-    let c = fx * fx + fy * fy - radius * radius;
-    let discriminant = b * b - 4.0 * a * c;
-    if discriminant < 0.0 {
+
+    let t_perp = -b / (2.0 * a);
+    let px = fx + t_perp * d[0];
+    let py = fy + t_perp * d[1];
+    let h = (px * px + py * py).sqrt();
+
+    let max_radius = radius.max(1.0);
+    let tol = PROXIMITY_EPSILON.max(1e-7 * max_radius);
+
+    if h > radius + tol {
         return Vec::new();
     }
-    if discriminant < DISCRIMINANT_EPSILON {
-        return vec![-b / (2.0 * a)];
+    if (h - radius).abs() <= tol {
+        return vec![t_perp];
     }
-    let root = discriminant.sqrt();
-    vec![(-b - root) / (2.0 * a), (-b + root) / (2.0 * a)]
+    let half_chord = (radius * radius - h * h).max(0.0).sqrt();
+    let delta_t = half_chord / a.sqrt();
+    vec![t_perp - delta_t, t_perp + delta_t]
 }
 
 /// Where two circles meet, as angles measured on the **first** circle.
@@ -90,24 +101,49 @@ pub fn circle_circle_angles(
     centre2: [f64; 2],
     radius2: f64,
 ) -> Vec<f64> {
+    if radius1 <= 0.0 || radius2 <= 0.0 {
+        return Vec::new();
+    }
     let span_x = centre2[0] - centre1[0];
     let span_y = centre2[1] - centre1[1];
     let distance = (span_x * span_x + span_y * span_y).sqrt();
 
+    // Scale proximity tolerance for large dimensions while preserving PROXIMITY_EPSILON for small ones.
+    let max_radius = radius1.max(radius2).max(1.0);
+    let tol = PROXIMITY_EPSILON.max(1e-7 * max_radius);
+
     // Concentric (no discrete solutions, even when the radii match and the
     // circles coincide), too far apart, or one swallowed by the other.
-    if distance < PROXIMITY_EPSILON
-        || distance > radius1 + radius2 + PROXIMITY_EPSILON
-        || distance < (radius1 - radius2).abs() - PROXIMITY_EPSILON
+    if distance < tol
+        || distance > radius1 + radius2 + tol
+        || distance < (radius1 - radius2).abs() - tol
     {
         return Vec::new();
+    }
+
+    // Check for tangency: external or internal
+    let external_tangent = (distance - (radius1 + radius2)).abs() <= tol;
+    let internal_tangent = (distance - (radius1 - radius2).abs()).abs() <= tol;
+
+    if external_tangent || internal_tangent {
+        let angle = if external_tangent || radius1 >= radius2 {
+            span_y.atan2(span_x)
+        } else {
+            (-span_y).atan2(-span_x)
+        };
+        return vec![angle];
     }
 
     // Distance from centre1 to the radical line, then the half-chord on it.
     let along = (radius1 * radius1 - radius2 * radius2 + distance * distance) / (2.0 * distance);
     let half_chord_squared = radius1 * radius1 - along * along;
-    if half_chord_squared < 0.0 {
-        return Vec::new();
+    if half_chord_squared <= 0.0 {
+        let angle = if radius1 >= radius2 {
+            span_y.atan2(span_x)
+        } else {
+            (-span_y).atan2(-span_x)
+        };
+        return vec![angle];
     }
     let half_chord = half_chord_squared.sqrt();
 
@@ -117,7 +153,7 @@ pub fn circle_circle_angles(
     let offset_y = -half_chord * span_x / distance;
 
     let first = ((mid_y + offset_y) - centre1[1]).atan2((mid_x + offset_x) - centre1[0]);
-    if half_chord < PROXIMITY_EPSILON {
+    if half_chord < tol {
         return vec![first];
     }
     let second = ((mid_y - offset_y) - centre1[1]).atan2((mid_x - offset_x) - centre1[0]);
@@ -168,17 +204,22 @@ pub fn line_ellipse(p: [f64; 2], d: [f64; 2], ellipse: &Ellipse) -> Vec<(f64, f6
         return Vec::new();
     }
     let b = 2.0 * (unit_x * unit_dx + unit_y * unit_dy);
-    let c = unit_x * unit_x + unit_y * unit_y - 1.0;
-    let discriminant = b * b - 4.0 * a * c;
-    if discriminant < 0.0 {
-        return Vec::new();
-    }
 
-    let line_params = if discriminant < DISCRIMINANT_EPSILON {
-        vec![-b / (2.0 * a)]
+    let t_perp = -b / (2.0 * a);
+    let px = unit_x + t_perp * unit_dx;
+    let py = unit_y + t_perp * unit_dy;
+    let h = (px * px + py * py).sqrt();
+
+    let tol = PROXIMITY_EPSILON.max(1e-7);
+
+    let line_params = if h > 1.0 + tol {
+        Vec::new()
+    } else if (h - 1.0).abs() <= tol {
+        vec![t_perp]
     } else {
-        let root = discriminant.sqrt();
-        vec![(-b - root) / (2.0 * a), (-b + root) / (2.0 * a)]
+        let half_chord = (1.0 - h * h).max(0.0).sqrt();
+        let delta_t = half_chord / a.sqrt();
+        vec![t_perp - delta_t, t_perp + delta_t]
     };
 
     line_params
@@ -210,6 +251,110 @@ pub fn circle_circle_points(
             ]
         })
         .collect()
+}
+
+/// Where the circle at `centre` with `radius` meets an ellipse, as `(circle_angle, ellipse_parameter)` pairs.
+///
+/// `circle_angle` is the angle on the circle measured from its centre.
+/// `ellipse_parameter` is the ellipse's own parameter `t`, so the point on the
+/// ellipse is [`Ellipse::point_at(t)`](Ellipse::point_at).
+pub fn ellipse_circle(
+    ellipse: &Ellipse,
+    centre: [f64; 2],
+    radius: f64,
+) -> Vec<(f64, f64)> {
+    if ellipse.is_degenerate() || radius < DEGENERATE_DIRECTION {
+        return Vec::new();
+    }
+    let Ellipse {
+        centre: c_e,
+        major_radius: a,
+        minor_radius: b,
+        major_axis,
+    } = *ellipse;
+    if a < DEGENERATE_DIRECTION || b < DEGENERATE_DIRECTION {
+        return Vec::new();
+    }
+    let (nx, ny) = (major_axis[0], major_axis[1]);
+
+    // Express circle centre in the ellipse's unscaled local coordinate frame.
+    let rx = centre[0] - c_e[0];
+    let ry = centre[1] - c_e[1];
+    let u = rx * nx + ry * ny;
+    let v = -rx * ny + ry * nx;
+    let r2 = radius * radius;
+
+    // F(t) = distance_squared(ellipse(t), circle_centre) - radius^2
+    let f = |t: f64| (a * t.cos() - u).powi(2) + (b * t.sin() - v).powi(2) - r2;
+    let df = |t: f64| (b * b - a * a) * (2.0 * t).sin() + 2.0 * a * u * t.sin() - 2.0 * b * v * t.cos();
+
+    // F is measured in length², so its tangency window is the distance
+    // tolerance of `line_circle` carried through d(r²) = 2r·dr.
+    let tol = PROXIMITY_EPSILON.max(1e-7 * radius.max(1.0));
+    let tangency = 2.0 * radius * tol;
+
+    // Sample F, and split any sample interval at an extremum of F: two
+    // crossings can sit between two samples of the same sign (a small circle
+    // on a large ellipse), and the extremum between them separates them.
+    // Each piece is then bracketed, so bisection cannot wander off to a
+    // neighbouring root.
+    let mut roots: Vec<f64> = Vec::new();
+    let mut push = |t: f64| {
+        let t = t.rem_euclid(TAU);
+        if !roots.iter().any(|&r| (r - t).abs() < 1e-9 || (r - t).abs() > TAU - 1e-9) {
+            roots.push(t);
+        }
+    };
+    const N: usize = 64;
+    for i in 0..N {
+        let t0 = i as f64 * TAU / N as f64;
+        let t1 = (i + 1) as f64 * TAU / N as f64;
+        let mut cuts = vec![t0];
+        if df(t0) * df(t1) < 0.0 {
+            let extremum = bisect(&df, t0, t1);
+            if f(extremum).abs() <= tangency {
+                // A touch, not two crossings a hair apart.
+                push(extremum);
+                continue;
+            }
+            cuts.push(extremum);
+        }
+        cuts.push(t1);
+        for piece in cuts.windows(2) {
+            let (lo, hi) = (f(piece[0]), f(piece[1]));
+            if lo == 0.0 {
+                push(piece[0]);
+            } else if lo * hi < 0.0 {
+                push(bisect(&f, piece[0], piece[1]));
+            }
+        }
+    }
+
+    roots
+        .into_iter()
+        .map(|t| {
+            let pt = [
+                c_e[0] + a * t.cos() * nx - b * t.sin() * ny,
+                c_e[1] + a * t.cos() * ny + b * t.sin() * nx,
+            ];
+            let angle = (pt[1] - centre[1]).atan2(pt[0] - centre[0]);
+            (angle, t)
+        })
+        .collect()
+}
+
+/// A root of `g` between `lo` and `hi`, where `g` changes sign.
+fn bisect(g: &impl Fn(f64) -> f64, mut lo: f64, mut hi: f64) -> f64 {
+    let lo_negative = g(lo) < 0.0;
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if (g(mid) < 0.0) == lo_negative {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    0.5 * (lo + hi)
 }
 
 #[cfg(test)]
@@ -450,6 +595,52 @@ mod tests {
         assert!(sum.abs() < 1e-9, "x components should cancel, got {sum}");
         for angle in angles {
             assert!(angle.sin() > 0.0, "both hits sit above the centre");
+        }
+    }
+
+    #[test]
+    fn tangent_circles_external_at_various_angles_and_epsilons() {
+        for angle in [0.0f64, 0.5, 1.0, 1.57, 2.5, 3.14, 4.0, 5.0] {
+            for eps in [-1e-8, 0.0, 1e-8] {
+                let dist = 20.0 + eps;
+                let c2 = [dist * angle.cos(), dist * angle.sin()];
+                let angles = circle_circle_angles([0.0, 0.0], 10.0, c2, 10.0);
+                assert_eq!(angles.len(), 1, "failed at angle {angle}, eps {eps}");
+                let diff = (angles[0] - angle).abs();
+                let cyclic = diff.min(TAU - diff);
+                assert!(cyclic < 1e-5, "tangent angle mismatch: got {}, expected {angle}", angles[0]);
+            }
+        }
+    }
+
+    #[test]
+    fn tangent_circles_internal_both_sizes() {
+        // R1 = 10, R2 = 4 (c2 inside c1) touching at (10, 0)
+        let angles1 = circle_circle_angles([0.0, 0.0], 10.0, [6.0, 0.0], 4.0);
+        assert_eq!(angles1.len(), 1);
+        assert!(angles1[0].abs() < 1e-5);
+
+        // R1 = 4, R2 = 10 (c1 inside c2) touching at (10, 0)
+        let angles2 = circle_circle_angles([6.0, 0.0], 4.0, [0.0, 0.0], 10.0);
+        assert_eq!(angles2.len(), 1);
+        assert!(angles2[0].abs() < 1e-5);
+    }
+
+    #[test]
+    fn skinny_ellipse_crossing_circle_detects_all_roots() {
+        let e = Ellipse {
+            centre: [0.0, 0.0],
+            major_radius: 100.0,
+            minor_radius: 5.0, // Very skinny 20:1
+            major_axis: [1.0, 0.0],
+        };
+        // Circle centered at (0, 0) crossing near the tips at x = 95
+        let hits = ellipse_circle(&e, [0.0, 0.0], 95.0);
+        assert_eq!(hits.len(), 4, "concentric circle of radius 95 must cross skinny ellipse at 4 points");
+        for (_, t) in &hits {
+            let pt = e.point_at(*t);
+            let d = (pt[0] * pt[0] + pt[1] * pt[1]).sqrt();
+            assert!((d - 95.0).abs() < 1e-3, "point must lie on circle of radius 95");
         }
     }
 }

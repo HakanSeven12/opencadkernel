@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
 description = "Geometry kernel for CAD: 2D curve operations and a B-rep solid layer"
-repository = "https://github.com/HakanSeven12/cadkernel"
+repository = "https://github.com/HakanSeven12/opencadkernel"
 keywords = ["cad", "geometry", "brep", "nurbs", "kernel"]
 categories = ["mathematics", "graphics"]
 

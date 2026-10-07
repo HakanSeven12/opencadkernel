@@ -285,6 +285,31 @@ fn sanitize(ring: &[[f64; 2]]) -> Vec<[f64; 2]> {
     while points.len() > 1 && points.first() == points.last() {
         points.pop();
     }
+    // A corner whose two edges fold back onto each other (a zero-area spike)
+    // encloses nothing, but leaves the ring non-simple: drop it, and the
+    // duplicate it may leave behind, until none remain.
+    let mut index = 0;
+    while points.len() >= 3 && index < points.len() {
+        let count = points.len();
+        let before = Vec2::from(points[(index + count - 1) % count]);
+        let here = Vec2::from(points[index]);
+        let after = Vec2::from(points[(index + 1) % count]);
+        let incoming = before - here;
+        let outgoing = after - here;
+        let length = incoming.length().max(outgoing.length()).max(1.0);
+        let epsilon = 64.0 * f64::EPSILON * length * length;
+        if incoming.cross(outgoing).abs() > epsilon || incoming.dot(outgoing) <= 0.0 {
+            index += 1;
+            continue;
+        }
+        points.remove(index);
+        let count = points.len();
+        let previous = (index + count - 1) % count;
+        if count > 1 && points[previous] == points[index % count] {
+            points.remove(index % count);
+        }
+        index = index.saturating_sub(1);
+    }
     points
 }
 

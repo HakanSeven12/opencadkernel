@@ -46,6 +46,15 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
     if !lies_on(surface, curve, tolerance) {
         return None;
     }
+    // A spline edge — an intersection a file saved as one — has no closed
+    // image on an analytic surface, and without one the face had no
+    // boundary at all: no point could be placed in or out of a solid with a
+    // hex socket, so every boolean against it was refused (#1563). Its
+    // image is walked instead, which `trim_to` redoes over the edge's own
+    // span, the same way a general circle on a sphere is kept.
+    if matches!(curve, Curve3::Nurbs(_)) {
+        return sampled_image(surface, curve);
+    }
     match surface {
         Surface::Plane(plane) => match curve {
             Curve3::Line(line) => Some(Curve::XLine(XLine {
@@ -188,9 +197,16 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
                 let offset = Vec3::from(circle.plane.origin) - Vec3::from(torus.frame.origin);
                 if plane_normal.is_parallel_to(axis, tolerance) {
                     // A parallel. Where it sits round the tube is fixed by
-                    // how far out and how high it is.
+                    // how far out and how high it is — read the way
+                    // `parameters_at` reads it, through the minor radius's
+                    // sign: a torus stored with a negative one (a concave
+                    // fillet) otherwise put every parallel half a turn round
+                    // the tube, where a cut that missed the face fell inside
+                    // it (#1563).
+                    let sign = torus.minor_radius.signum();
                     Some(band_at(
-                        offset.dot(axis).atan2(circle.radius - torus.major_radius),
+                        (offset.dot(axis) * sign)
+                            .atan2((circle.radius - torus.major_radius) * sign),
                     ))
                 } else if plane_normal.dot(axis).abs() <= tolerance {
                     Some(meridian_at(angle_about(&torus.frame, circle.plane.origin)?))
@@ -241,6 +257,35 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
     }
 }
 
+/// A spline edge's image in an analytic surface's parameters, walked over
+/// the spline's whole domain and unwound across any seam.
+fn sampled_image(surface: &Surface, curve: &Curve3) -> Option<Curve> {
+    const SAMPLES: usize = 64;
+    let Curve3::Nurbs(spline) = curve else {
+        return None;
+    };
+    let (start, end) = spline.domain();
+    let periods = periods(surface);
+    let mut points: Vec<[f64; 2]> = Vec::with_capacity(SAMPLES + 1);
+    for index in 0..=SAMPLES {
+        let t = start + (end - start) * index as f64 / SAMPLES as f64;
+        let (u, v) = surface.parameters_at(curve.point_at(t))?;
+        let mut here = [u, v];
+        if let Some(previous) = points.last() {
+            for axis in 0..2 {
+                if let Some(period) = periods[axis] {
+                    here[axis] = unwound(here[axis], previous[axis], period);
+                }
+            }
+        }
+        points.push(here);
+    }
+    Some(Curve::Polyline(Polyline {
+        vertices: points.into_iter().map(PolylineVertex::straight).collect(),
+        closed: false,
+    }))
+}
+
 /// A general circle on a sphere is not a conic in longitude/latitude space.
 /// Store its pcurve as a dense closed parameter-space chain through exact
 /// samples while retaining the analytic circle as the space edge.
@@ -260,15 +305,25 @@ fn sampled_sphere_circle(surface: &Surface, curve: &Curve3) -> Option<Curve> {
     let (mut final_u, final_v) = surface.parameters_at(curve.point_at(TAU))?;
     final_u = unwound(final_u, previous?, TAU);
     let first = points[0];
-    if (final_u - first[0]).abs() > 1.0e-6 || (final_v - first[1]).abs() > 1.0e-6 {
+    if (final_v - first[1]).abs() > 1.0e-6 {
         return None;
+    }
+    // A circle round the pole axis comes back a turn along, like a band of
+    // latitude: one turn, left open, which its periodic images continue.
+    let closed = match (final_u - first[0]).abs() {
+        gap if gap <= 1.0e-6 => true,
+        gap if (gap - TAU).abs() <= 1.0e-6 => false,
+        _ => return None,
+    };
+    if !closed {
+        points.push([final_u, final_v]);
     }
     Some(Curve::Polyline(Polyline {
         vertices: points
             .into_iter()
             .map(PolylineVertex::straight)
             .collect(),
-        closed: true,
+        closed,
     }))
 }
 
@@ -323,7 +378,18 @@ pub(crate) fn face_boundary_parts(
             let edge_key = coedge_node.edge;
             let edge = body.edges.get(edge_key)?;
             let curve = body.curves.get(edge.curve)?;
-            let flat = project(surface, curve, tolerance)?;
+            // A curve with no written image — anything on a spline patch, a
+            // slanted section of a cylinder — still bounds the face: the walk
+            // `trim_to` takes over the edge's own span is its image.
+            let whole = (edge.start_parameter, edge.end_parameter);
+            let flat = match project(surface, curve, tolerance) {
+                Some(flat) => flat,
+                None if span_on(surface, curve, whole, tolerance) => Curve::Polyline(Polyline {
+                    vertices: Vec::new(),
+                    closed: false,
+                }),
+                None => return None,
+            };
             // The loop's own direction, not the edge's.
             let forward = coedge_node.forward;
             let span = if forward {
@@ -361,9 +427,9 @@ fn chain_round(pieces: &mut [Curve], periods: [Option<f64>; 2]) {
         return;
     }
     let mut head = pieces[0].point_at(1.0);
-    let mut behind = [pieces[0].point_at(0.0), head];
+    let mut behind = [pieces[0].point_at(0.0), head, pieces[0].point_at(0.5)];
     for piece in pieces.iter_mut().skip(1) {
-        let (start, end) = (piece.point_at(0.0), piece.point_at(1.0));
+        let (start, end, middle) = (piece.point_at(0.0), piece.point_at(1.0), piece.point_at(0.5));
         let mut best = (f64::INFINITY, [0.0, 0.0]);
         for across in turns(periods[0]) {
             for along in turns(periods[1]) {
@@ -375,11 +441,15 @@ fn chain_round(pieces: &mut [Curve], periods: [Option<f64>; 2]) {
                 // one: it retraces the piece before it and the ring encloses
                 // nothing, which is how a cone's wall came to be missing from
                 // every mesh.
+                //
+                // Only the same path counts: two arcs between one pair of
+                // corners — a sliver cut from a sphere — share their ends too.
                 let moved = [
                     [start[0] + shift[0], start[1] + shift[1]],
                     [end[0] + shift[0], end[1] + shift[1]],
+                    [middle[0] + shift[0], middle[1] + shift[1]],
                 ];
-                if near(moved[0], behind[1]) && near(moved[1], behind[0]) {
+                if near(moved[0], behind[1]) && near(moved[1], behind[0]) && near(moved[2], behind[2]) {
                     continue;
                 }
                 let gap = (moved[0][0] - head[0]).hypot(moved[0][1] - head[1]);
@@ -391,7 +461,7 @@ fn chain_round(pieces: &mut [Curve], periods: [Option<f64>; 2]) {
         if best.1 != [0.0, 0.0] {
             slide(piece, best.1);
         }
-        behind = [piece.point_at(0.0), piece.point_at(1.0)];
+        behind = [piece.point_at(0.0), piece.point_at(1.0), piece.point_at(0.5)];
         head = behind[1];
     }
 }
@@ -410,15 +480,25 @@ fn turns(period: Option<f64>) -> impl Iterator<Item = f64> {
     (-span..=span).map(move |turn| period.unwrap_or(0.0) * f64::from(turn))
 }
 
-/// Moves a projected piece by whole turns. Only the straight kinds ever need
-/// it: a circle or an ellipse in parameter space comes from a plane, and a
-/// plane does not wrap.
+/// Moves a projected piece by whole turns. Only the straight and sampled
+/// kinds ever need it: a circle or an ellipse in parameter space comes from a
+/// plane, and a plane does not wrap.
 fn slide(piece: &mut Curve, shift: [f64; 2]) {
-    if let Curve::Line(line) = piece {
-        for axis in 0..2 {
-            line.start[axis] += shift[axis];
-            line.end[axis] += shift[axis];
+    match piece {
+        Curve::Line(line) => {
+            for axis in 0..2 {
+                line.start[axis] += shift[axis];
+                line.end[axis] += shift[axis];
+            }
         }
+        Curve::Polyline(polyline) => {
+            for vertex in &mut polyline.vertices {
+                for axis in 0..2 {
+                    vertex.position[axis] += shift[axis];
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -426,6 +506,8 @@ fn slide(piece: &mut Curve, shift: [f64; 2]) {
 /// begins and ends. Three would do for the shapes here; more costs nothing
 /// and keeps the unwrapping below honest when an edge covers most of a turn.
 const WALK: usize = 8;
+/// Steps per whole turn when a sampled projection is walked.
+const SAMPLED_WALK: usize = 256;
 
 /// The part of a projected boundary curve the edge actually covers.
 ///
@@ -444,9 +526,16 @@ fn trim_to(
     // backwards unless it is unwound. One that does not wrap must be left
     // alone: unwinding a plane's coordinates would move the curve.
     let periods = periods(surface);
-    let mut raw: Vec<[f64; 2]> = Vec::with_capacity(WALK + 1);
-    for step in 0..=WALK {
-        let t = span.0 + (span.1 - span.0) * step as f64 / WALK as f64;
+    // A sampled projection is kept as the walk itself, so it walks finely:
+    // evenly round the turn, so a short arc is not sampled like a whole one.
+    let steps = if matches!(flat, Curve::Polyline(_)) {
+        ((span.1 - span.0).abs() / TAU * SAMPLED_WALK as f64).ceil().clamp(16.0, SAMPLED_WALK as f64) as usize
+    } else {
+        WALK
+    };
+    let mut raw: Vec<[f64; 2]> = Vec::with_capacity(steps + 1);
+    for step in 0..=steps {
+        let t = span.0 + (span.1 - span.0) * step as f64 / steps as f64;
         let point = curve.point_at(t);
         if let Some((u, v)) = surface.parameters_at(point) {
             raw.push([u, v]);
@@ -481,7 +570,7 @@ fn trim_to(
         raw[index][0] = longitude;
     }
 
-    let mut walk: Vec<[f64; 2]> = Vec::with_capacity(WALK + 1);
+    let mut walk: Vec<[f64; 2]> = Vec::with_capacity(steps + 1);
     let mut last: Option<[f64; 2]> = None;
     for mut here in raw {
         if let Some(previous) = last {
@@ -494,7 +583,7 @@ fn trim_to(
         last = Some(here);
         walk.push(here);
     }
-    let (first, final_point) = (walk[0], walk[WALK]);
+    let (first, final_point) = (walk[0], walk[steps]);
 
     Some(match flat {
         // The kinds that run past their edge become the segment between the
@@ -535,6 +624,11 @@ fn trim_to(
                 Curve::Nurbs(super::nurbs_builder::RationalCurve2::from_curve(&positive)?.reversed().curve()?)
             } else { positive }
         }
+        // A sampled circle covers the whole turn; the edge is the walk.
+        Curve::Polyline(_) => Curve::Polyline(Polyline {
+            vertices: walk.into_iter().map(PolylineVertex::straight).collect(),
+            closed: false,
+        }),
         // A spline's projection already spans exactly its own edge.
         other => other,
     })
@@ -617,6 +711,12 @@ pub(crate) fn contains_parameter(
     tolerance: crate::geom2d::Tolerance,
 ) -> bool {
     let periods = periods(surface);
+    // A band's rims are not polygons, and a polygon test over them reads a
+    // point in one of the band's holes as inside it; counted along `v` the
+    // holes and rims all answer alike.
+    if let Some(inside) = band_parity(periods, boundary, point, tolerance) {
+        return inside;
+    }
     let turns = |period: Option<f64>| match period {
         Some(period) => vec![-period, 0.0, period],
         None => vec![0.0],
@@ -638,6 +738,119 @@ pub(crate) fn contains_parameter(
         point[1] >= levels[0] - tolerance.linear()
             && point[1] <= levels[1] + tolerance.linear()
     })
+}
+
+/// Whether a point is inside a band — a face whose rims wrap round the
+/// surface rather than close, holes and notches and all. A line from the
+/// point along `v`, past every rim, crosses the boundary an odd number of
+/// times from inside; the boundary covers one turn, so the line is tried at
+/// every turn it spans. `None` for a face that is not a band.
+fn band_parity(
+    periods: [Option<f64>; 2],
+    boundary: &[Curve],
+    point: [f64; 2],
+    tolerance: crate::geom2d::Tolerance,
+) -> Option<bool> {
+    let ([Some(period), None], false) = (periods, boundary.is_empty()) else {
+        return None;
+    };
+    // A band has its rims wrap round, each a turn along, in pairs; with no
+    // wrapping loop the face is the polygon test's. One wrapping loop alone
+    // — a cone's rim, its face running up to the apex — bounds a side only
+    // the apex decides, not a band.
+    let near =
+        |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= tolerance.linear();
+    // The boundary lists each loop's pieces in order; a loop ends where the
+    // next piece does not take up from it. Pieces walked from a spline meet
+    // only to the walk's accuracy, and a wrap leaves a whole turn between
+    // the loop's two ends.
+    let joined =
+        |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= period * 1e-3;
+    let mut wrapping = 0;
+    let mut loop_start = 0;
+    for (index, curve) in boundary.iter().enumerate() {
+        let end = curve.point_at(1.0);
+        let continues = boundary
+            .get(index + 1)
+            .is_some_and(|next| joined(next.point_at(0.0), end));
+        if !continues {
+            if !joined(boundary[loop_start].point_at(0.0), end) {
+                wrapping += 1;
+            }
+            loop_start = index + 1;
+        }
+    }
+    if wrapping < 2 || wrapping % 2 == 1 {
+        return None;
+    }
+    let samples: Vec<[f64; 2]> = boundary
+        .iter()
+        .flat_map(|curve| (0..=16).map(move |step| curve.point_at(step as f64 / 16.0)))
+        .collect();
+    let (low, high, top) = samples.iter().fold(
+        (f64::INFINITY, f64::NEG_INFINITY, f64::NEG_INFINITY),
+        |(low, high, top), sample| {
+            (low.min(sample[0]), high.max(sample[0]), top.max(sample[1]))
+        },
+    );
+    if point[1] >= top {
+        return Some(false);
+    }
+    let top = top + (top - point[1]) + 1.0;
+    let first = ((low - point[0]) / period).floor() as i64 - 1;
+    let last = ((high - point[0]) / period).ceil() as i64 + 1;
+    // Each piece's box, so the line is only tried against pieces it can meet.
+    let boxes: Vec<[[f64; 2]; 2]> = boundary
+        .iter()
+        .map(|curve| {
+            let points: Vec<[f64; 2]> = match curve {
+                Curve::Polyline(polyline)
+                    if polyline.vertices.iter().all(|vertex| vertex.bulge == 0.0) =>
+                {
+                    polyline.vertices.iter().map(|vertex| vertex.position).collect()
+                }
+                _ => (0..=16).map(|step| curve.point_at(step as f64 / 16.0)).collect(),
+            };
+            let mut low = [f64::INFINITY; 2];
+            let mut high = [f64::NEG_INFINITY; 2];
+            for point in &points {
+                for axis in 0..2 {
+                    low[axis] = low[axis].min(point[axis]);
+                    high[axis] = high[axis].max(point[axis]);
+                }
+            }
+            let pad = (high[0] - low[0]).hypot(high[1] - low[1]) * 0.05 + period * 1e-3;
+            [[low[0] - pad, low[1] - pad], [high[0] + pad, high[1] + pad]]
+        })
+        .collect();
+    let mut crossings: Vec<[f64; 2]> = Vec::new();
+    for turn in first..=last {
+        let u = point[0] + turn as f64 * period;
+        // Slanted a little, so the line never runs along an edge of
+        // constant `u` — a generator, a slot's side.
+        let ray = Curve::Line(Line {
+            start: [u, point[1]],
+            end: [u + period * 1e-3, top],
+        });
+        for (curve, bounds) in boundary.iter().zip(&boxes) {
+            if u < bounds[0][0] || u > bounds[1][0] || point[1] > bounds[1][1] {
+                continue;
+            }
+            for crossing in crate::geom2d::intersect(&ray, curve, tolerance) {
+                // Where two boundary pieces meet, both report the joint —
+                // a turn apart, where a wrapping loop comes round.
+                let turned = [crossing.point[0].rem_euclid(period), crossing.point[1]];
+                if !crossings.iter().any(|seen| {
+                    near(*seen, turned)
+                        || near([seen[0] + period, seen[1]], turned)
+                        || near([seen[0] - period, seen[1]], turned)
+                }) {
+                    crossings.push(turned);
+                }
+            }
+        }
+    }
+    Some(crossings.len() % 2 == 1)
 }
 
 /// An interior point between two full-turn boundary loops.
@@ -708,14 +921,56 @@ fn lies_on(surface: &Surface, curve: &Curve3, tolerance: f64) -> bool {
     // surface but does not follow it — a line crossing a sphere is on it at
     // two parameters and nowhere else.
     const SAMPLES: usize = 9;
-    (0..SAMPLES).all(|index| {
-        let t = match curve {
-            Curve3::Line(_) => -2.0 + 4.0 * index as f64 / (SAMPLES - 1) as f64,
-            Curve3::PlanarSpline { .. } => index as f64 / (SAMPLES - 1) as f64,
-            _ => TAU * index as f64 / SAMPLES as f64,
-        };
-        surface.contains(curve.point_at(t), tolerance)
-    })
+    let points: Vec<[f64; 3]> = (0..SAMPLES)
+        .map(|index| {
+            let t = match curve {
+                Curve3::Line(_) => -2.0 + 4.0 * index as f64 / (SAMPLES - 1) as f64,
+                Curve3::PlanarSpline { .. } => index as f64 / (SAMPLES - 1) as f64,
+                Curve3::Nurbs(spline) => {
+                    let (start, end) = spline.domain();
+                    start + (end - start) * index as f64 / (SAMPLES - 1) as f64
+                }
+                _ => TAU * index as f64 / SAMPLES as f64,
+            };
+            curve.point_at(t)
+        })
+        .collect();
+    let allowance = fit_allowance(surface, curve, &points, tolerance);
+    points.into_iter().all(|point| surface.distance_to(point).abs() <= allowance)
+}
+
+/// How far a curve may stand off a surface and still be on it. A spline in a
+/// file is a fit to the true intersection or surface, within the fit's own
+/// tolerance — up to a thousandth of the curve, many times the
+/// modelling tolerance — so a spline on either side is held to that.
+fn fit_allowance(
+    surface: &Surface,
+    curve: &Curve3,
+    points: &[[f64; 3]],
+    tolerance: f64,
+) -> f64 {
+    if !matches!(curve, Curve3::Nurbs(_)) && !matches!(surface, Surface::Nurbs(_)) {
+        return tolerance;
+    }
+    let first = Vec3::from(points[0]);
+    let extent = points
+        .iter()
+        .map(|point| Vec3::from(*point).distance(first))
+        .fold(0.0, f64::max);
+    tolerance.max(extent * 1e-3)
+}
+
+/// Whether an edge's own span lies on a surface. A spline patch ends where
+/// the face does, so the curve beyond the edge's ends is no evidence.
+fn span_on(surface: &Surface, curve: &Curve3, span: (f64, f64), tolerance: f64) -> bool {
+    const SAMPLES: usize = 9;
+    let points: Vec<[f64; 3]> = (0..SAMPLES)
+        .map(|index| {
+            curve.point_at(span.0 + (span.1 - span.0) * index as f64 / (SAMPLES - 1) as f64)
+        })
+        .collect();
+    let allowance = fit_allowance(surface, curve, &points, tolerance);
+    points.into_iter().all(|point| surface.distance_to(point).abs() <= allowance)
 }
 
 #[cfg(test)]

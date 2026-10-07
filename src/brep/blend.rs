@@ -1,5 +1,6 @@
 //! Constant edge chamfers and fillets on convex planar solids.
 
+use super::blend_local::{blend_lines, blend_rims, LocalBlend, LocalError};
 use super::bounds::operation_tolerance;
 use super::geometry::{Circle3, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface};
 use super::topology::{Body, Coedge, Edge, EdgeKey, Face, FaceKey, Loop, Lump, Shell, Vertex};
@@ -33,6 +34,8 @@ struct ExistingFillet {
     cut: Halfspace,
     cylinder: Cylinder,
     forward: bool,
+    /// Outward normals of the two planar faces the fillet rounds between.
+    sides: [Vec3; 2],
 }
 
 /// Why one or more selected edges could not be filleted.
@@ -244,6 +247,14 @@ pub fn chamfer_edges(
     ) {
         return result;
     }
+    let rim = LocalBlend::Chamfer { base_face, base: base_distance, other: other_distance };
+    if let Some(result) = blend_rims(body, &selected, rim) {
+        return result.map_err(|error| match error {
+            LocalError::TooLarge => ChamferError::DistanceTooLargeOrInteracting,
+            LocalError::OutsideBaseFace(edge) => ChamferError::EdgeOutsideBaseFace(edge),
+            LocalError::InvalidResult => ChamferError::InvalidResult,
+        });
+    }
     if let Some(result) = super::chamfer_prismatic::chamfer_prismatic(
         body,
         &selected,
@@ -264,12 +275,35 @@ pub fn chamfer_edges(
             tolerance,
         );
     }
+    let distances = (base_distance, other_distance);
+    let convex = chamfer_convex(body, &selected, base_face, distances, tolerance);
+    // A body the convex solver cannot rebuild may still take a local cut.
+    let Err(error) = convex else { return convex };
+    let local = LocalBlend::Chamfer { base_face, base: base_distance, other: other_distance };
+    match blend_lines(body, &selected, local) {
+        Some(result) => result.map_err(|error| match error {
+            LocalError::TooLarge => ChamferError::DistanceTooLargeOrInteracting,
+            LocalError::OutsideBaseFace(edge) => ChamferError::EdgeOutsideBaseFace(edge),
+            LocalError::InvalidResult => ChamferError::InvalidResult,
+        }),
+        None => Err(error),
+    }
+}
+
+/// Cuts straight edges of a convex planar body, keeping earlier fillets.
+fn chamfer_convex(
+    body: &Body,
+    selected: &[EdgeKey],
+    base_face: FaceKey,
+    (base_distance, other_distance): (f64, f64),
+    tolerance: f64,
+) -> Result<Body, ChamferError> {
     let existing = existing_fillets(body).ok_or(ChamferError::UnsupportedExistingFillet)?;
     let corners = existing_corners(body).ok_or(ChamferError::UnsupportedExistingFillet)?;
     validate_chamfer_body(body, &existing, tolerance)?;
 
     let mut frames = Vec::with_capacity(selected.len());
-    for edge in selected {
+    for &edge in selected {
         validate_chamfer_edge(body, edge)?;
         let frame = edge_frame(body, edge).ok_or(ChamferError::DegenerateGeometry(edge))?;
         if !frame.faces.contains(&base_face) {
@@ -548,10 +582,124 @@ pub fn fillet_edges(
     if let Some(result) = super::fillet_circular::fillet_circular(body, &selected, radius) {
         return result;
     }
+    if let Some(result) = blend_rims(body, &selected, LocalBlend::Fillet(radius)) {
+        return result.map_err(|error| match error {
+            LocalError::TooLarge => FilletError::RadiusTooLargeOrInteracting,
+            LocalError::OutsideBaseFace(_) | LocalError::InvalidResult => {
+                FilletError::InvalidResult
+            }
+        });
+    }
     if let Some(result) = super::fillet_prismatic::fillet_prismatic(body, &selected, radius) {
         return result;
     }
 
+    let convex = match fillet_convex(body, &selected, radius) {
+        Err(
+            error @ (FilletError::RadiusTooLargeOrInteracting
+            | FilletError::UnsupportedEndCondition(_)
+            | FilletError::InvalidResult),
+        ) => refillet_from_sharp(body, &selected, radius).ok_or(error),
+        result => result,
+    };
+    // A body the convex solver cannot rebuild may still take a local cut.
+    let Err(error) = convex else { return convex };
+    match blend_lines(body, &selected, LocalBlend::Fillet(radius)) {
+        Some(result) => result.map_err(|error| match error {
+            LocalError::TooLarge => FilletError::RadiusTooLargeOrInteracting,
+            LocalError::OutsideBaseFace(_) | LocalError::InvalidResult => {
+                FilletError::InvalidResult
+            }
+        }),
+        None => Err(error),
+    }
+}
+
+/// An edge next to an earlier fillet of the same radius: rebuild the sharp
+/// body from its planar faces and round the earlier edges together with the
+/// new ones, so the corner between them gets the same seam or patch an
+/// all-at-once selection would. Earlier fillets of another radius, or a body
+/// that is not the intersection of its face planes, are left to the caller's
+/// error.
+fn refillet_from_sharp(body: &Body, selected: &[EdgeKey], radius: f64) -> Option<Body> {
+    let tolerance = operation_tolerance(&[body]);
+    let existing = existing_fillets(body)?;
+    if existing.is_empty()
+        || existing
+            .iter()
+            .any(|fillet| (fillet.cylinder.radius - radius).abs() > tolerance)
+    {
+        return None;
+    }
+    let sharp = sharp_convex(body, tolerance)?;
+    let mut edges = Vec::with_capacity(existing.len() + selected.len());
+    for fillet in &existing {
+        edges.push(sharp_edge(&sharp, fillet.sides)?);
+    }
+    for edge in selected {
+        let frame = edge_frame(body, *edge)?;
+        edges.push(sharp_edge(&sharp, [frame.first_normal, frame.second_normal])?);
+    }
+    fillet_convex(&sharp, &edges, radius).ok()
+}
+
+/// The convex body bounded by each distinct face plane once, or `None` when
+/// the body is not that intersection.
+fn sharp_convex(body: &Body, tolerance: f64) -> Option<Body> {
+    let mut halfspaces: Vec<Halfspace> = Vec::new();
+    for (_, face) in body.faces.iter() {
+        let Some(Surface::Plane(plane)) = body.surfaces.get(face.surface) else {
+            continue;
+        };
+        let mut normal = Vec3::from(plane.normal()?);
+        if !face.forward {
+            normal = -normal;
+        }
+        let offset = normal.dot(Vec3::from(plane.origin));
+        // Coplanar faces bound the same halfspace once.
+        if halfspaces.iter().any(|other| {
+            other.normal.dot(normal) > 1.0 - 1e-8 && (other.offset - offset).abs() <= tolerance
+        }) {
+            continue;
+        }
+        halfspaces.push(Halfspace {
+            origin: Vec3::from(plane.origin),
+            normal,
+            offset,
+            added: false,
+        });
+    }
+    // Only a convex body is the intersection of its face planes.
+    if body.vertices.iter().any(|(_, vertex)| {
+        let point = Vec3::from(vertex.point);
+        halfspaces
+            .iter()
+            .any(|plane| plane.normal.dot(point) > plane.offset + tolerance)
+    }) {
+        return None;
+    }
+    // `convex_body` reports one marked face; which one does not matter here.
+    halfspaces.first_mut()?.added = true;
+    convex_body(&halfspaces, tolerance).map(|(sharp, _)| sharp)
+}
+
+/// The edge of a convex body named by the outward normals of its two faces.
+fn sharp_edge(sharp: &Body, pair: [Vec3; 2]) -> Option<EdgeKey> {
+    let same = |a: Vec3, b: Vec3| a.dot(b) > 1.0 - 1e-8;
+    sharp.edges.iter().find_map(|(key, _)| {
+        let frame = edge_frame(sharp, key)?;
+        let normals = [frame.first_normal, frame.second_normal];
+        ((same(normals[0], pair[0]) && same(normals[1], pair[1]))
+            || (same(normals[0], pair[1]) && same(normals[1], pair[0])))
+        .then_some(key)
+    })
+}
+
+/// Rounds straight edges of a convex planar body, keeping earlier fillets.
+fn fillet_convex(body: &Body, selected: &[EdgeKey], radius: f64) -> Result<Body, FilletError> {
+    let mut selected = selected.to_vec();
+    selected.sort_by_key(EdgeKey::slot);
+    selected.dedup();
     let tolerance = operation_tolerance(&[body]);
     let existing = existing_fillets(body).ok_or(FilletError::UnsupportedExistingFillet)?;
     let old_corners = existing_corners(body).ok_or(FilletError::UnsupportedExistingFillet)?;
@@ -1053,6 +1201,7 @@ fn existing_fillets(body: &Body) -> Option<Vec<ExistingFillet>> {
             },
             cylinder: cylinder.clone(),
             forward: face.forward,
+            sides: [side_normals[0], side_normals[1]],
         });
     }
     Some(found)
@@ -1213,7 +1362,15 @@ fn round_face(
         let start_height = (start - centre).dot(axis);
         let end_height = (end - centre).dot(axis);
         if (start_height - end_height).abs() > tolerance {
-            return None;
+            // An oblique end plane, such as a neighbouring chamfer, cuts the
+            // cylinder in an ellipse.
+            let Surface::Plane(plane) = body.surfaces.get(other.surface)? else {
+                return None;
+            };
+            let curve = cylinder_section(cylinder, plane)?;
+            set_round_edge(body, edge_key, curve, tolerance)?;
+            rounded += 1;
+            continue;
         }
         let cross_centre = centre + axis * ((start_height + end_height) * 0.5);
         let mut circle_plane = Plane::orthonormal(
@@ -1277,7 +1434,38 @@ fn cylinder_seam(
     None
 }
 
-fn set_round_edge(body: &mut Body, key: EdgeKey, mut curve: Curve3, tolerance: f64) -> Option<()> {
+/// Where a plane crossing the axis cuts a cylinder: a circle when square to
+/// it, an ellipse otherwise.
+pub(super) fn cylinder_section(cylinder: &Cylinder, plane: &Plane) -> Option<Curve3> {
+    let axis = Vec3::from(cylinder.base.normal()?);
+    let centre = Vec3::from(cylinder.base.origin);
+    let normal = Vec3::from(plane.normal()?);
+    let cosine = normal.dot(axis);
+    if cosine.abs() < 1e-8 {
+        return None;
+    }
+    let along = normal.dot(Vec3::from(plane.origin) - centre) / cosine;
+    let origin = (centre + axis * along).to_array();
+    let minor = axis.cross(normal);
+    if minor.length() < 1e-9 {
+        let plane = Plane::orthonormal(origin, cylinder.base.x_axis, normal.to_array())?;
+        return Some(Curve3::Circle(Circle3 { plane, radius: cylinder.radius }));
+    }
+    let minor = minor.normalize()?;
+    let plane = Plane::orthonormal(origin, normal.cross(minor).to_array(), normal.to_array())?;
+    Some(Curve3::Ellipse(Ellipse3 {
+        plane,
+        major_radius: cylinder.radius / cosine.abs(),
+        minor_radius: cylinder.radius,
+    }))
+}
+
+pub(super) fn set_round_edge(
+    body: &mut Body,
+    key: EdgeKey,
+    mut curve: Curve3,
+    tolerance: f64,
+) -> Option<()> {
     let edge = body.edges.get(key)?.clone();
     let start = body.vertices.get(edge.start)?.point;
     let end = body.vertices.get(edge.end)?.point;
@@ -1568,6 +1756,114 @@ mod tests {
 
         assert!(result.validate().is_empty());
         assert!(result.faces.len() > body.faces.len());
+    }
+
+    /// Rounding one box edge and then an adjacent one ends with the same
+    /// corner as rounding both at once.
+    #[test]
+    fn adjacent_edge_after_a_fillet_of_the_same_radius() {
+        let body = cuboid([0.0; 3], [8.0, 6.0, 4.0]).unwrap();
+        let face = body.face_keys().next().unwrap();
+        let edges = body
+            .face_coedges(face)
+            .into_iter()
+            .map(|coedge| body.coedges.get(coedge).unwrap().edge)
+            .collect::<Vec<_>>();
+        let together = fillet_edges(&body, &edges[0..2], 0.5).unwrap();
+
+        let first = fillet_edges(&body, &edges[0..1], 0.5).unwrap();
+        let first_frame = edge_frame(&body, edges[1]).unwrap();
+        let next = first
+            .edges
+            .iter()
+            .find_map(|(key, _)| {
+                let frame = edge_frame(&first, key)?;
+                let same = |a: Vec3, b: Vec3| a.dot(b) > 1.0 - 1e-8;
+                let (a, b) = (frame.first_normal, frame.second_normal);
+                let (c, d) = (first_frame.first_normal, first_frame.second_normal);
+                ((same(a, c) && same(b, d)) || (same(a, d) && same(b, c))).then_some(key)
+            })
+            .unwrap();
+        let second = fillet_edges(&first, &[next], 0.5).unwrap();
+
+        assert!(second.validate().is_empty());
+        assert_eq!(second.faces.len(), together.faces.len());
+    }
+
+    #[test]
+    fn edges_of_an_extruded_presspull_are_rounded_and_chamfered() {
+        let body = cuboid([0.0; 3], [10.0, 6.0, 4.0]).unwrap();
+        let top = body
+            .face_keys()
+            .find(|face| {
+                crate::brep::planar_face_profile(&body, *face)
+                    .is_some_and(|profile| profile.outward[2] > 0.5)
+            })
+            .unwrap();
+        let pulled =
+            crate::brep::presspull_face(&body, top, 2.0, crate::brep::PresspullMode::Extrude)
+                .unwrap();
+        // The pulled sides join the box's: still a box.
+        assert_eq!(pulled.faces.len(), body.faces.len());
+        let (edge, face) = pulled
+            .face_keys()
+            .find_map(|face| {
+                let profile = crate::brep::planar_face_profile(&pulled, face)?;
+                (profile.outward[2] > 0.5).then(|| {
+                    let coedge = pulled.face_coedges(face)[0];
+                    (pulled.coedges.get(coedge).unwrap().edge, face)
+                })
+            })
+            .unwrap();
+
+        let rounded = fillet_edges(&pulled, &[edge], 0.5).unwrap();
+        let chamfered = chamfer_edges(&pulled, &[edge], face, 0.5, 0.5).unwrap();
+
+        assert!(rounded.validate().is_empty());
+        assert!(chamfered.validate().is_empty());
+        assert_eq!(rounded.faces.len(), body.faces.len() + 1);
+        assert_eq!(chamfered.faces.len(), body.faces.len() + 1);
+    }
+
+    #[test]
+    fn chamfers_and_fillets_meet_at_a_corner_in_either_order() {
+        let body = cuboid([0.0; 3], [8.0, 6.0, 4.0]).unwrap();
+        let face = body.face_keys().next().unwrap();
+        let edges = body
+            .face_coedges(face)
+            .into_iter()
+            .map(|coedge| body.coedges.get(coedge).unwrap().edge)
+            .collect::<Vec<_>>();
+        let later = |first: &Body| {
+            let frame = edge_frame(&body, edges[1]).unwrap();
+            first
+                .edges
+                .iter()
+                .find_map(|(key, _)| {
+                    let other = edge_frame(first, key)?;
+                    let same = |a: Vec3, b: Vec3| a.dot(b) > 1.0 - 1e-8;
+                    let (a, b) = (other.first_normal, other.second_normal);
+                    let (c, d) = (frame.first_normal, frame.second_normal);
+                    ((same(a, c) && same(b, d)) || (same(a, d) && same(b, c)))
+                        .then_some((key, other.faces[0]))
+                })
+                .unwrap()
+        };
+
+        let rounded = fillet_edges(&body, &edges[0..1], 0.5).unwrap();
+        let (edge, base) = later(&rounded);
+        let then_chamfered = chamfer_edges(&rounded, &[edge], base, 0.5, 0.5).unwrap();
+        let chamfered = chamfer_edges(&body, &edges[0..1], face, 0.5, 0.5).unwrap();
+        let (edge, _) = later(&chamfered);
+        let then_rounded = fillet_edges(&chamfered, &[edge], 0.5).unwrap();
+
+        for result in [then_chamfered, then_rounded] {
+            assert!(result.validate().is_empty());
+            assert_eq!(result.faces.len(), body.faces.len() + 2);
+            assert!(result.edges.iter().any(|(_, edge)| {
+                matches!(result.curves.get(edge.curve), Some(Curve3::Ellipse(_)))
+            }));
+        }
     }
 
     #[test]

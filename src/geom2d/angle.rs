@@ -59,19 +59,22 @@ pub fn angle_within_arc(angle: f64, start: f64, end: f64) -> bool {
 
 /// Where `angle` sits along the arc from `start` to `end`, as `0.0..=1.0`.
 ///
-/// Clamped, so an angle just outside the arc reports an endpoint rather than
-/// a parameter that would index off the end of a tessellation.
+/// An angle in the gap outside the arc reports the nearer endpoint, so a
+/// point just before the start reads 0 rather than 1 and nothing indexes off
+/// the end of a tessellation.
 pub fn arc_parameter(angle: f64, start: f64, end: f64) -> f64 {
     let span = arc_span(start, end);
-    let travelled = {
-        let delta = normalize_angle(angle) - normalize_angle(start);
-        if delta < 0.0 {
-            delta + TAU
-        } else {
-            delta
-        }
-    };
-    (travelled / span).clamp(0.0, 1.0)
+    if span < 1e-12 {
+        return 0.0;
+    }
+    let travelled = (normalize_angle(angle) - normalize_angle(start)).rem_euclid(TAU);
+    if travelled <= span {
+        (travelled / span).clamp(0.0, 1.0)
+    } else if travelled - span <= (TAU - span) * 0.5 {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]

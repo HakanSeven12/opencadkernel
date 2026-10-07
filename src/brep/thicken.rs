@@ -398,7 +398,7 @@ fn thicken_revolved_patch(
 ) -> Result<Body, ThickenError> {
     let (frame, profile) = match surface {
         // An elliptical section's offset is not an ellipse, and revolving
-        // the (major, v) profile would silently round it — the offset of
+        // the (major, v) profile would silently round it â€” the offset of
         // an original face is said no to rather than built wrong.
         Surface::EllipticCone(_) => return Err(ThickenError::UnsupportedSurface),
         Surface::Cylinder(cylinder) => {

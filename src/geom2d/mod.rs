@@ -65,7 +65,8 @@ pub use frame::Frame;
 pub use fillet::{fillet_between_rays, fillets_between, Fillet};
 pub use gradient::{gradient_frame, GradientFrame};
 pub use intersect::{
-    circle_circle_angles, circle_circle_points, line_circle, line_ellipse, line_line,
+    circle_circle_angles, circle_circle_points, ellipse_circle, line_circle, line_ellipse,
+    line_line,
 };
 #[cfg(feature = "offset")]
 pub use offset::offset_polyline;
@@ -130,6 +131,84 @@ impl Ellipse {
     pub(crate) fn is_degenerate(&self) -> bool {
         self.major_radius.abs() < 1e-20 || self.minor_radius.abs() < 1e-20
     }
+
+    /// The parameter of the point on the ellipse nearest to `point`: its
+    /// orthogonal projection, not the parameter read off the squashed
+    /// direction, which drifts by tens of degrees for a point just off the
+    /// curve.
+    pub fn closest_parameter(&self, point: [f64; 2]) -> f64 {
+        let rx = point[0] - self.centre[0];
+        let ry = point[1] - self.centre[1];
+        let (nx, ny) = (self.major_axis[0], self.major_axis[1]);
+        ellipse_closest_parameter(
+            self.major_radius,
+            self.minor_radius,
+            rx * nx + ry * ny,
+            -rx * ny + ry * nx,
+        )
+    }
+}
+
+/// The parameter of the point nearest to `(u, v)` on the origin-centred,
+/// axis-aligned ellipse `(x/a)² + (y/b)² = 1` (Eberly's orthogonal
+/// projection: a bracketed Newton solve on the distance function).
+pub fn ellipse_closest_parameter(a: f64, b: f64, u: f64, v: f64) -> f64 {
+    if a < 1e-12 || b < 1e-12 {
+        return 0.0;
+    }
+    if (a - b).abs() < 1e-9 {
+        return v.atan2(u);
+    }
+    if a < b {
+        return std::f64::consts::FRAC_PI_2 - ellipse_closest_parameter(b, a, v, u);
+    }
+
+    let sign_x = if u >= 0.0 { 1.0 } else { -1.0 };
+    let sign_y = if v >= 0.0 { 1.0 } else { -1.0 };
+    let (u_abs, v_abs) = (u.abs(), v.abs());
+
+    if v_abs < 1e-12 {
+        let x = if u_abs < (a * a - b * b) / a {
+            a * a * u_abs / (a * a - b * b)
+        } else {
+            a
+        };
+        let y = b * (1.0 - (x / a).powi(2)).max(0.0).sqrt();
+        return (sign_y * y / b).atan2(sign_x * x / a);
+    }
+    if u_abs < 1e-12 {
+        return sign_y.atan2(0.0);
+    }
+
+    let (a2, b2) = (a * a, b * b);
+    let mut low = -b2 + b * v_abs;
+    let mut high = -b2 + (a * u_abs).hypot(b * v_abs);
+    let mut t = low;
+    for _ in 0..25 {
+        let (t_a, t_b) = (t + a2, t + b2);
+        if t_a.abs() < 1e-12 || t_b.abs() < 1e-12 {
+            break;
+        }
+        let f = (a * u_abs / t_a).powi(2) + (b * v_abs / t_b).powi(2) - 1.0;
+        if f.abs() < 1e-12 {
+            break;
+        }
+        let df = -2.0 * (a2 * u_abs * u_abs / t_a.powi(3) + b2 * v_abs * v_abs / t_b.powi(3));
+        let next = t - f / df;
+        if next > low && next < high {
+            t = next;
+        } else {
+            if f > 0.0 {
+                low = t;
+            } else {
+                high = t;
+            }
+            t = 0.5 * (low + high);
+        }
+    }
+    let x = a2 * u_abs / (t + a2);
+    let y = b2 * v_abs / (t + b2);
+    (sign_y * y / b).atan2(sign_x * x / a)
 }
 
 /// Distance below which two positions are treated as one.

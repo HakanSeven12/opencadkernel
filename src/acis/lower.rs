@@ -85,8 +85,8 @@ pub fn lower(body: &Body, document: &mut SatDocument) -> Result<usize, Unwritabl
 /// The record index a node must be written through, or `None` if it is clean.
 ///
 /// A synthesized node has no record to write through at all. Adding one means
-/// giving it a place in the pointer graph — which record names it, and which
-/// it names — and that is the part a boolean's output needs and this does not
+/// giving it a place in the pointer graph â€” which record names it, and which
+/// it names â€” and that is the part a boolean's output needs and this does not
 /// yet do. Saying so beats writing a geometry record nothing points at.
 fn dirty_source(provenance: &Provenance) -> Option<u32> {
     match provenance {
@@ -169,7 +169,7 @@ pub fn pending(body: &Body) -> usize {
 ///
 /// Kept in `append` rather than copied here. The two had already drifted: a
 /// cone's half-angle sits at token thirteen, after two continuation tokens,
-/// and this file's own copy put it at eleven — which reads back as a
+/// and this file's own copy put it at eleven â€” which reads back as a
 /// cylinder whatever the cone's real angle was.
 fn surface_type(surface: &Surface) -> &'static str {
     super::append::surface_record(surface)

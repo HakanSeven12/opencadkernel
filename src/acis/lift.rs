@@ -541,7 +541,10 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
         // token — reading the token instead turns a disc into a ring.
         let radius = Vec3::new(mx, my, mz).length();
         let base = Plane::orthonormal([cx, cy, cz], [mx, my, mz], [ax, ay, az])?;
+        // Only the ratio shapes the cone; a negative cosine flips the normal,
+        // which `cone_points_inward` carries on the face.
         let (sine, cosine) = (cone.sin_half_angle(), cone.cos_half_angle());
+        let (sine, cosine) = if cosine < 0.0 { (-sine, -cosine) } else { (sine, cosine) };
         let ratio = cone.ratio();
         let circular = (ratio - 1.0).abs() < 1e-12;
         return Some(if circular && sine.abs() < 1e-12 {

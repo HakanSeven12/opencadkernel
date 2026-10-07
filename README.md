@@ -1,4 +1,4 @@
-# cadkernel
+# opencadkernel
 
 A geometry kernel for CAD work: 2D curve algebra with a B-rep solid layer
 built on top of it.
@@ -28,14 +28,14 @@ afterthought.
 ## Where this sits
 
 ```
-OpenCADStudio ──► cadcodec      DWG/DXF/ACIS
-      ├─────────► cadkernel
+OpenCADStudio ──► opencadcodec      DWG/DXF/ACIS
+      ├─────────► opencadkernel
       └─────────► acadifc       IFC ↔ CAD conversion
 
-acadifc ──► cadcodec
-       └──► cadkernel
+acadifc ──► opencadcodec
+       └──► opencadkernel
 
-cadkernel ──► cadcodec          under `acis` only
+opencadkernel ──► opencadcodec          under `acis` only
 ```
 
 Consumers depend on this crate directly rather than through each other, so

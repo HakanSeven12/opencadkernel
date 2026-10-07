@@ -829,8 +829,8 @@ pub(crate) fn spline_value(x: f64, k: usize, p: usize, d: &mut [f64], flatknots:
 /// A rational B-spline (NURBS) curve.
 ///
 /// Two deliberate departures from planegcs's `BSpline`, both because this
-/// port targets acadrust's `Spline` entity (`entities/spline.rs` in the
-/// `acadrust`/cadcodec crate) as its real consumer, and that entity — like
+/// port targets opencadcodec's `Spline` entity (`entities/spline.rs` in the
+/// `opencadcodec`/opencadcodec crate) as its real consumer, and that entity — like
 /// the DXF/DWG formats it round-trips — already stores knots *flattened*
 /// (each value repeated per its multiplicity) rather than as planegcs's
 /// separate unique-`knots` + `mult` vectors:

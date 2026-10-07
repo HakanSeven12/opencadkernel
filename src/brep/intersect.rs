@@ -26,7 +26,7 @@
 //! every branch. That is a piece of its own; until it exists those pairs say
 //! `Unknown`.
 
-use super::geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface};
+use super::geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
 use crate::space::{Plane, Vec3};
 
 /// What two surfaces have in common.
@@ -51,6 +51,11 @@ pub enum Meeting {
 /// `tolerance` decides when two directions count as parallel and when a
 /// near-tangency is treated as a touch.
 pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
+    // One surface twice, of whatever kind — a spline patch included, which
+    // has no closed form to compare by.
+    if a == b {
+        return Meeting::Coincident;
+    }
     match (a, b) {
         (Surface::Plane(one), Surface::Plane(other)) => planes(one, other, tolerance),
         (Surface::Plane(plane), Surface::Sphere(sphere))
@@ -71,6 +76,14 @@ pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
         | (Surface::Cylinder(cylinder), Surface::Sphere(sphere)) => {
             sphere_cylinder(sphere, cylinder, tolerance)
         }
+        (Surface::Torus(torus), Surface::Cylinder(cylinder))
+        | (Surface::Cylinder(cylinder), Surface::Torus(torus)) => {
+            torus_cylinder(torus, cylinder, tolerance)
+        }
+        // One torus twice — a fillet both solids of an assembly carry.
+        (Surface::Torus(one), Surface::Torus(other)) if same_torus(one, other, tolerance) => {
+            Meeting::Coincident
+        }
         (Surface::Cone(cone), Surface::Cylinder(cylinder))
         | (Surface::Cylinder(cylinder), Surface::Cone(cone)) => coaxial_conics(
             &cone.base, cone.radius, cone.half_angle.tan(),
@@ -80,26 +93,274 @@ pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
             &one.base, one.radius, one.half_angle.tan(),
             &other.base, other.radius, other.half_angle.tan(), tolerance,
         ),
-        _ => Meeting::Unknown,
+        _ => coaxial_revolutions(a, b, tolerance)
+            .or_else(|| apart(a, b, tolerance))
+            .unwrap_or(Meeting::Unknown),
     }
 }
 
-/// A sphere and a coaxial cylinder meet in one or two exact latitude circles.
-/// Offset axes form a quartic and remain unknown until the marching path can
-/// represent every branch safely.
+/// A surface of revolution's meridian in the half-plane of distance from an
+/// axis and height along it, mirrored across the axis so a cone's two nappes
+/// and a torus's two sides are one set of lines and circles.
+enum Profile {
+    Line { point: [f64; 2], direction: [f64; 2] },
+    Circle { centre: [f64; 2], radius: f64 },
+}
+
+/// `surface`'s meridian about the line through `origin` along `axis`, when it
+/// is a surface of revolution round that very line.
+fn revolution_profile(
+    surface: &Surface,
+    origin: Vec3,
+    axis: Vec3,
+    tolerance: f64,
+) -> Option<Vec<Profile>> {
+    let height_of = |point: [f64; 3]| (Vec3::from(point) - origin).dot(axis);
+    let on_axis = |point: [f64; 3]| {
+        let offset = Vec3::from(point) - origin;
+        (offset - axis * offset.dot(axis)).length() <= tolerance
+    };
+    let aligned = |frame: &Plane| -> Option<f64> {
+        let own = Vec3::from(frame.normal()?);
+        let sense = own.dot(axis);
+        (own.cross(axis).length() <= 1e-9 && on_axis(frame.origin)).then_some(sense.signum())
+    };
+    Some(match surface {
+        Surface::Plane(plane) => {
+            let normal = Vec3::from(plane.normal()?);
+            if normal.cross(axis).length() > 1e-9 {
+                return None;
+            }
+            let height = height_of(plane.origin);
+            vec![Profile::Line { point: [0.0, height], direction: [1.0, 0.0] }]
+        }
+        Surface::Cylinder(cylinder) => {
+            aligned(&cylinder.base)?;
+            let radius = cylinder.radius;
+            vec![
+                Profile::Line { point: [radius, 0.0], direction: [0.0, 1.0] },
+                Profile::Line { point: [-radius, 0.0], direction: [0.0, 1.0] },
+            ]
+        }
+        Surface::Cone(cone) => {
+            let sense = aligned(&cone.base)?;
+            let (height, slope) = (height_of(cone.base.origin), cone.half_angle.tan() * sense);
+            vec![
+                Profile::Line { point: [cone.radius, height], direction: [-slope, 1.0] },
+                Profile::Line { point: [-cone.radius, height], direction: [slope, 1.0] },
+            ]
+        }
+        Surface::Sphere(sphere) => {
+            if !on_axis(sphere.frame.origin) {
+                return None;
+            }
+            vec![Profile::Circle {
+                centre: [0.0, height_of(sphere.frame.origin)],
+                radius: sphere.radius,
+            }]
+        }
+        Surface::Torus(torus) => {
+            aligned(&torus.frame)?;
+            let (major, minor) = (torus.major_radius.abs(), torus.minor_radius.abs());
+            let height = height_of(torus.frame.origin);
+            vec![
+                Profile::Circle { centre: [major, height], radius: minor },
+                Profile::Circle { centre: [-major, height], radius: minor },
+            ]
+        }
+        Surface::EllipticCone(_) | Surface::Nurbs(_) => return None,
+    })
+}
+
+/// Two surfaces of revolution round one axis meet in circles round it: where
+/// their meridians cross, each crossing swept round. A torus against a plane
+/// square to its axis, a coaxial torus, a sphere or a cone on its axis
+/// (#1563's knurled hubs and bearings).
+/// Whether two tori are one: the same centre, axis and radii.
+fn same_torus(one: &super::Torus, other: &super::Torus, tolerance: f64) -> bool {
+    let (Some(first), Some(second)) = (one.frame.normal(), other.frame.normal()) else {
+        return false;
+    };
+    Vec3::from(one.frame.origin).distance(Vec3::from(other.frame.origin)) <= tolerance
+        && Vec3::from(first).is_parallel_to(Vec3::from(second), tolerance)
+        && (one.major_radius - other.major_radius).abs() <= tolerance
+        && (one.minor_radius - other.minor_radius).abs() <= tolerance
+}
+
+fn coaxial_revolutions(a: &Surface, b: &Surface, tolerance: f64) -> Option<Meeting> {
+    let axis_of = |surface: &Surface| -> Option<(Vec3, Vec3)> {
+        let frame = match surface {
+            Surface::Cylinder(cylinder) => &cylinder.base,
+            Surface::Cone(cone) => &cone.base,
+            Surface::Torus(torus) => &torus.frame,
+            _ => return None,
+        };
+        Some((Vec3::from(frame.origin), Vec3::from(frame.normal()?)))
+    };
+    let (origin, axis) = axis_of(a).or_else(|| axis_of(b))?;
+    let one = revolution_profile(a, origin, axis, tolerance)?;
+    let other = revolution_profile(b, origin, axis, tolerance)?;
+    let mut crossings: Vec<[f64; 2]> = Vec::new();
+    for first in &one {
+        for second in &other {
+            for point in profile_crossings(first, second, tolerance)? {
+                let point = [point[0].abs(), point[1]];
+                if !crossings.iter().any(|seen| {
+                    (seen[0] - point[0]).abs() <= tolerance && (seen[1] - point[1]).abs() <= tolerance
+                }) {
+                    crossings.push(point);
+                }
+            }
+        }
+    }
+    if crossings.is_empty() {
+        return Some(Meeting::None);
+    }
+    let (mut curves, mut points) = (Vec::new(), Vec::new());
+    for [radius, height] in crossings {
+        match circle_on(origin + axis * height, axis, radius, tolerance) {
+            Meeting::Curves(mut circle) => curves.append(&mut circle),
+            Meeting::Points(mut pole) => points.append(&mut pole),
+            _ => return Some(Meeting::Unknown),
+        }
+    }
+    Some(if curves.is_empty() { Meeting::Points(points) } else { Meeting::Curves(curves) })
+}
+
+/// Where two meridians cross. `None` where they coincide over a stretch,
+/// which is a shared surface rather than a crossing.
+fn profile_crossings(one: &Profile, other: &Profile, tolerance: f64) -> Option<Vec<[f64; 2]>> {
+    let cross = |a: [f64; 2], b: [f64; 2]| a[0] * b[1] - a[1] * b[0];
+    Some(match (one, other) {
+        (
+            Profile::Line { point, direction },
+            Profile::Line { point: other_point, direction: other_direction },
+        ) => {
+            let denominator = cross(*direction, *other_direction);
+            let gap = [other_point[0] - point[0], other_point[1] - point[1]];
+            if denominator.abs() <= 1e-12 {
+                if cross(gap, *direction).abs() <= tolerance {
+                    return None;
+                }
+                Vec::new()
+            } else {
+                let t = cross(gap, *other_direction) / denominator;
+                vec![[point[0] + direction[0] * t, point[1] + direction[1] * t]]
+            }
+        }
+        (Profile::Line { point, direction }, Profile::Circle { centre, radius })
+        | (Profile::Circle { centre, radius }, Profile::Line { point, direction }) => {
+            let length = direction[0].hypot(direction[1]);
+            let unit = [direction[0] / length, direction[1] / length];
+            let offset = [point[0] - centre[0], point[1] - centre[1]];
+            let along = offset[0] * unit[0] + offset[1] * unit[1];
+            let foot = [point[0] - unit[0] * along, point[1] - unit[1] * along];
+            let distance = (foot[0] - centre[0]).hypot(foot[1] - centre[1]);
+            if distance > radius + tolerance {
+                Vec::new()
+            } else {
+                let half = (radius * radius - distance * distance).max(0.0).sqrt();
+                if half <= tolerance {
+                    vec![foot]
+                } else {
+                    vec![
+                        [foot[0] - unit[0] * half, foot[1] - unit[1] * half],
+                        [foot[0] + unit[0] * half, foot[1] + unit[1] * half],
+                    ]
+                }
+            }
+        }
+        (
+            Profile::Circle { centre, radius },
+            Profile::Circle { centre: other_centre, radius: other_radius },
+        ) => {
+            let span = [other_centre[0] - centre[0], other_centre[1] - centre[1]];
+            let distance = span[0].hypot(span[1]);
+            if distance <= tolerance {
+                if (radius - other_radius).abs() <= tolerance {
+                    return None;
+                }
+                Vec::new()
+            } else if distance > radius + other_radius + tolerance
+                || distance < (radius - other_radius).abs() - tolerance
+            {
+                Vec::new()
+            } else {
+                let along = (distance * distance + radius * radius - other_radius * other_radius)
+                    / (2.0 * distance);
+                let half = (radius * radius - along * along).max(0.0).sqrt();
+                let unit = [span[0] / distance, span[1] / distance];
+                let foot = [centre[0] + unit[0] * along, centre[1] + unit[1] * along];
+                if half <= tolerance {
+                    vec![foot]
+                } else {
+                    vec![
+                        [foot[0] - unit[1] * half, foot[1] + unit[0] * half],
+                        [foot[0] + unit[1] * half, foot[1] - unit[0] * half],
+                    ]
+                }
+            }
+        }
+    })
+}
+
+/// Two surfaces too far apart to meet, judged by the balls a sphere or a
+/// torus fits in: bearings and hubs well clear of a shaft or of each other.
+fn apart(a: &Surface, b: &Surface, tolerance: f64) -> Option<Meeting> {
+    let ball = |surface: &Surface| -> Option<(Vec3, f64)> {
+        match surface {
+            Surface::Sphere(sphere) => Some((Vec3::from(sphere.frame.origin), sphere.radius)),
+            Surface::Torus(torus) => Some((
+                Vec3::from(torus.frame.origin),
+                torus.major_radius.abs() + torus.minor_radius.abs(),
+            )),
+            _ => None,
+        }
+    };
+    let clear = |bounded: (Vec3, f64), other: &Surface| -> bool {
+        let (centre, reach) = bounded;
+        match other {
+            Surface::Plane(plane) => plane
+                .distance_to(centre.to_array())
+                .is_some_and(|distance| distance.abs() > reach + tolerance),
+            Surface::Cylinder(cylinder) => cylinder.base.normal().is_some_and(|axis| {
+                let axis = Vec3::from(axis);
+                let offset = centre - Vec3::from(cylinder.base.origin);
+                (offset - axis * offset.dot(axis)).length() > cylinder.radius + reach + tolerance
+            }),
+            _ => ball(other).is_some_and(|(other_centre, other_reach)| {
+                centre.distance(other_centre) > reach + other_reach + tolerance
+            }),
+        }
+    };
+    match (ball(a), ball(b)) {
+        (Some(bounded), _) if clear(bounded, b) => Some(Meeting::None),
+        (_, Some(bounded)) if clear(bounded, a) => Some(Meeting::None),
+        _ => None,
+    }
+}
+
+/// A sphere centred on a cylinder's axis meets it in one or two exact
+/// circles round that axis. The sphere's own frame plays no part: any axis
+/// through its centre is one of its axes. Off the axis the section is a
+/// quartic, which remains unknown until the marching path can represent
+/// every branch safely.
 fn sphere_cylinder(sphere: &Sphere, cylinder: &Cylinder, tolerance: f64) -> Meeting {
-    let (Some(axis), Some(sphere_axis)) =
-        (cylinder.base.normal(), sphere.frame.normal())
-    else {
+    let Some(axis) = cylinder.base.normal() else {
         return Meeting::Unknown;
     };
     let axis = Vec3::from(axis);
-    if !axis.is_parallel_to(Vec3::from(sphere_axis), tolerance) {
-        return Meeting::Unknown;
-    }
     let offset = Vec3::from(sphere.frame.origin) - Vec3::from(cylinder.base.origin);
     let along = offset.dot(axis);
-    if (offset - axis * along).length() > tolerance {
+    let across = (offset - axis * along).length();
+    if across > tolerance {
+        // A sphere wholly outside the cylinder or wholly inside it shares
+        // nothing with it: ball bearings round a shaft (#1563).
+        if across - sphere.radius > cylinder.radius + tolerance
+            || across + sphere.radius < cylinder.radius - tolerance
+        {
+            return Meeting::None;
+        }
         return Meeting::Unknown;
     }
     if cylinder.radius - sphere.radius > tolerance {
@@ -110,6 +371,48 @@ fn sphere_cylinder(sphere: &Sphere, cylinder: &Cylinder, tolerance: f64) -> Meet
         return Meeting::None;
     }
     let rise = squared.max(0.0).sqrt();
+    let heights = if rise <= tolerance {
+        vec![along]
+    } else {
+        vec![along - rise, along + rise]
+    };
+    let mut curves = Vec::with_capacity(heights.len());
+    for height in heights {
+        let centre = Vec3::from(cylinder.base.origin) + axis * height;
+        let Meeting::Curves(mut circle) = circle_on(centre, axis, cylinder.radius, tolerance)
+        else {
+            return Meeting::Unknown;
+        };
+        curves.append(&mut circle);
+    }
+    Meeting::Curves(curves)
+}
+
+/// A cylinder round a torus's own axis meets it where the tube reaches the
+/// cylinder's radius: two circles, one where it only touches, or none — a
+/// shaft through a knurled hub whose tube stands clear of it (#1563). Off
+/// that axis the section is a quartic; only a cylinder clear of the whole
+/// torus is answered.
+fn torus_cylinder(torus: &Torus, cylinder: &Cylinder, tolerance: f64) -> Meeting {
+    let (Some(axis), Some(torus_axis)) = (cylinder.base.normal(), torus.frame.normal()) else {
+        return Meeting::Unknown;
+    };
+    let axis = Vec3::from(axis);
+    let offset = Vec3::from(torus.frame.origin) - Vec3::from(cylinder.base.origin);
+    let along = offset.dot(axis);
+    let across = (offset - axis * along).length();
+    let (major, minor) = (torus.major_radius.abs(), torus.minor_radius.abs());
+    if across - (major + minor) > cylinder.radius + tolerance {
+        return Meeting::None;
+    }
+    if axis.cross(Vec3::from(torus_axis)).length() > 1e-9 || across > tolerance {
+        return Meeting::Unknown;
+    }
+    let gap = cylinder.radius - major;
+    if gap.abs() > minor + tolerance {
+        return Meeting::None;
+    }
+    let rise = (minor * minor - gap * gap).max(0.0).sqrt();
     let heights = if rise <= tolerance {
         vec![along]
     } else {
@@ -774,14 +1077,28 @@ mod tests {
     }
 
     #[test]
-    fn a_torus_is_not_claimed_to_be_understood() {
+    fn a_torus_meets_a_plane_square_to_its_axis_in_two_circles_only() {
         let torus = Surface::Torus(super::super::Torus {
             frame: plane_at([0.0; 3], [0.0, 0.0, 1.0]),
             major_radius: 10.0,
             minor_radius: 2.0,
         });
-        let plane = Surface::Plane(plane_at([0.0; 3], [0.0, 0.0, 1.0]));
-        assert_eq!(surfaces(&torus, &plane, TOL), Meeting::Unknown);
+        let square = Surface::Plane(plane_at([0.0; 3], [0.0, 0.0, 1.0]));
+        let Meeting::Curves(circles) = surfaces(&torus, &square, TOL) else {
+            panic!("a plane through the ring is answered");
+        };
+        let mut radii: Vec<f64> = circles
+            .iter()
+            .map(|curve| match curve {
+                Curve3::Circle(circle) => circle.radius,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        radii.sort_by(f64::total_cmp);
+        assert!((radii[0] - 8.0).abs() < 1e-9 && (radii[1] - 12.0).abs() < 1e-9, "{radii:?}");
+        // A tilted section is a quartic and stays unknown.
+        let tilted = Surface::Plane(plane_at([0.0; 3], [0.0, 1.0, 1.0]));
+        assert_eq!(surfaces(&torus, &tilted, TOL), Meeting::Unknown);
     }
 
     #[test]

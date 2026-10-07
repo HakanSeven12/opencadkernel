@@ -35,7 +35,7 @@
 //! having to test containment for itself.
 
 use super::curve::{Curve, Extent};
-use super::intersect::{circle_circle_points, line_circle, line_ellipse, line_line};
+use super::intersect::{circle_circle_points, ellipse_circle, line_circle, line_ellipse, line_line};
 use super::vec::Vec2;
 use super::Tolerance;
 
@@ -145,6 +145,15 @@ fn candidates(a: &Curve, b: &Curve, tolerance: Tolerance) -> Vec<[f64; 2]> {
             let (c2, r2) = circle_of(b);
             circle_circle_points(c1, r1, c2, r2)
         }
+
+        (Ellipse(arc), _) if round(b) => {
+            let (centre, radius) = circle_of(b);
+            ellipse_circle(&arc.ellipse, centre, radius)
+                .into_iter()
+                .map(|(_, parameter)| arc.ellipse.point_at(parameter))
+                .collect()
+        }
+        (_, Ellipse(_)) if round(a) => candidates(b, a, tolerance),
 
         // A polyline is lines and arcs, all of which are answered exactly
         // above. Take it apart rather than approximating it whole.
@@ -758,5 +767,55 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!((hits[0].point[0] - (origin[0] - 5.0)).abs() < 1e-6);
         assert!((hits[1].point[0] - (origin[0] + 5.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tangent_circles_intersect_reports_single_crossing() {
+        let c1 = circle([0.0, 0.0], 10.0);
+        let c2 = circle([20.0, 0.0], 10.0);
+        let hits = intersect(&c1, &c2, tol());
+        assert_eq!(hits.len(), 1, "tangent circles must have 1 crossing");
+        assert!((hits[0].point[0] - 10.0).abs() < 1e-5);
+        assert!(hits[0].point[1].abs() < 1e-5);
+        assert!((hits[0].t_a - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn tangent_arcs_intersect_reports_single_crossing() {
+        use super::super::Arc as KernelArc;
+        let a1 = Curve::Arc(KernelArc {
+            centre: [0.0, 0.0],
+            radius: 10.0,
+            start_angle: -1.0,
+            end_angle: 1.0,
+        });
+        let a2 = circle([20.0, 0.0], 10.0);
+        let hits = intersect(&a1, &a2, tol());
+        assert_eq!(hits.len(), 1);
+        assert!((hits[0].point[0] - 10.0).abs() < 1e-5);
+        assert!((hits[0].t_a - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn skinny_ellipse_crossing_arc_detected() {
+        use super::super::{Ellipse as KernelEllipse, EllipseArc as KernelEllipseArc, Arc as KernelArc};
+        let ell = Curve::Ellipse(KernelEllipseArc {
+            ellipse: KernelEllipse {
+                centre: [0.0, 0.0],
+                major_radius: 100.0,
+                minor_radius: 5.0,
+                major_axis: [1.0, 0.0],
+            },
+            start_parameter: 0.0,
+            end_parameter: std::f64::consts::TAU,
+        });
+        let arc = Curve::Arc(KernelArc {
+            centre: [0.0, 0.0],
+            radius: 95.0,
+            start_angle: 0.0,
+            end_angle: std::f64::consts::PI,
+        });
+        let hits = intersect(&ell, &arc, tol());
+        assert_eq!(hits.len(), 2, "half-circle arc of radius 95 must cross upper half of skinny ellipse twice");
     }
 }

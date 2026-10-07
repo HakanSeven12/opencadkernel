@@ -993,12 +993,41 @@ fn body_edge_schedules(
 ) -> HashMap<EdgeKey, Vec<super::place::EdgeSample>> {
     body.edge_keys()
         .filter_map(|edge| {
-            let max_angle = edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal);
+            // The faces fill against their own limit and cannot split a
+            // boundary segment, so an edge is sampled at least as finely as
+            // every face it bounds needs (#1538: a cylinder notched by
+            // ellipses tightens its face below its circles').
+            let max_angle = body.edges.get(edge)?.coedges.iter().fold(
+                edge_chordal_angle(body, edge, tolerance.angle, tolerance.chordal),
+                |angle, coedge| {
+                    body.coedges
+                        .get(*coedge)
+                        .and_then(|coedge| body.loops.get(coedge.owner))
+                        .map_or(angle, |ring| {
+                            angle.min(face_chordal_angle(
+                                body,
+                                ring.owner,
+                                tolerance.angle,
+                                tolerance.chordal,
+                            ))
+                        })
+                },
+            );
             let mut samples = shared_edge_samples(body, edge, max_angle, tolerance.linear)?;
             for sample in &mut samples {
                 sample.position =
                     shared_surface_position(body, edge, sample.position, tolerance.linear)
                         .unwrap_or(sample.position);
+            }
+            // An edge ends at its vertices. Projected onto its faces, an end
+            // lands wherever those surfaces put it, and the surfaces of a
+            // file fitted to 4e-3 disagree by that much from one edge to the
+            // next round a vertex, so the face's boundary no longer closed
+            // (#1538).
+            {
+                let node = body.edges.get(edge)?;
+                samples.first_mut()?.position = body.vertices.get(node.start)?.point;
+                samples.last_mut()?.position = body.vertices.get(node.end)?.point;
             }
             Some((edge, samples))
         })
@@ -1580,6 +1609,11 @@ fn edge_samples_from_pcurves(
         }
         breaks.sort_by(f64::total_cmp);
         breaks.dedup_by(|a, b| parameter_value_near(*a, *b));
+        // A pcurve that disagrees with its edge keeps every piece turning,
+        // however small, and halving it down to MAX_DEPTH is billions of
+        // evaluations. Past the budget the pcurve is given up on and the
+        // edge's own curve is sampled instead.
+        let mut budget = PCURVE_REFINE_BUDGET;
         let resolved = breaks.windows(2).all(|pair| {
             refine_pcurve_edge(
                 body,
@@ -1592,6 +1626,7 @@ fn edge_samples_from_pcurves(
                 0,
                 &mut samples,
                 directions,
+                &mut budget,
             )
             .is_some()
         });
@@ -1621,7 +1656,9 @@ fn refine_pcurve_edge(
     depth: u32,
     samples: &mut Vec<super::place::EdgeSample>,
     coedge_directions: &HashMap<super::topology::CoedgeKey, bool>,
+    budget: &mut usize,
 ) -> Option<()> {
+    *budget = budget.checked_sub(1)?;
     let edge = body.edges.get(edge_key)?;
     let (source_surface, Some(source_pcurve)) = coedge_geometry(body, source_coedge)? else {
         return None;
@@ -1717,6 +1754,7 @@ fn refine_pcurve_edge(
             depth + 1,
             samples,
             coedge_directions,
+            budget,
         )?;
         refine_pcurve_edge(
             body,
@@ -1729,6 +1767,7 @@ fn refine_pcurve_edge(
             depth + 1,
             samples,
             coedge_directions,
+            budget,
         )?;
     } else {
         samples.push(super::place::EdgeSample {
@@ -1917,11 +1956,17 @@ fn scheduled_face(
         {
             return fill_scheduled_singular_cap(body, face, &band, max_angle);
         }
+        let zipped = |rim: &[BoundaryPoint]| {
+            periods(surface)[band.varying]
+                .is_none_or(|period| is_monotonic_periodic_rim(rim, band.varying, period))
+        };
         if band.strip
             && band.holes.is_empty()
             && (band.structured
                 || (!matches!(surface, super::geometry::Surface::Nurbs(_))
-                    && periods(surface)[1 - band.varying].is_none()))
+                    && periods(surface)[1 - band.varying].is_none()
+                    && zipped(&band.low)
+                    && zipped(&band.high)))
         {
             return fill_scheduled_band(body, face, &band, max_angle, tolerance);
         }
@@ -2035,6 +2080,21 @@ fn chain_samples(
     tolerance: f64,
 ) -> Option<Vec<BoundaryPoint>> {
     let surface_periods = periods(surface);
+    // Neighbouring edges meet at their shared vertex, but a file's edges are
+    // often only fitted to within its own tolerance and may end a hair apart
+    // (5e-5 on a 100-unit solid, #1538). The joins accept a gap that small
+    // next to the ring rather than the fitting tolerance alone.
+    let join = {
+        let (mut low, mut high) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for sample in pieces.iter().flat_map(|(samples, _)| samples) {
+            for axis in 0..3 {
+                low[axis] = low[axis].min(sample.position[axis]);
+                high[axis] = high[axis].max(sample.position[axis]);
+            }
+        }
+        let size = distance3(low, high);
+        tolerance.max(if size.is_finite() { size * 1e-5 } else { 0.0 })
+    };
     let mut pieces = pieces.into_iter();
     let (first, pcurve) = pieces.next()?;
     let (mut points, mut explicit) = parameterize_samples(surface, &first, pcurve, tolerance)?;
@@ -2051,13 +2111,24 @@ fn chain_samples(
         // that difference away erases the patch's parameter-space area.
         if !explicit || !next_explicit {
             align_parameters(&mut next, &points, surface_periods, pieces.peek().is_none());
+        } else if let Some(shift) =
+            ordinary_period_jump(surface, points.last()?.parameters, next[0].parameters, surface_periods)
+        {
+            // Two explicit pcurves on either side of an ordinary seam point
+            // that merely name it from different turns: the jump is not a
+            // pole's, so it is folded rather than kept as a boundary segment
+            // spanning a whole period (#1538).
+            for point in &mut next {
+                point.parameters[0] += shift[0];
+                point.parameters[1] += shift[1];
+            }
         }
-        if distance3(head, next[0].position) > tolerance {
+        if distance3(head, next[0].position) > join {
             return None;
         }
         let skip = if explicit
             && next_explicit
-            && !parameter_near(points.last()?.parameters, next[0].parameters)
+            && !same_corner(points.last()?.parameters, next[0].parameters)
         {
             0
         } else {
@@ -2067,12 +2138,12 @@ fn chain_samples(
         explicit = next_explicit;
         all_explicit &= next_explicit;
     }
-    if distance3(points.first()?.position, points.last()?.position) > tolerance {
+    if distance3(points.first()?.position, points.last()?.position) > join {
         return None;
     }
     let first = points.first()?.parameters;
     let last = points.last()?.parameters;
-    if all_explicit && !parameter_near(first, last) {
+    if all_explicit && !same_corner(first, last) {
         return Some(points);
     }
     let mut closing = last;
@@ -2429,6 +2500,44 @@ fn parameterize_samples(
     parameterize(surface, &positions).map(|points| (points, false))
 }
 
+/// The shift that brings `to` onto `from` when the two differ by whole
+/// periods on one axis at a point where that axis is not singular — moving
+/// along it moves the point, so the two parameters are one ordinary place.
+/// `None` for a real parameter jump or one at a pole (where the patch may
+/// legitimately span a period between its sides).
+fn ordinary_period_jump(
+    surface: &super::geometry::Surface,
+    from: [f64; 2],
+    to: [f64; 2],
+    periods: [Option<f64>; 2],
+) -> Option<[f64; 2]> {
+    for axis in 0..2 {
+        let Some(period) = periods[axis] else {
+            continue;
+        };
+        let other = 1 - axis;
+        let turns = ((from[axis] - to[axis]) / period).round();
+        if turns == 0.0
+            || !parameter_value_near(to[axis] + turns * period, from[axis])
+            || !parameter_value_near(to[other], from[other])
+        {
+            continue;
+        }
+        let mut nudged = from;
+        nudged[axis] += period * 0.01;
+        let here = surface.point_at(from[0], from[1]);
+        let there = surface.point_at(nudged[0], nudged[1]);
+        let singular = distance3(here, there) <= 1e-9 * (1.0 + distance3(here, [0.0; 3]));
+        if singular {
+            return None;
+        }
+        let mut shift = [0.0; 2];
+        shift[axis] = turns * period;
+        return Some(shift);
+    }
+    None
+}
+
 fn align_parameters(
     points: &mut [BoundaryPoint],
     chain: &[BoundaryPoint],
@@ -2476,6 +2585,15 @@ fn period_shifts(period: Option<f64>) -> impl Iterator<Item = f64> {
     let period = period.filter(|value| value.is_finite() && *value > 0.0);
     let turns = if period.is_some() { 2 } else { 0 };
     (-turns..=turns).map(move |turn| f64::from(turn) * period.unwrap_or(0.0))
+}
+
+/// Whether two explicit pcurve ends name one corner. Their pcurves are fitted
+/// separately and meet only to rounding (3e-13 on a 134-unit domain, #1538);
+/// ends that name one place from different turns, as at a pole, differ by far
+/// more.
+fn same_corner(a: [f64; 2], b: [f64; 2]) -> bool {
+    let scale = a.into_iter().chain(b).map(f64::abs).fold(1.0, f64::max);
+    (a[0] - b[0]).hypot(a[1] - b[1]) <= 1e-9 * scale
 }
 
 fn parameter_near(a: [f64; 2], b: [f64; 2]) -> bool {
@@ -2649,6 +2767,15 @@ fn scheduled_band(
     if let Some(rim) = winding_rim {
         rims.push(rim);
     }
+    if rims.len() == 2
+        && holes.is_empty()
+        && surface_periods[fixed].is_none()
+        && rims
+            .iter()
+            .any(|rim| !is_monotonic_periodic_rim(rim, varying, period))
+    {
+        return cut_winding_band(surface, &rims, varying, period);
+    }
     let traversal: Vec<f64> = rims
         .iter()
         .map(|rim| rim.last().unwrap().parameters[varying] - rim[0].parameters[varying])
@@ -2672,7 +2799,7 @@ fn scheduled_band(
         && (!holes.is_empty() || !structured)
         && parameter_range(&rims[0], varying) >= period * (1.0 - 1e-9)
     {
-        fit_periodic_band(&mut rims, &mut holes, varying, period)?;
+        fit_periodic_band(surface, &mut rims, &mut holes, varying, period)?;
     }
     let mut bounds: Vec<f64> = rims
         .iter()
@@ -2808,6 +2935,103 @@ fn scheduled_band(
     })
 }
 
+/// Two rims winding round a periodic surface, one of which doubles back
+/// along the way (a notch cut into a cylinder's edge), cut at one value of
+/// the varying parameter that each crosses exactly once. Sorting such a rim
+/// by that parameter, as a plain band does, tears the notch apart; cut
+/// there, the two rims and the seam between them bound an ordinary region.
+fn cut_winding_band(
+    surface: &super::geometry::Surface,
+    rims: &[Vec<BoundaryPoint>],
+    varying: usize,
+    period: f64,
+) -> Option<BoundaryBand> {
+    let rims: Vec<Vec<BoundaryPoint>> = rims
+        .iter()
+        .map(|rim| {
+            let mut rim = rim.clone();
+            if rim.last()?.parameters[varying] < rim.first()?.parameters[varying] {
+                rim.reverse();
+            }
+            Some(rim)
+        })
+        .collect::<Option<_>>()?;
+    let turn = |value: f64, seam: f64| ((value - seam) / period).floor();
+    let crossings = |rim: &[BoundaryPoint], seam: f64| -> f64 {
+        rim.windows(2)
+            .map(|pair| {
+                (turn(pair[1].parameters[varying], seam) - turn(pair[0].parameters[varying], seam))
+                    .abs()
+            })
+            .sum()
+    };
+    // Seams through the middle of the longest steps first: well clear of any
+    // vertex, and of a notch's sides, which do not step along at all.
+    let mut steps: Vec<(f64, f64)> = rims
+        .iter()
+        .flat_map(|rim| rim.windows(2))
+        .map(|pair| {
+            let (a, b) = (pair[0].parameters[varying], pair[1].parameters[varying]);
+            ((b - a).abs(), 0.5 * (a + b))
+        })
+        .collect();
+    steps.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let seam = steps
+        .into_iter()
+        .map(|(_, middle)| middle)
+        .find(|seam| rims.iter().all(|rim| crossings(rim, *seam) == 1.0))?;
+    let mut cut: Vec<Vec<BoundaryPoint>> = rims
+        .iter()
+        .map(|rim| {
+            let index = rim.windows(2).position(|pair| {
+                turn(pair[0].parameters[varying], seam) != turn(pair[1].parameters[varying], seam)
+            })?;
+            let (a, b) = (&rim[index], &rim[index + 1]);
+            let line = seam + turn(b.parameters[varying], seam) * period;
+            let t = (line - a.parameters[varying])
+                / (b.parameters[varying] - a.parameters[varying]);
+            let mut parameters = [0, 1].map(|axis| {
+                a.parameters[axis] + (b.parameters[axis] - a.parameters[axis]) * t
+            });
+            parameters[varying] = line;
+            let start = BoundaryPoint {
+                parameters,
+                position: surface.point_at(parameters[0], parameters[1]),
+            };
+            let mut out = vec![start.clone()];
+            out.extend(rim[index + 1..].iter().cloned());
+            out.extend(rim[1..=index].iter().map(|point| {
+                let mut point = point.clone();
+                point.parameters[varying] += period;
+                point
+            }));
+            let mut end = start;
+            end.parameters[varying] += period;
+            out.push(end);
+            let shift = seam - line;
+            for point in &mut out {
+                point.parameters[varying] += shift;
+            }
+            Some(out)
+        })
+        .collect::<Option<_>>()?;
+    let fixed = 1 - varying;
+    let first_is_low = average_parameter(&cut[0], fixed) < average_parameter(&cut[1], fixed);
+    let (low, high) = if first_is_low {
+        (cut.remove(0), cut.remove(0))
+    } else {
+        (cut.remove(1), cut.remove(0))
+    };
+    Some(BoundaryBand {
+        low,
+        high,
+        holes: Vec::new(),
+        varying,
+        strip: true,
+        structured: false,
+    })
+}
+
 fn unwrap_boundary(points: &mut [BoundaryPoint], periods: [Option<f64>; 2]) {
     for index in 1..points.len() {
         for axis in 0..2 {
@@ -2884,7 +3108,7 @@ fn scheduled_periodic_band(
         for point in &mut rims[1] {
             point.parameters[varying] += shift;
         }
-        fit_periodic_band(&mut rims, &mut holes, varying, period)?;
+        fit_periodic_band(surface, &mut rims, &mut holes, varying, period)?;
         let mut bounds = [
             average_parameter(&rims[0], fixed),
             average_parameter(&rims[1], fixed),
@@ -3057,7 +3281,7 @@ fn scheduled_winding_band(
             continue;
         }
         let mut rims = rings.clone();
-        fit_periodic_band(&mut rims, &mut [], varying, period)?;
+        fit_periodic_band(surface, &mut rims, &mut [], varying, period)?;
         let first_is_low = separated_rim_order(&rims[0], &rims[1], varying)?;
         let (low, high) = if first_is_low {
             (rims.remove(0), rims.remove(0))
@@ -3244,6 +3468,7 @@ fn sample_parameter_seam(
 }
 
 fn fit_periodic_band(
+    surface: &super::geometry::Surface,
     rims: &mut [Vec<BoundaryPoint>],
     holes: &mut [Vec<BoundaryPoint>],
     varying: usize,
@@ -3281,21 +3506,23 @@ fn fit_periodic_band(
         }
     }
     for rim in rims {
-        rotate_periodic_rim(rim, varying, choice.0, period)?;
+        rotate_periodic_rim(surface, rim, varying, choice.0, period)?;
     }
     Some(())
 }
 
 fn rotate_periodic_rim(
+    surface: &super::geometry::Surface,
     rim: &mut Vec<BoundaryPoint>,
     varying: usize,
     seam: f64,
     period: f64,
 ) -> Option<()> {
+    let scale = seam.abs().max((seam + period).abs()).max(1.0);
+    let epsilon = f64::EPSILON * 128.0 * scale;
     for point in rim.iter_mut() {
         let mut value = seam + (point.parameters[varying] - seam).rem_euclid(period);
-        let scale = seam.abs().max((seam + period).abs()).max(1.0);
-        if (value - seam - period).abs() <= f64::EPSILON * 128.0 * scale {
+        if (value - seam - period).abs() <= epsilon {
             value = seam;
         }
         point.parameters[varying] = value;
@@ -3308,6 +3535,26 @@ fn rotate_periodic_rim(
             .max(1.0);
         (a.parameters[varying] - b.parameters[varying]).abs() <= f64::EPSILON * 128.0 * scale
     });
+    // Both rims must start on the seam itself: one whose samples straddle
+    // it would otherwise start a step past it, and the seam joining the two
+    // rims ran slantwise across the face (#1538's torus).
+    let (first, last) = (rim.first()?, rim.last()?);
+    if first.parameters[varying] - seam > epsilon {
+        let before = last.parameters[varying] - period;
+        let t = (seam - before) / (first.parameters[varying] - before);
+        let fixed = 1 - varying;
+        let mut parameters = [0.0; 2];
+        parameters[varying] = seam;
+        parameters[fixed] =
+            last.parameters[fixed] + (first.parameters[fixed] - last.parameters[fixed]) * t;
+        rim.insert(
+            0,
+            BoundaryPoint {
+                parameters,
+                position: surface.point_at(parameters[0], parameters[1]),
+            },
+        );
+    }
     let mut closing = rim.first()?.clone();
     closing.parameters[varying] += period;
     rim.push(closing);
@@ -3389,33 +3636,36 @@ fn whole_surface_domain(
     if bounded_domain {
         return Some(domain);
     }
+    // Every loop a slit — one edge walked there and back — encloses nothing,
+    // so the face is the whole surface. A ball touching two tangent faces
+    // carries one slit per contact (#1563).
     let seam_loop = matches!(
         surface,
         super::geometry::Surface::Sphere(_) | super::geometry::Surface::Torus(_)
-    ) && node.loops.as_slice().first().is_some_and(|loop_key| {
-        let Some(ring) = body.loops.get(*loop_key) else {
-            return false;
-        };
-        node.loops.len() == 1
-            && !ring.coedges.is_empty()
-            && ring.coedges.iter().all(|coedge_key| {
-                let Some(coedge) = body.coedges.get(*coedge_key) else {
-                    return false;
-                };
-                if coedge.pcurve.is_some() {
-                    // An explicit pcurve bounds a trimmed periodic patch; it
-                    // is not merely an arbitrary cut across the whole surface.
-                    return false;
-                }
-                let matching: Vec<_> = ring
-                    .coedges
-                    .iter()
-                    .filter_map(|candidate| body.coedges.get(*candidate))
-                    .filter(|candidate| candidate.edge == coedge.edge)
-                    .collect();
-                matching.len() == 2 && matching[0].forward != matching[1].forward
-            })
-    });
+    ) && !node.loops.is_empty()
+        && node.loops.iter().all(|loop_key| {
+            let Some(ring) = body.loops.get(*loop_key) else {
+                return false;
+            };
+            !ring.coedges.is_empty()
+                && ring.coedges.iter().all(|coedge_key| {
+                    let Some(coedge) = body.coedges.get(*coedge_key) else {
+                        return false;
+                    };
+                    if coedge.pcurve.is_some() {
+                        // An explicit pcurve bounds a trimmed periodic patch; it
+                        // is not merely an arbitrary cut across the whole surface.
+                        return false;
+                    }
+                    let matching: Vec<_> = ring
+                        .coedges
+                        .iter()
+                        .filter_map(|candidate| body.coedges.get(*candidate))
+                        .filter(|candidate| candidate.edge == coedge.edge)
+                        .collect();
+                    matching.len() == 2 && matching[0].forward != matching[1].forward
+                })
+        });
     if !node.loops.is_empty() && !seam_loop {
         return None;
     }
@@ -3488,6 +3738,8 @@ fn distance3(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 /// Recursion guard; tolerance normally stops first.
 const MAX_DEPTH: u32 = 32;
+/// Most pieces one edge's pcurve walk may split into before it is abandoned.
+const PCURVE_REFINE_BUDGET: usize = 1 << 14;
 const MAX_FACE_DEPTH: u32 = 128;
 const MAX_FACE_PASSES: usize = 128;
 const MAX_FACE_ADDITIONS: usize = 262_144;
@@ -3654,7 +3906,10 @@ fn surface_span_breaks(
         parameters[1 - fixed_axis] = varying;
         parameters
     });
-    if !angle_exceeds(surface_normal_angle(surface, &parameters)?, max_angle) {
+    // The parameter line's own turning counts as well as the normal's: a
+    // flat spline patch whose isolines curve (a planar face swept along an
+    // arc) has a constant normal, and would otherwise be cut by chords.
+    if !angle_exceeds(surface_path_angle(surface, &parameters)?, max_angle) {
         values.push(from);
         return Some(());
     }
@@ -4141,14 +4396,27 @@ fn surface_grid_values(
     };
     let values = [0, 1].map(|axis| {
         let other = 1 - axis;
-        let mut probes = nurbs.map_or_else(Vec::new, |nurbs| {
-            let knots = nurbs.knots();
-            if other == 0 {
-                knots.0.to_vec()
-            } else {
-                knots.1.to_vec()
-            }
-        });
+        // An analytic surface has no knots to probe at, and its bounds and
+        // their middle can all sit where the normal stands still along the
+        // axis (a torus's top and bottom circles), leaving the grid with no
+        // lines at all (#1538). Eighths across the other axis cannot.
+        let mut probes = nurbs.map_or_else(
+            || {
+                (1..8)
+                    .map(|step| {
+                        bounds[other][0] + (bounds[other][1] - bounds[other][0]) * step as f64 / 8.0
+                    })
+                    .collect()
+            },
+            |nurbs| {
+                let knots = nurbs.knots();
+                if other == 0 {
+                    knots.0.to_vec()
+                } else {
+                    knots.1.to_vec()
+                }
+            },
+        );
         probes.retain(|value| *value >= bounds[other][0] && *value <= bounds[other][1]);
         probes.extend(bounds[other]);
         probes.sort_by(f64::total_cmp);
@@ -4307,9 +4575,15 @@ fn triangle_refinement(
         });
         edge_angles[index] = surface_normal_angle_cached(surface, &parameters, normal_cache)?;
     }
+    // A constrained edge is a boundary sample pair (or a grid line), which
+    // no insertion may split: the neighbouring face shares those samples.
+    // The edge sampler measures the curve's own turn, this the surface
+    // normal's along the straight parameter chord, and the two differ by a
+    // hair — 0.171 against 0.170 on a torus rim failed a whole face (#1563).
+    // Within twice the limit it stands; beyond that the ring is broken.
     if (0..3).any(|index| {
         let [from, to] = edge_vertices[index];
-        angle_exceeds(edge_angles[index], max_angle)
+        angle_exceeds(edge_angles[index], max_angle * 2.0)
             && triangle.constraints[index]
             && distance3(
                 surface.point_at(corners[from][0], corners[from][1]),
@@ -4322,7 +4596,8 @@ fn triangle_refinement(
         .into_iter()
         .enumerate()
         .filter(|(index, [from, to])| {
-            angle_exceeds(edge_angles[*index], max_angle)
+            !triangle.constraints[*index]
+                && angle_exceeds(edge_angles[*index], max_angle)
                 && distance3(
                     surface.point_at(corners[*from][0], corners[*from][1]),
                     surface.point_at(corners[*to][0], corners[*to][1]),

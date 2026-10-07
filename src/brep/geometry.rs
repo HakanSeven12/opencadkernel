@@ -1,7 +1,7 @@
 //! The shapes a face sits on and an edge runs along.
 //!
 //! Topology says which face borders which; geometry says where they are. The
-//! two are kept apart because they change independently — a boolean rewrites
+//! two are kept apart because they change independently Ã¢â‚¬â€ a boolean rewrites
 //! adjacency while leaving every surface exactly as it was, and a face can be
 //! moved without any coedge noticing.
 //!
@@ -10,7 +10,7 @@
 //! A cylinder is stored as a cylinder, not as a spline that happens to look
 //! like one. That is not an optimisation: an ACIS file says `cone`, and
 //! lowering it back as a B-spline surface loses the fact that it was ever
-//! round — every downstream consumer, including the next modeller to open
+//! round Ã¢â‚¬â€ every downstream consumer, including the next modeller to open
 //! the file, then sees an approximation. The analytic cases are also the ones
 //! whose intersections have closed forms, which is the difference between a
 //! boolean that lands on the exact circle two cylinders share and one that
@@ -34,7 +34,7 @@ pub enum Surface {
     /// A right circular cylinder about `axis`. `u` runs round it in radians,
     /// `v` along the axis.
     Cylinder(Cylinder),
-    /// A right circular cone, which a cylinder is the zero-angle case of —
+    /// A right circular cone, which a cylinder is the zero-angle case of Ã¢â‚¬â€
     /// kept separate because ACIS stores them as one record with a flag, and
     /// because their intersections behave differently.
     Cone(Cone),
@@ -75,7 +75,7 @@ pub struct Cone {
     /// The frame at the reference circle, as for a cylinder.
     pub base: Plane,
     /// Radius of that circle. This is the radius *at the base*, not at the
-    /// apex — reading it as the apex radius puts every generator on the wrong
+    /// apex Ã¢â‚¬â€ reading it as the apex radius puts every generator on the wrong
     /// slope.
     pub radius: f64,
     /// Half-angle at the apex, positive when the cone narrows along the axis.
@@ -94,7 +94,7 @@ pub struct EllipticCone {
     /// cross-section.
     pub radius: f64,
     /// Minor half-length over major half-length, kept along the whole
-    /// surface — this is what makes one record cover the whole family,
+    /// surface Ã¢â‚¬â€ this is what makes one record cover the whole family,
     /// `ratio = 1` being a circular section.
     pub ratio: f64,
     /// Half-angle at the apex, positive when the cone narrows along the
@@ -282,13 +282,13 @@ impl Surface {
         })
     }
 
-    /// The `(u, v)` of a point on the surface — the inverse of
+    /// The `(u, v)` of a point on the surface Ã¢â‚¬â€ the inverse of
     /// [`point_at`](Self::point_at).
     ///
     /// A point off the surface is answered for the nearest point on it, so a
     /// caller holding an intersection result does not have to be exact
     /// first. `None` only where the frame is degenerate, or at a place with
-    /// no single answer — a sphere's pole, where every longitude meets.
+    /// no single answer Ã¢â‚¬â€ a sphere's pole, where every longitude meets.
     pub fn parameters_at(&self, point: [f64; 3]) -> Option<(f64, f64)> {
         match self {
             Self::Plane(plane) => {
@@ -312,7 +312,7 @@ impl Surface {
                 let scale = cone.radius.abs().max(1.0);
                 if major.abs() <= 1e-12 * scale {
                     // The apex. Every longitude passes through it, so there
-                    // is no `u` to report rather than an arbitrary one —
+                    // is no `u` to report rather than an arbitrary one Ã¢â‚¬â€
                     // the sphere's pole answered the same way.
                     return None;
                 }
@@ -368,12 +368,12 @@ impl Surface {
 
     /// Where a ray meets the surface, as distances along `direction`.
     ///
-    /// In order, and including negative ones — behind the origin is still on
+    /// In order, and including negative ones Ã¢â‚¬â€ behind the origin is still on
     /// the surface, and a caller counting crossings ahead filters for itself.
     ///
-    /// `None` for a torus: its section is a quartic and this kernel has no
-    /// solver for one. As everywhere else here, that is said rather than
-    /// answered with an empty list a caller would read as "no hits".
+    /// `None` where a spline patch's crossing will not settle. As everywhere
+    /// else here, that is said rather than answered with an empty list a
+    /// caller would read as "no hits".
     pub fn ray_hits(&self, origin: [f64; 3], direction: [f64; 3]) -> Option<Vec<f64>> {
         let start = Vec3::from(origin);
         let along = Vec3::from(direction);
@@ -425,9 +425,64 @@ impl Surface {
                     across_offset.length_squared() - at_start * at_start,
                 ))
             }
-            // An elliptic section is a quartic like the torus's is, so the
-            // same honesty: `None`, not an empty list.
-            Self::EllipticCone(_) | Self::Torus(_) | Self::Nurbs(_) => None,
+            // An elliptic section is a quartic like the torus's is, but
+            // with no closed form and no upstream counterpart: keep the
+            // honest `None`, not an empty list.
+            Self::EllipticCone(_) => None,
+            Self::Torus(torus) => {
+                // The section is a quartic in the ray parameter. Its roots
+                // lie within the torus's bounding sphere, so the span there is
+                // walked for sign changes and each one halved down to a
+                // root. Two roots inside one step, or a graze, show no
+                // change and are missed together ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â an even number, which
+                // leaves a crossing count's parity as it was.
+                let axis = Vec3::from(torus.frame.normal()?);
+                let (major, minor) = (torus.major_radius.abs(), torus.minor_radius.abs());
+                let offset = start - Vec3::from(torus.frame.origin);
+                let bound = major + minor;
+                let span = roots(
+                    along.length_squared(),
+                    2.0 * offset.dot(along),
+                    offset.length_squared() - bound * bound,
+                );
+                let [first, second] = span[..] else {
+                    return Some(Vec::new());
+                };
+                let (enter, leave) = (first.min(second), first.max(second));
+                let quartic = |t: f64| {
+                    let q = offset + along * t;
+                    let height = q.dot(axis);
+                    let squared = q.length_squared();
+                    let across = squared - height * height;
+                    let sum = squared + major * major - minor * minor;
+                    sum * sum - 4.0 * major * major * across
+                };
+                const STEPS: usize = 256;
+                let mut hits = Vec::new();
+                let mut previous = (enter, quartic(enter));
+                for step in 1..=STEPS {
+                    let t = enter + (leave - enter) * step as f64 / STEPS as f64;
+                    let value = quartic(t);
+                    if value == 0.0 {
+                        hits.push(t);
+                    } else if previous.1 != 0.0 && (value > 0.0) != (previous.1 > 0.0) {
+                        let (mut low, mut high) = (previous.0, t);
+                        let low_positive = previous.1 > 0.0;
+                        for _ in 0..64 {
+                            let middle = 0.5 * (low + high);
+                            if (quartic(middle) > 0.0) == low_positive {
+                                low = middle;
+                            } else {
+                                high = middle;
+                            }
+                        }
+                        hits.push(0.5 * (low + high));
+                    }
+                    previous = (t, value);
+                }
+                Some(hits)
+            }
+            Self::Nurbs(surface) => nurbs_ray_hits(surface, start, along),
         }
     }
 
@@ -442,7 +497,7 @@ impl Surface {
 
     /// Signed distance from `point` to the surface, positive outside.
     ///
-    /// Exact for every analytic kind here — no search, no sampling.
+    /// Exact for every analytic kind here Ã¢â‚¬â€ no search, no sampling.
     pub fn distance_to(&self, point: [f64; 3]) -> f64 {
         match self {
             Self::Plane(plane) => plane.distance_to(point).unwrap_or(f64::INFINITY),
@@ -450,7 +505,7 @@ impl Surface {
             Self::Cone(cone) => {
                 let (along, across) = axial_distance(&cone.base, point);
                 // In the (across, along) half plane the cone's profile is not
-                // one line but two, meeting at the apex — the record covers
+                // one line but two, meeting at the apex Ã¢â‚¬â€ the record covers
                 // both nappes, so past the apex the radius grows again on the
                 // mirrored half. Taking the magnitude is what folds the
                 // second one in; reading the first line's own extension
@@ -478,19 +533,30 @@ impl Surface {
                 }
             }
             Self::EllipticCone(cone) => elliptic_cone_distance(cone, point),
-            Self::Nurbs(_) => f64::INFINITY,
+            // Unsigned off the patch's side, where the nearest point is on
+            // its edge and the normal says nothing about the side.
+            Self::Nurbs(surface) => {
+                let Some((u, v)) = surface.parameters_at(point) else {
+                    return f64::INFINITY;
+                };
+                let offset = Vec3::from(point) - Vec3::from(surface.point_at_knot(u, v));
+                let side = self
+                    .normal_at(u, v)
+                    .map_or(1.0, |normal| offset.dot(Vec3::from(normal)).signum());
+                offset.length() * if side < 0.0 { -1.0 } else { 1.0 }
+            }
         }
     }
 }
 
 /// Signed distance from `point` to an elliptical cone surface.
 ///
-/// The section is an ellipse, whose nearest point has no closed form — a
+/// The section is an ellipse, whose nearest point has no closed form Ã¢â‚¬â€ a
 /// circle's has. What the circular arms answer by algebra here comes from a
 /// short Gauss-Newton iteration instead: refine `(u, v)` from the point's
 /// own longitude and height toward the nearest surface point. Several
 /// seeds are tried, the ellipse's quadrants and the reflected nappe among
-/// them — the torus arm's two sheets answered the same way — and the
+/// them Ã¢â‚¬â€ the torus arm's two sheets answered the same way Ã¢â‚¬â€ and the
 /// smallest residual keeps the answer. Points *on* the surface, which is
 /// what `contains` gates a lift on, converge to a zero residual in a step
 /// or two from the point's own longitude.
@@ -560,6 +626,119 @@ fn elliptic_cone_distance(cone: &EllipticCone, point: [f64; 3]) -> f64 {
     best.unwrap_or(f64::INFINITY)
 }
 
+/// Where a ray meets a spline patch: the crossings of a grid of the patch's
+/// own points, each then refined onto the patch itself by Newton's method in
+/// `(u, v, t)`. `None` when a crossing will not settle Ã¢â‚¬â€ a ray grazing the
+/// patch, whose count of crossings is not to be trusted either way.
+fn nurbs_ray_hits(surface: &NurbsSurface3, origin: Vec3, direction: Vec3) -> Option<Vec<f64>> {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let (u_knots, v_knots) = surface.knots();
+    // ponytail: four cells a knot span; a patch folding tighter than that can
+    // hide a pair of crossings, which leaves the parity intact.
+    let cells = |knots: &[f64], low: f64, high: f64| {
+        let spans = knots
+            .windows(2)
+            .filter(|pair| pair[1] > pair[0] && pair[0] >= low && pair[1] <= high)
+            .count();
+        (spans * 4).clamp(8, 96)
+    };
+    let (columns, rows) = (cells(u_knots, u0, u1), cells(v_knots, v0, v1));
+    let at = |i: usize, j: usize| {
+        (
+            u0 + (u1 - u0) * i as f64 / columns as f64,
+            v0 + (v1 - v0) * j as f64 / rows as f64,
+        )
+    };
+    let grid: Vec<Vec<Vec3>> = (0..=columns)
+        .map(|i| {
+            (0..=rows)
+                .map(|j| {
+                    let (u, v) = at(i, j);
+                    Vec3::from(surface.point_at_knot(u, v))
+                })
+                .collect()
+        })
+        .collect();
+    let mut hits: Vec<f64> = Vec::new();
+    for i in 0..columns {
+        for j in 0..rows {
+            let corners = [(i, j), (i + 1, j), (i + 1, j + 1), (i, j + 1)];
+            for triangle in [[0, 1, 2], [0, 2, 3]] {
+                let [a, b, c] = triangle.map(|k| corners[k]);
+                let corners = [grid[a.0][a.1], grid[b.0][b.1], grid[c.0][c.1]];
+                let Some((t, beta, gamma)) = ray_triangle(origin, direction, corners) else {
+                    continue;
+                };
+                let ((ua, va), (ub, vb), (uc, vc)) = (at(a.0, a.1), at(b.0, b.1), at(c.0, c.1));
+                let alpha = 1.0 - beta - gamma;
+                let guess = (
+                    alpha * ua + beta * ub + gamma * uc,
+                    alpha * va + beta * vb + gamma * vc,
+                );
+                let t = refine_ray_hit(surface, origin, direction, guess, t)?;
+                if !hits.iter().any(|hit| (hit - t).abs() <= 1e-9 * (1.0 + t.abs())) {
+                    hits.push(t);
+                }
+            }
+        }
+    }
+    hits.sort_by(f64::total_cmp);
+    Some(hits)
+}
+
+/// Where a ray crosses a triangle: its distance and the crossing's second
+/// and third barycentric weights. The edges count as inside Ã¢â‚¬â€ a crossing on
+/// one is found from both its triangles and kept once.
+fn ray_triangle(origin: Vec3, direction: Vec3, [a, b, c]: [Vec3; 3]) -> Option<(f64, f64, f64)> {
+    let (ab, ac) = (b - a, c - a);
+    let cross = direction.cross(ac);
+    let determinant = ab.dot(cross);
+    if determinant.abs() <= f64::EPSILON * ab.length() * ac.length() {
+        return None;
+    }
+    let from = origin - a;
+    let beta = from.dot(cross) / determinant;
+    let back = from.cross(ab);
+    let gamma = direction.dot(back) / determinant;
+    const SLACK: f64 = 1e-9;
+    (beta >= -SLACK && gamma >= -SLACK && beta + gamma <= 1.0 + SLACK)
+        .then(|| (ac.dot(back) / determinant, beta, gamma))
+}
+
+/// A grid crossing pulled onto the patch: `S(u, v) = origin + tÃ‚Â·direction`
+/// solved from the grid's guess.
+fn refine_ray_hit(
+    surface: &NurbsSurface3,
+    origin: Vec3,
+    direction: Vec3,
+    (mut u, mut v): (f64, f64),
+    mut t: f64,
+) -> Option<f64> {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let scale = 1.0 + origin.length() + t.abs() * direction.length();
+    for _ in 0..32 {
+        let residual = Vec3::from(surface.point_at_knot(u, v)) - (origin + direction * t);
+        if residual.length() <= 1e-10 * scale {
+            return Some(t);
+        }
+        let (along_u, along_v) = surface.tangents_at_knot(u, v)?;
+        let (along_u, along_v, back) = (Vec3::from(along_u), Vec3::from(along_v), direction * -1.0);
+        let determinant = along_u.dot(along_v.cross(back));
+        if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+            return None;
+        }
+        // Cramer's rule for JÃ‚Â·step = -residual, J = [S_u S_v -d].
+        let target = residual * -1.0;
+        u += target.dot(along_v.cross(back)) / determinant;
+        v += along_u.dot(target.cross(back)) / determinant;
+        t += along_u.dot(along_v.cross(target)) / determinant;
+        u = u.clamp(u0, u1);
+        v = v.clamp(v0, v1);
+    }
+    let residual = Vec3::from(surface.point_at_knot(u, v)) - (origin + direction * t);
+    (residual.length() <= 1e-7 * scale).then_some(t)
+}
+
 /// Moves `point` by `distance` along `frame`'s normal.
 fn offset_along_normal(frame: &Plane, point: [f64; 3], distance: f64) -> [f64; 3] {
     match frame.normal() {
@@ -578,7 +757,7 @@ fn perpendicular(vector: Vec3, axis: Vec3) -> Vec3 {
     vector - axis * vector.dot(axis)
 }
 
-/// Real roots of `a·t² + b·t + c`, in order.
+/// Real roots of `aÃ‚Â·tÃ‚Â² + bÃ‚Â·t + c`, in order.
 ///
 /// Falls back to the linear case when the quadratic term vanishes, which is
 /// how a ray parallel to a cone's own slope is answered rather than divided
@@ -631,7 +810,7 @@ pub enum Curve3 {
     /// radians measured from the plane's x axis.
     Circle(Circle3),
     /// An ellipse, lying in `plane`. `t` is the ellipse's own parameter, not
-    /// an angle — the two differ everywhere except on the axes.
+    /// an angle Ã¢â‚¬â€ the two differ everywhere except on the axes.
     ///
     /// Where a plane cuts a cylinder at a slant this is what they share
     /// exactly; approximating it with a circle or a spline would put the
@@ -807,7 +986,7 @@ mod tests {
 
     #[test]
     fn a_cone_holds_the_nappe_past_its_own_apex() {
-        // One record, both halves — which `ray_hits` has always said, since a
+        // One record, both halves Ã¢â‚¬â€ which `ray_hits` has always said, since a
         // ray up one side meets the other. The distance has to agree: past
         // the apex the radius grows again on the mirrored half, and reading
         // the first half's generator extended instead reports a point lying
@@ -815,7 +994,7 @@ mod tests {
         //
         // What that cost was a cone's whole wall. A seam runs from the rim to
         // the apex, the check that a curve lies on its surface samples past
-        // both ends, and the sample beyond the apex was refused — so the
+        // both ends, and the sample beyond the apex was refused Ã¢â‚¬â€ so the
         // face's boundary could not be projected and nothing of it was drawn.
         let surface = Surface::Cone(Cone {
             base: xy(),

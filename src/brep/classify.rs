@@ -130,6 +130,9 @@ fn face_hits(
 ) -> Option<Vec<f64>> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
+    if whole_closed_face(body, face) {
+        return surface.ray_hits(origin, direction);
+    }
     let boundary = pcurve::face_boundary(body, face, tolerance)?;
     let mut out = Vec::new();
     for distance in surface.ray_hits(origin, direction)? {
@@ -162,8 +165,46 @@ fn face_hits(
     Some(out)
 }
 
+/// Whether a sphere or torus face is the whole surface: no loops, or only
+/// slits — one edge walked there and back, enclosing nothing. A ball held in
+/// its pocket carries one slit per contact line; tested against those, every
+/// ray hit but the ones beside them fell outside, and a ray through the ball
+/// counted its way in but not out (#1563).
+pub(super) fn whole_closed_face(body: &Body, face: FaceKey) -> bool {
+    let Some(node) = body.faces.get(face) else {
+        return false;
+    };
+    if !matches!(
+        body.surfaces.get(node.surface),
+        Some(super::Surface::Sphere(_) | super::Surface::Torus(_))
+    ) {
+        return false;
+    }
+    node.loops.iter().all(|ring| {
+        body.loops.get(*ring).is_some_and(|ring| {
+            !ring.coedges.is_empty()
+                && ring.coedges.iter().all(|key| {
+                    let Some(coedge) = body.coedges.get(*key) else {
+                        return false;
+                    };
+                    coedge.pcurve.is_none()
+                        && ring.coedges.iter().any(|other| {
+                            body.coedges.get(*other).is_some_and(|other| {
+                                other.edge == coedge.edge && other.forward != coedge.forward
+                            })
+                        })
+                })
+        })
+    })
+}
+
 /// How far `point` is from a face, or `None` if that cannot be measured.
-fn face_distance(body: &Body, face: FaceKey, point: [f64; 3], tolerance: f64) -> Option<f64> {
+pub(super) fn face_distance(
+    body: &Body,
+    face: FaceKey,
+    point: [f64; 3],
+    tolerance: f64,
+) -> Option<f64> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
     let gap = surface.distance_to(point).abs();
@@ -313,18 +354,26 @@ mod tests {
 
     #[test]
     fn a_body_with_a_surface_that_cannot_be_cast_says_so() {
-        // A torus's section is a quartic and there is no solver for one, so
-        // the count is refused rather than taken with that face missing —
-        // which would report every point inside it as outside.
+        // A spline surface has no ray solver, so the count is refused rather
+        // than taken with that face missing — which would report every point
+        // inside it as outside.
         let mut body = box_body();
         let face = body.face_keys().next().unwrap();
         let surface = body.faces.get(face).unwrap().surface;
-        *body.surfaces.get_mut(surface).unwrap() =
-            crate::brep::Surface::Torus(crate::brep::Torus {
-                frame: crate::space::Plane::XY,
-                major_radius: 10.0,
-                minor_radius: 2.0,
-            });
+        *body.surfaces.get_mut(surface).unwrap() = crate::brep::Surface::Nurbs(
+            crate::space::NurbsSurface3::new_strict(
+                1,
+                1,
+                vec![
+                    vec![[0.0, 0.0, 0.0], [0.0, 10.0, 0.0]],
+                    vec![[10.0, 0.0, 0.0], [10.0, 10.0, 0.0]],
+                ],
+                vec![0.0, 0.0, 1.0, 1.0],
+                vec![0.0, 0.0, 1.0, 1.0],
+                vec![vec![1.0; 2]; 2],
+            )
+            .unwrap(),
+        );
         assert_eq!(
             contains_point(&body, [5.0, 5.0, 5.0], TOL),
             Containment::Unknown
