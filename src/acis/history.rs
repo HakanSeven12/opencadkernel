@@ -1,6 +1,7 @@
 use cadcodec::entities::EmbeddedEntity;
 use cadcodec::objects::{
-    SolidHistoryLoft, SolidHistoryOperation, SolidHistoryRevolve, SolidHistorySweep,
+    SolidHistoryBoolean, SolidHistoryLoft, SolidHistoryOperation, SolidHistoryRevolve,
+    SolidHistorySweep, SolidHistoryTree,
 };
 use cadcodec::types::{Matrix3, Vector3};
 
@@ -19,6 +20,10 @@ pub enum HistoryRebuildError {
     InvalidBrep,
     Fillet(brep::FilletError),
     Chamfer(brep::ChamferError),
+    /// A sweep the record asks for that a cornered path refuses.
+    Refused(brep::SweepRefusal),
+    /// The two solids a boolean step joins could not be combined.
+    Boolean,
 }
 
 impl std::fmt::Display for HistoryRebuildError {
@@ -30,6 +35,8 @@ impl std::fmt::Display for HistoryRebuildError {
             Self::InvalidBrep => formatter.write_str("invalid solid history B-rep"),
             Self::Fillet(error) => write!(formatter, "solid history fillet failed: {error}"),
             Self::Chamfer(error) => write!(formatter, "solid history chamfer failed: {error}"),
+            Self::Refused(why) => write!(formatter, "sweep refused: {why:?} along a path with a corner"),
+            Self::Boolean => formatter.write_str("solid history boolean failed"),
         }
     }
 }
@@ -217,6 +224,85 @@ fn spline_curve(
     Ok(PlanarCurve::new(plane, Curve::Nurbs(nurbs)))
 }
 
+/// The spans of a polyline the modeler keeps as a wire body.
+fn body_wire_spans(entity: &EmbeddedEntity) -> Option<Vec<crate::acis::WireSpan>> {
+    let EmbeddedEntity::Body { acis_data, .. } = entity else {
+        return None;
+    };
+    crate::acis::lift_wire(&acis_data.parse()?)
+}
+
+/// A planar wire body as a bulged polyline in its own plane: lines and
+/// circular arcs, open or closed.
+fn wire_polyline(spans: &[crate::acis::WireSpan]) -> Result<PlanarCurve, HistoryRebuildError> {
+    let points = spans
+        .iter()
+        .flat_map(|span| [span.start, span.end])
+        .collect::<Vec<_>>();
+    let first = Vec3::from(spans.first().ok_or(HistoryRebuildError::InvalidParameters)?.start);
+    let arc_normal = spans.iter().find_map(|span| match &span.curve {
+        brep::Curve3::Circle(circle) => circle.plane.normal(),
+        _ => None,
+    });
+    let normal = match arc_normal {
+        Some(normal) => Vec3::from(normal),
+        // Newell's normal of the vertex chain.
+        None => (0..points.len()).fold(Vec3::ZERO, |sum, index| {
+            let a = Vec3::from(points[index]) - first;
+            let b = Vec3::from(points[(index + 1) % points.len()]) - first;
+            sum + a.cross(b)
+        }),
+    }
+    .normalize()
+    .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let x_axis = points
+        .iter()
+        .map(|point| Vec3::from(*point) - first)
+        .map(|chord| chord - normal * chord.dot(normal))
+        .find(|chord| chord.length() > 1e-12)
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let plane = Plane::orthonormal(first.to_array(), x_axis.to_array(), normal.to_array())
+        .ok_or(HistoryRebuildError::InvalidParameters)?;
+    let tolerance = coplanarity_tolerance(&points);
+    if points.iter().any(|point| !plane.contains(*point, tolerance)) {
+        return Err(HistoryRebuildError::Unsupported);
+    }
+    let mut vertices = Vec::with_capacity(spans.len() + 1);
+    for span in spans {
+        let bulge = match &span.curve {
+            brep::Curve3::Line(_) => 0.0,
+            brep::Curve3::Circle(circle) => {
+                let axis = Vec3::from(circle.plane.normal().ok_or(HistoryRebuildError::InvalidParameters)?);
+                let axis = if span.along_curve { axis } else { -axis };
+                let centre = Vec3::from(circle.plane.origin);
+                let (a, b) = (Vec3::from(span.start) - centre, Vec3::from(span.end) - centre);
+                let mut sweep = a.cross(b).dot(axis).atan2(a.dot(b));
+                if sweep <= 1e-12 {
+                    sweep += std::f64::consts::TAU;
+                }
+                if axis.dot(normal).abs() < 1.0 - 1e-9 || sweep >= std::f64::consts::TAU - 1e-9 {
+                    return Err(HistoryRebuildError::Unsupported);
+                }
+                (sweep / 4.0).tan() * axis.dot(normal).signum()
+            }
+            _ => return Err(HistoryRebuildError::Unsupported),
+        };
+        vertices.push(PolylineVertex {
+            position: plane.project(span.start).ok_or(HistoryRebuildError::InvalidParameters)?,
+            bulge,
+        });
+    }
+    let last = spans.last().ok_or(HistoryRebuildError::InvalidParameters)?.end;
+    let closed = Vec3::from(last).distance(first) <= tolerance.max(1e-9);
+    if !closed {
+        vertices.push(PolylineVertex {
+            position: plane.project(last).ok_or(HistoryRebuildError::InvalidParameters)?,
+            bulge: 0.0,
+        });
+    }
+    Ok(PlanarCurve::new(plane, Curve::Polyline(Polyline { vertices, closed })))
+}
+
 fn embedded_curve(entity: &EmbeddedEntity) -> Result<PlanarCurve, HistoryRebuildError> {
     match entity {
         EmbeddedEntity::Line(value) => straight_curve(value.start, value.end),
@@ -278,6 +364,9 @@ fn embedded_curve(entity: &EmbeddedEntity) -> Result<PlanarCurve, HistoryRebuild
                 }),
             ))
         }
+        EmbeddedEntity::Body { .. } => wire_polyline(
+            &body_wire_spans(entity).ok_or(HistoryRebuildError::InvalidParameters)?,
+        ),
         EmbeddedEntity::Spline(value) => spline_curve(value),
         EmbeddedEntity::LwPolyline(value) => {
             if value.vertices.len() < 2 {
@@ -796,6 +885,27 @@ fn embedded_sweep_path(
     entity: &EmbeddedEntity,
     transform: [f64; 16],
 ) -> Result<HistorySweepPath, HistoryRebuildError> {
+    // A polyline kept as a wire body: straight spans are a 3D polyline;
+    // a planar chain with arcs is swept as a bulged polyline in its plane.
+    if let Some(spans) = body_wire_spans(entity) {
+        let place = placement(transform)?;
+        if place.scale().is_none() {
+            return Err(HistoryRebuildError::InvalidTransform);
+        }
+        if spans.iter().all(|span| matches!(span.curve, brep::Curve3::Line(_))) {
+            let mut points = std::iter::once(spans[0].start)
+                .chain(spans.iter().map(|span| span.end))
+                .map(|point| place.point(point))
+                .collect::<Vec<_>>();
+            let closed = points.len() > 2
+                && Vec3::from(points[0]).distance(Vec3::from(*points.last().unwrap()))
+                    <= coplanarity_tolerance(&points).max(1e-9);
+            if closed {
+                points.pop();
+            }
+            return Ok(HistorySweepPath::Polyline3d { points, closed });
+        }
+    }
     if let EmbeddedEntity::Spline(value) = entity {
         let degree = value.degree.max(1) as usize;
         let fit_method = !value.fit_points.is_empty() && value.control_points.len() <= degree;
@@ -911,11 +1021,28 @@ fn sweep_nurbs_length(curve: &NurbsCurve3) -> f64 {
     }).sum()
 }
 
+/// Transforms that place the embedded profile and path in world space.
+///
+/// With flag 295 both entities are stored already placed (the profile at the
+/// path start, both in world coordinates). The record's matrices then
+/// describe the source profile frame and the placed profile frame; applying
+/// them to the stored geometry again would move it off the path.
+fn sweep_entity_transforms(value: &SolidHistorySweep) -> ([f64; 16], [f64; 16]) {
+    const IDENTITY: [f64; 16] = [
+        1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+    ];
+    if value.flags_294_296[1] {
+        (IDENTITY, IDENTITY)
+    } else {
+        (value.sweep_entity_transform, value.path_entity_transform)
+    }
+}
+
 /// Length of the history path in world units, including its closing segment.
 pub fn sweep_history_path_length(value: &SolidHistorySweep) -> Result<f64, HistoryRebuildError> {
     let path = embedded_sweep_path(
         value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
-        value.path_entity_transform,
+        sweep_entity_transforms(value).1,
     )?;
     let length = match path {
         HistorySweepPath::Planar { plane, curves, .. } => {
@@ -951,14 +1078,38 @@ fn sweep_history_geometry(
     value: &SolidHistorySweep,
     surface: bool,
 ) -> Result<SweepHistoryGeometry, HistoryRebuildError> {
+    let (profile_transform, path_transform) = sweep_entity_transforms(value);
     let (plane, wires, closed) = sweep_profile_geometry(
         value.sweep_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
-        value.sweep_entity_transform,
+        profile_transform,
     )?;
     let mut path = embedded_sweep_path(
         value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
-        value.path_entity_transform,
+        path_transform,
     )?;
+    // Flag 295: the stored profile is already placed at the path start and
+    // aligned (base point and alignment applied), so it is swept where it
+    // stands, turned by the profile rotation about the start tangent.
+    if value.flags_294_296[1] {
+        let start = brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
+        let tangent = Vec3::from(brep::sweep_path_tangent(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?);
+        let facing = Vec3::from(plane.normal().ok_or(HistoryRebuildError::InvalidParameters)?).dot(tangent);
+        return Ok(SweepHistoryGeometry {
+            plane,
+            wires,
+            path,
+            path_shift: Vec3::ZERO,
+            options: brep::SweepOptions {
+                align: false,
+                base_point: Some(start),
+                rotation: if facing < 0.0 { -value.align_angle } else { value.align_angle },
+                twist: value.twist_angle,
+                scale: value.scale_factor,
+                bank: value.bank,
+                surface: surface || !closed,
+            },
+        });
+    }
     let explicit_alignment = value.has_align_start || value.align_option != 0;
     let mut path_shift = Vec3::ZERO;
     let reference_point = if explicit_alignment {
@@ -979,7 +1130,8 @@ fn sweep_history_geometry(
         path,
         path_shift,
         options: brep::SweepOptions {
-            align: explicit_alignment && value.align_option != 0,
+            // Option 2 translates the profile to the path without turning it.
+            align: explicit_alignment && value.align_option == 1,
             base_point: Some(reference_point),
             rotation: value.align_angle,
             twist: value.twist_angle,
@@ -1015,9 +1167,10 @@ pub fn sweep_history_placements(
         y_axis: [0.0, 1.0, 0.0],
         z_axis: [0.0, 0.0, 1.0],
     };
+    let (profile_transform, path_transform) = sweep_entity_transforms(value);
     Ok((
-        compose_placements(base, compose_placements(profile, placement(value.sweep_entity_transform)?)),
-        compose_placements(base, compose_placements(path_shift, placement(value.path_entity_transform)?)),
+        compose_placements(base, compose_placements(profile, placement(profile_transform)?)),
+        compose_placements(base, compose_placements(path_shift, placement(path_transform)?)),
     ))
 }
 
@@ -1026,7 +1179,7 @@ pub fn sweep_history_reference_point(value: &SolidHistorySweep) -> Result<[f64; 
     let reference = if value.has_align_start || value.align_option != 0 {
         let path = embedded_sweep_path(
             value.path_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
-            value.path_entity_transform,
+            sweep_entity_transforms(value).1,
         )?;
         brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?
     } else {
@@ -1044,9 +1197,10 @@ pub fn rebuild_sweep_with_mode(
     value: &SolidHistorySweep,
     surface: bool,
 ) -> Result<Body, HistoryRebuildError> {
-    // Nondefault native miter/intersection policies cannot be replaced by
-    // the standard construction without changing the saved object's intent.
-    if value.miter_option != 0 || value.check_intersections {
+    // The reference application builds the same bisector-mitered corner for
+    // every miter option (default, old, new, crimp, bend: 0..=4), on planar
+    // and spatial polyline paths alike. Unknown values stay unsupported.
+    if value.miter_option > 4 {
         return Err(HistoryRebuildError::Unsupported);
     }
     if !value.scale_factor.is_finite()
@@ -1065,6 +1219,9 @@ pub fn rebuild_sweep_with_mode(
         };
     }
     let geometry = sweep_history_geometry(value, surface)?;
+    if let Some(why) = brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options) {
+        return Err(HistoryRebuildError::Refused(why));
+    }
     finish(
         brep::sweep_path(
             geometry.plane,
@@ -1074,6 +1231,13 @@ pub fn rebuild_sweep_with_mode(
         ),
         value.base.transform,
     )
+}
+
+/// Why a sweep record is refused: a twist or scale along a path with a
+/// corner, or banking along a planar one.
+pub fn sweep_history_refusal(value: &SolidHistorySweep) -> Option<brep::SweepRefusal> {
+    let geometry = sweep_history_geometry(value, false).ok()?;
+    brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options)
 }
 
 fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
@@ -1389,16 +1553,17 @@ pub fn rebuild_body(
     operation: &SolidHistoryOperation,
 ) -> Result<Body, HistoryRebuildError> {
     match operation {
+        // Box and wedge history frames sit at the bounding-box centre.
         SolidHistoryOperation::Box(value) => finish(
             brep::make::cuboid(
-                [0.0; 3],
+                [-value.length * 0.5, -value.width * 0.5, -value.height * 0.5],
                 [value.length, value.width, value.height],
             ),
             value.base.transform,
         ),
         SolidHistoryOperation::Wedge(value) => finish(
             brep::make::wedge(
-                [0.0; 3],
+                [-value.length * 0.5, -value.width * 0.5, -value.height * 0.5],
                 value.length,
                 value.width,
                 value.height,
@@ -1496,50 +1661,132 @@ pub fn rebuild_history(
         .ok_or(HistoryRebuildError::InvalidParameters)?;
     let mut body = rebuild_body(first)?;
     for operation in following {
-        let current_edges = body.edge_keys().collect::<Vec<_>>();
-        let selected_edges = |ordinals: &[i32]| {
-            ordinals
-                .iter()
-                .map(|ordinal| {
-                    usize::try_from(*ordinal)
-                        .ok()
-                        .and_then(|ordinal| current_edges.get(ordinal).copied())
-                        .ok_or(HistoryRebuildError::InvalidParameters)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        };
-        let (rebuilt, transform) = match operation {
-            SolidHistoryOperation::Fillet(value) => {
-                let radius = *value
-                    .radii
-                    .first()
-                    .ok_or(HistoryRebuildError::InvalidParameters)?;
-                (
-                    brep::fillet_edges(&body, &selected_edges(&value.edges)?, radius)?,
-                    value.base.transform,
-                )
-            }
-            SolidHistoryOperation::Chamfer(value) => {
-                let faces = body.face_keys().collect::<Vec<_>>();
-                let base_face = usize::try_from(value.base_face)
-                    .ok()
-                    .and_then(|ordinal| faces.get(ordinal).copied())
-                    .ok_or(HistoryRebuildError::InvalidParameters)?;
-                (
-                    brep::chamfer_edges(
-                        &body,
-                        &selected_edges(&value.edges)?,
-                        base_face,
-                        value.base_distance,
-                        value.other_distance,
-                    )?,
-                    value.base.transform,
-                )
-            }
-            _ => return Err(HistoryRebuildError::Unsupported),
-        };
-        body = brep::transform(&rebuilt, &placement(transform)?)
-            .ok_or(HistoryRebuildError::InvalidTransform)?;
+        body = rebuild_step(operation, std::slice::from_ref(&body))?;
     }
     Ok(body)
+}
+
+/// Rebuild a history tree: each step over what its operands rebuild to, so a
+/// boolean step combines both solids it joined.
+pub fn rebuild_history_tree(tree: &SolidHistoryTree) -> Result<Body, HistoryRebuildError> {
+    if tree.operands.is_empty() {
+        return rebuild_body(&tree.operation);
+    }
+    let operands = tree
+        .operands
+        .iter()
+        .map(rebuild_history_tree)
+        .collect::<Result<Vec<_>, _>>()?;
+    rebuild_step(&tree.operation, &operands)
+}
+
+/// One step over the bodies of its operands, placed by the step's own
+/// transform.
+fn rebuild_step(
+    operation: &SolidHistoryOperation,
+    operands: &[Body],
+) -> Result<Body, HistoryRebuildError> {
+    let (rebuilt, transform) = match (operation, operands) {
+        (SolidHistoryOperation::Fillet(value), [body]) => {
+            let current_edges = body.edge_keys().collect::<Vec<_>>();
+            let edges = selected_edges(&current_edges, &value.edges)?;
+            let radius = *value
+                .radii
+                .first()
+                .ok_or(HistoryRebuildError::InvalidParameters)?;
+            (brep::fillet_edges(body, &edges, radius)?, value.base.transform)
+        }
+        (SolidHistoryOperation::Chamfer(value), [body]) => {
+            let current_edges = body.edge_keys().collect::<Vec<_>>();
+            let faces = body.face_keys().collect::<Vec<_>>();
+            let base_face = usize::try_from(value.base_face)
+                .ok()
+                .and_then(|ordinal| faces.get(ordinal).copied())
+                .ok_or(HistoryRebuildError::InvalidParameters)?;
+            (
+                brep::chamfer_edges(
+                    body,
+                    &selected_edges(&current_edges, &value.edges)?,
+                    base_face,
+                    value.base_distance,
+                    value.other_distance,
+                )?,
+                value.base.transform,
+            )
+        }
+        (SolidHistoryOperation::Boolean(value), [first, second]) => {
+            let how = match value.operation {
+                SolidHistoryBoolean::UNION => brep::Operation::Union,
+                SolidHistoryBoolean::INTERSECT => brep::Operation::Intersection,
+                SolidHistoryBoolean::SUBTRACT => brep::Operation::Difference,
+                _ => return Err(HistoryRebuildError::Unsupported),
+            };
+            let tolerance = brep::operation_tolerance(&[first, second]);
+            let combined = brep::combine(first.clone(), second.clone(), how, tolerance)
+                .map_err(|_| HistoryRebuildError::Boolean)?;
+            (combined, value.base.transform)
+        }
+        _ => return Err(HistoryRebuildError::Unsupported),
+    };
+    brep::transform(&rebuilt, &placement(transform)?).ok_or(HistoryRebuildError::InvalidTransform)
+}
+
+fn selected_edges<K: Copy>(edges: &[K], ordinals: &[i32]) -> Result<Vec<K>, HistoryRebuildError> {
+    ordinals
+        .iter()
+        .map(|ordinal| {
+            usize::try_from(*ordinal)
+                .ok()
+                .and_then(|ordinal| edges.get(ordinal).copied())
+                .ok_or(HistoryRebuildError::InvalidParameters)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadcodec::objects::{SolidHistoryBox, SolidHistoryNodeBase};
+
+    fn cube(id: i32, size: [f64; 3]) -> SolidHistoryTree {
+        SolidHistoryTree {
+            operation: SolidHistoryOperation::Box(SolidHistoryBox {
+                base: SolidHistoryNodeBase::new(id),
+                length: size[0],
+                width: size[1],
+                height: size[2],
+                ..SolidHistoryBox::default()
+            }),
+            operands: Vec::new(),
+        }
+    }
+
+    fn volume(body: &Body) -> f64 {
+        let mesh = brep::mesh::body(body, crate::tessellation::DEFAULT_ANGLE, 1e-9);
+        mesh.mass_properties().expect("a closed result").0
+    }
+
+    #[test]
+    fn a_boolean_step_rebuilds_from_both_operands() {
+        let mut tree = SolidHistoryTree {
+            operation: SolidHistoryOperation::Boolean(SolidHistoryBoolean {
+                base: SolidHistoryNodeBase::new(3),
+                operation: SolidHistoryBoolean::SUBTRACT,
+                first_operand: 1,
+                second_operand: 2,
+                ..SolidHistoryBoolean::default()
+            }),
+            operands: vec![cube(1, [4.0, 4.0, 4.0]), cube(2, [2.0, 2.0, 8.0])],
+        };
+        let body = rebuild_history_tree(&tree).expect("a box with a square hole");
+        assert!((volume(&body) - 48.0).abs() < 1e-6, "{}", volume(&body));
+
+        // Editing the tool reshapes the composite.
+        let SolidHistoryOperation::Box(tool) = &mut tree.find_mut(2).unwrap().operation else {
+            unreachable!();
+        };
+        tool.length = 1.0;
+        let body = rebuild_history_tree(&tree).expect("a box with a narrower hole");
+        assert!((volume(&body) - 56.0).abs() < 1e-6, "{}", volume(&body));
+    }
 }
