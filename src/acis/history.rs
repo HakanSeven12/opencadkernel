@@ -847,6 +847,33 @@ impl HistorySweepPath {
         }
     }
 
+    fn end(&self) -> Option<[f64; 3]> {
+        match self {
+            Self::Planar { plane, curves, .. } => {
+                let reversed = brep::reversed_path_curves(curves)?;
+                Some(plane.point_at(reversed.first()?.point_at(0.0)))
+            }
+            Self::Polyline3d { points, closed } => if *closed { points.first().copied() } else { points.last().copied() },
+            Self::Nurbs3(curve) => Some(curve.point_at(1.0)),
+        }
+    }
+
+    /// The same path traversed from its other end.
+    fn reversed(self) -> Option<Self> {
+        Some(match self {
+            Self::Planar { plane, curves, .. } => {
+                let curves = brep::reversed_path_curves(&curves)?;
+                let start = plane.point_at(curves.first()?.point_at(0.0));
+                Self::Planar { plane, curves, start }
+            }
+            Self::Polyline3d { mut points, closed } => {
+                points.reverse();
+                Self::Polyline3d { points, closed }
+            }
+            Self::Nurbs3(curve) => Self::Nurbs3(curve.reversed()?),
+        })
+    }
+
     fn translated(mut self, shift: Vec3) -> Result<Self, HistoryRebuildError> {
         match &mut self {
             Self::Planar { plane, start, .. } => {
@@ -1087,6 +1114,14 @@ fn sweep_history_geometry(
     // aligned (base point and alignment applied), so it is swept where it
     // stands, turned by the profile rotation about the start tangent.
     if value.flags_294_296[1] {
+        // The placed profile stands at the path end the sweep starts from;
+        // an open path is traversed from that end.
+        let placed = Vec3::from(placement(path_transform)?.origin);
+        if let (Some(start), Some(end)) = (path.start(), path.end()) {
+            if Vec3::from(end).distance(placed) + 1e-9 < Vec3::from(start).distance(placed) {
+                path = path.reversed().ok_or(HistoryRebuildError::InvalidParameters)?;
+            }
+        }
         let start = brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
         let tangent = Vec3::from(brep::sweep_path_tangent(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?);
         let facing = Vec3::from(plane.normal().ok_or(HistoryRebuildError::InvalidParameters)?).dot(tangent);

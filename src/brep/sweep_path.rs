@@ -353,6 +353,11 @@ pub fn sweep_path(
             _ => None,
         };
         if let Some(body) = analytic {
+            // Quarter faces of a round profile share one surface: join them.
+            let mut joined = body.clone();
+            if analytic_ruled_faces(&mut joined).is_some() && joined.validate().is_empty() {
+                return Some(joined);
+            }
             return Some(body);
         }
     }
@@ -379,19 +384,25 @@ pub fn sweep_path(
             return Some(body);
         }
     }
-    let patches = transported_patches(&pieces, first, options,
+    let (patches, runs) = transported_runs(&pieces, first, options,
         extent, radius, closed)?;
     // A sheet need not sweep out any volume (for example an in-plane line
     // translated sideways), so only solid sections use the volume check.
     let outward = if sheet { up >= 0.0 } else { regular_transport(&wires, &patches)? };
-    let body = build_body(&wires, &patches, sheet, closed, outward)?;
     if options.twist.abs() <= 1e-12 && (options.scale - 1.0).abs() <= 1e-12 {
-        let mut exact = body.clone();
-        if analytic_ruled_faces(&mut exact).is_some() && exact.validate().is_empty() {
+        let mut exact = build_body(&wires, &patches, sheet, closed, outward)?;
+        let all_analytic = |body: &Body| body.faces.iter().all(|(_, face)|
+            !matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_))));
+        if analytic_ruled_faces(&mut exact).is_some() && exact.validate().is_empty() && all_analytic(&exact) {
             return Some(exact);
         }
     }
-    Some(body)
+    // One face per profile curve and path run, as the reference builds it.
+    let joined = build_body_in_runs(&wires, &patches, &runs, sheet, closed, outward, true)?;
+    // A run face too large to triangulate falls back to one face per patch.
+    // ponytail: probe meshing at display settings; replace with a cheaper size bound if this shows up in profiles.
+    let meshes = joined.face_keys().all(|face| super::mesh::face(&joined, face, 0.05, 1e-5).is_some());
+    if meshes { Some(joined) } else { build_body(&wires, &patches, sheet, closed, outward) }
 }
 
 /// Faces swept along straight and circular runs without twist or scaling
@@ -1622,6 +1633,20 @@ struct Wire {
     closed: bool,
 }
 
+/// A planar path's curves traversed the other way, in chain order.
+pub(crate) fn reversed_path_curves(curves: &[Curve]) -> Option<Vec<Curve>> {
+    let curves = expanded(curves)?;
+    let senses = chain_senses(&curves)?;
+    curves.iter().zip(senses).rev().map(|(curve, forward)| {
+        let mut rational = RationalCurve2::from_curve(curve)?;
+        // Path pieces are evaluated over [0, 1].
+        let (low, high) = (*rational.knots.first()?, *rational.knots.last()?);
+        rational.knots = rational.knots.iter().map(|k| (k - low) / (high - low)).collect();
+        let rational = if forward { rational.reversed() } else { rational };
+        Some(Curve::Nurbs(NurbsCurve::new_strict(rational.degree, rational.points, rational.knots, rational.weights)?))
+    }).collect()
+}
+
 fn expanded(curves: &[Curve]) -> Option<Vec<Curve>> {
     let mut result = Vec::new();
     for curve in curves {
@@ -1952,6 +1977,14 @@ fn transported_patches(
     pieces: &[Piece], first: Frame, options: SweepOptions,
     total: f64, radius: f64, closed: bool,
 ) -> Option<Vec<Patch>> {
+    Some(transported_runs(pieces, first, options, total, radius, closed)?.0)
+}
+
+/// The transported patches and how many of them each path piece has.
+fn transported_runs(
+    pieces: &[Piece], first: Frame, options: SweepOptions,
+    total: f64, radius: f64, closed: bool,
+) -> Option<(Vec<Patch>, Vec<usize>)> {
     let mut frame = first;
     let mut previous_point = pieces[0].point(0.0);
     let mut previous_tangent = pieces[0].tangent(0.0)?;
@@ -1980,6 +2013,7 @@ fn transported_patches(
         axis.dot(a.cross(b)).atan2(a.dot(b))
     } else { 0.0 };
     let mut patches = Vec::new();
+    let mut runs = Vec::new();
     let mut travelled = 0.0;
     for (index, piece) in pieces.iter().enumerate() {
         let length = piece.length();
@@ -2027,6 +2061,7 @@ fn transported_patches(
             }
         }
         travelled += length;
+        runs.push(patches.len() - runs.iter().sum::<usize>());
     }
     // Shared topology requires exactly the same section on both sides of a
     // path corner. Minimal transport plus the bisector cut gives that map;
@@ -2040,7 +2075,11 @@ fn transported_patches(
         if frame_error(patches.last()?[3], start, radius) > total.max(radius) * 1e-6 { return None; }
         patches.last_mut()?[3] = start;
     }
-    Some(patches)
+    // The knot spans of one spline are a single run.
+    if pieces.iter().all(|piece| matches!(piece, Piece::Spline(..))) {
+        runs = vec![patches.len()];
+    }
+    Some((patches, runs))
 }
 
 fn divide_path(piece: &Piece, a: f64, b: f64, depth: usize, result: &mut Vec<f64>) -> Option<()> {
@@ -2158,7 +2197,92 @@ fn fit_patch(
 }
 
 fn build_body(wires: &[Wire], patches: &[Patch], sheet: bool, closed_path: bool, outward: bool) -> Option<Body> {
-    if patches.is_empty() { return None; }
+    build_body_in_runs(wires, patches, &vec![1; patches.len()], sheet, closed_path, outward, false)
+}
+
+/// A whole round wire as one closed rational curve (C0 where its arcs
+/// meet), so the swept side is a single face, as the reference builds a
+/// twisted or scaled round sweep.
+fn merged_round(wire: &Wire) -> Option<Wire> {
+    profile_circle(&wire.source)?;
+    if !wire.closed || wire.curves.len() < 2 { return None; }
+    let degree = wire.curves[0].degree;
+    let count = wire.curves.len() as f64;
+    let mut merged = RationalCurve2 { degree, knots: Vec::new(), points: Vec::new(), weights: Vec::new() };
+    for (index, curve) in wire.curves.iter().enumerate() {
+        if curve.degree != degree { return None; }
+        let (low, high) = (*curve.knots.first()?, *curve.knots.last()?);
+        let map = |k: f64| (index as f64 + (k - low) / (high - low)) / count;
+        if index == 0 {
+            merged.points.extend_from_slice(&curve.points);
+            merged.weights.extend_from_slice(&curve.weights);
+            merged.knots.extend(curve.knots[..curve.knots.len() - 1].iter().map(|k| map(*k)));
+        } else {
+            let scale = merged.weights.last()? / curve.weights.first()?;
+            merged.points.extend_from_slice(&curve.points[1..]);
+            merged.weights.extend(curve.weights[1..].iter().map(|w| w * scale));
+            merged.knots.extend(curve.knots[degree + 1..curve.knots.len() - 1].iter().map(|k| map(*k)));
+        }
+        if index + 1 == wire.curves.len() {
+            merged.knots.push(1.0);
+        }
+    }
+    Some(Wire { source: wire.source.clone(), curves: vec![merged], closed: true })
+}
+
+/// The patches of one run joined into a single rational cubic B-spline in
+/// the path direction (C0 at the patch joins), so each profile curve gives
+/// one face per path run, as the reference modeler builds a twisted or
+/// scaled sweep. Weights are rescaled so neighbouring patches agree at the
+/// shared frame.
+fn joined_run(patches: &[Patch]) -> (Vec<Frame>, Vec<f64>, Vec<f64>) {
+    // Fitted (polynomial) patches only meet with matching positions, so a
+    // face made of them would carry creases. Pass one smooth C2 cubic through
+    // frames sampled along them instead; rational exact turns stay joined.
+    if patches.len() > 1 && patches.iter().all(|patch| patch.weights.iter().all(|w| (*w - 1.0).abs() <= 1e-12)) {
+        // At most 96 spans: dense enough for a C2 fit of a smooth transport,
+        // small enough for a single face to stay cheap to evaluate.
+        let count = (patches.len() * 3).min(96);
+        let stations = (0..=count).map(|k| {
+            let at = k as f64 * patches.len() as f64 / count as f64;
+            let index = (at.floor() as usize).min(patches.len() - 1);
+            bezier(&patches[index], at - index as f64)
+        }).collect::<Vec<_>>();
+        let flat = |f: Frame| [f.origin.x, f.origin.y, f.origin.z, f.x.x, f.x.y, f.x.z, f.y.x, f.y.y, f.y.z];
+        let points = stations.iter().map(|frame| flat(*frame)).collect::<Vec<_>>();
+        if let Some((controls, knots)) = crate::space::spline::interpolate_open(&points, None, None, crate::space::Parameterization::Uniform) {
+            let (low, high) = (knots[0], knots[knots.len() - 1]);
+            let frames = controls.iter().map(|c| Frame { origin: Vec3::new(c[0], c[1], c[2]), x: Vec3::new(c[3], c[4], c[5]), y: Vec3::new(c[6], c[7], c[8]) }).collect::<Vec<_>>();
+            let weights = vec![1.0; frames.len()];
+            return (frames, weights, knots.iter().map(|k| (k - low) / (high - low)).collect());
+        }
+    }
+    let mut frames = vec![patches[0][0]];
+    let mut weights = vec![patches[0].weights[0]];
+    let mut knots = vec![0.0; 4];
+    for (index, patch) in patches.iter().enumerate() {
+        let scale = weights.last().copied().unwrap_or(1.0) / patch.weights[0];
+        for k in 1..4 {
+            frames.push(patch[k]);
+            weights.push(patch.weights[k] * scale);
+        }
+        let end = (index + 1) as f64 / patches.len() as f64;
+        knots.extend(std::iter::repeat_n(end, if index + 1 == patches.len() { 4 } else { 3 }));
+    }
+    (frames, weights, knots)
+}
+
+fn build_body_in_runs(wires: &[Wire], patches: &[Patch], runs: &[usize], sheet: bool, closed_path: bool, outward: bool, round: bool) -> Option<Body> {
+    let merged = wires.iter().map(|wire| round.then(|| merged_round(wire)).flatten()).collect::<Vec<_>>();
+    let wires = &wires.iter().zip(merged).map(|(wire, merged)| merged.unwrap_or_else(|| Wire {
+        source: wire.source.clone(), curves: wire.curves.clone(), closed: wire.closed })).collect::<Vec<_>>();
+    if patches.is_empty() || runs.iter().sum::<usize>() != patches.len() || runs.contains(&0) { return None; }
+    let mut groups = Vec::new();
+    let mut at = 0;
+    for count in runs {
+        groups.push(&patches[at..at + count]);
+        at += count;
+    }
     let mut body = Body::new();
     let lump = body.lumps.insert(Lump { shells: Vec::new(), provenance: Provenance::Synthesized });
     let shell = body.shells.insert(Shell { faces: Vec::new(), owner: lump, provenance: Provenance::Synthesized });
@@ -2168,13 +2292,13 @@ fn build_body(wires: &[Wire], patches: &[Patch], sheet: bool, closed_path: bool,
         if !wire.closed { coords.push(rational_point(wire.curves.last()?, 1.0)?); }
         let mut vertices: Vec<Vec<VertexKey>> = Vec::new();
         let mut rims: Vec<Vec<EdgeKey>> = Vec::new();
-        for station in 0..=patches.len() {
-            if closed_path && station == patches.len() {
+        for station in 0..=groups.len() {
+            if closed_path && station == groups.len() {
                 vertices.push(vertices[0].clone());
                 rims.push(rims[0].clone());
                 continue;
             }
-            let frame = if station == 0 { patches[0][0] } else { patches[station - 1][3] };
+            let frame = if station == 0 { patches[0][0] } else { groups[station - 1].last()?[3] };
             let ring = coords.iter().map(|p| body.vertices.insert(Vertex {
                 point: frame.point(*p).to_array(), provenance: Provenance::Synthesized,
             })).collect::<Vec<_>>();
@@ -2185,27 +2309,30 @@ fn build_body(wires: &[Wire], patches: &[Patch], sheet: bool, closed_path: bool,
             vertices.push(ring);
             rims.push(edges);
         }
-        for (band, patch) in patches.iter().enumerate() {
+        for (band, group) in groups.iter().enumerate() {
+            let (frames, along, knots) = joined_run(group);
+            // Knots run over [0, 1], so knot and normalized parameters agree.
+            let span = 1.0;
             let rails = coords.iter().enumerate().map(|(index, point)| {
-                let curve = RationalCurve3 { degree: 3, knots: cubic_knots(),
-                    points: patch.frames.iter().map(|frame| frame.point(*point).to_array()).collect(),
-                    weights: patch.weights.to_vec() };
+                let curve = RationalCurve3 { degree: 3, knots: knots.clone(),
+                    points: frames.iter().map(|frame| frame.point(*point).to_array()).collect(),
+                    weights: along.clone() };
                 add_curve_edge(&mut body, &curve, vertices[band][index], vertices[band + 1][index])
             }).collect::<Option<Vec<_>>>()?;
             for (index, curve) in wire.curves.iter().enumerate() {
                 let next = (index + 1) % coords.len();
                 let points = curve.points.iter().map(|point|
-                    patch.frames.iter().map(|frame| frame.point(*point).to_array()).collect()).collect();
+                    frames.iter().map(|frame| frame.point(*point).to_array()).collect()).collect();
                 let weights = curve.weights.iter()
-                    .map(|weight| patch.weights.iter().map(|along| weight * along).collect())
+                    .map(|weight| along.iter().map(|along| weight * along).collect())
                     .collect();
                 let surface = NurbsSurface3::new_strict(curve.degree, 3, points,
-                    curve.knots.clone(), cubic_knots(), weights)?;
+                    curve.knots.clone(), knots.clone(), weights)?;
                 let surface = body.surfaces.insert(Surface::Nurbs(surface));
                 let mut circuit = vec![(rims[band][index], true), (rails[next], true),
                     (rims[band + 1][index], false), (rails[index], false)];
-                let mut pcurves = vec![([0.0, 0.0], [1.0, 0.0]), ([1.0, 0.0], [1.0, 1.0]),
-                    ([1.0, 1.0], [0.0, 1.0]), ([0.0, 1.0], [0.0, 0.0])];
+                let mut pcurves = vec![([0.0, 0.0], [1.0, 0.0]), ([1.0, 0.0], [1.0, span]),
+                    ([1.0, span], [0.0, span]), ([0.0, span], [0.0, 0.0])];
                 if !outward {
                     circuit = circuit.into_iter().rev().map(|(edge, forward)| (edge, !forward)).collect();
                     pcurves = pcurves.into_iter().rev().map(|(a, b)| (b, a)).collect();
@@ -2222,18 +2349,13 @@ fn build_body(wires: &[Wire], patches: &[Patch], sheet: bool, closed_path: bool,
             let surface = body.surfaces.insert(Surface::Plane(frame.plane()));
             let forward = if end { outward } else { !outward };
             let face = add_face(&mut body, shell, surface, forward);
-            for (wire, (start_edges, end_edges)) in wires.iter().zip(&cap_rims) {
+            for (start_edges, end_edges) in &cap_rims {
                 let edges = if end { end_edges } else { start_edges };
                 let mut circuit = edges.iter().map(|edge| (*edge, true)).collect::<Vec<_>>();
                 if !forward { circuit = circuit.into_iter().rev().map(|(edge, _)| (edge, false)).collect(); }
-                let ring = add_loop(&mut body, face, &circuit, None)?;
-                let curves = if forward { wire.curves.clone() } else {
-                    wire.curves.iter().rev().map(RationalCurve2::reversed).collect()
-                };
-                for (coedge, curve) in body.loops.get(ring)?.coedges.clone().into_iter().zip(curves) {
-                    body.coedges.get_mut(coedge)?.pcurve = Some(Curve::Nurbs(NurbsCurve::new_strict(
-                        curve.degree, curve.points, curve.knots, curve.weights)?));
-                }
+                // Like extrusion caps, the planar caps carry no pcurves: the
+                // reference modeler rejects these solids with them.
+                add_loop(&mut body, face, &circuit, None)?;
             }
         }
     }
@@ -2249,11 +2371,11 @@ fn rational_point(curve: &RationalCurve2, parameter: f64) -> Option<[f64; 2]> {
         curve.weights.clone())?.point_at(parameter))
 }
 
-fn cubic_knots() -> Vec<f64> { vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0] }
 
 fn add_curve_edge(body: &mut Body, source: &RationalCurve3, start: VertexKey, end: VertexKey) -> Option<EdgeKey> {
     let curve = body.curves.insert(Curve3::Nurbs(source.curve()?));
-    Some(body.edges.insert(Edge { curve, start_parameter: 0.0, end_parameter: 1.0, start, end,
+    let (start_parameter, end_parameter) = (*source.knots.first()?, *source.knots.last()?);
+    Some(body.edges.insert(Edge { curve, start_parameter, end_parameter, start, end,
         coedges: Vec::new(), provenance: Provenance::Synthesized }))
 }
 
