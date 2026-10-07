@@ -1,6 +1,7 @@
 use opencadcodec::entities::EmbeddedEntity;
 use opencadcodec::objects::{
-    SolidHistoryLoft, SolidHistoryOperation, SolidHistoryRevolve, SolidHistorySweep,
+    SolidHistoryBoolean, SolidHistoryLoft, SolidHistoryOperation, SolidHistoryRevolve,
+    SolidHistorySweep, SolidHistoryTree,
 };
 use opencadcodec::types::{Matrix3, Vector3};
 
@@ -21,6 +22,8 @@ pub enum HistoryRebuildError {
     Chamfer(brep::ChamferError),
     /// A sweep the record asks for that a cornered path refuses.
     Refused(brep::SweepRefusal),
+    /// The two solids a boolean step joins could not be combined.
+    Boolean,
 }
 
 impl std::fmt::Display for HistoryRebuildError {
@@ -33,6 +36,7 @@ impl std::fmt::Display for HistoryRebuildError {
             Self::Fillet(error) => write!(formatter, "solid history fillet failed: {error}"),
             Self::Chamfer(error) => write!(formatter, "solid history chamfer failed: {error}"),
             Self::Refused(why) => write!(formatter, "sweep refused: {why:?} along a path with a corner"),
+            Self::Boolean => formatter.write_str("solid history boolean failed"),
         }
     }
 }
@@ -1748,50 +1752,132 @@ pub fn rebuild_history(
         .ok_or(HistoryRebuildError::InvalidParameters)?;
     let mut body = rebuild_body(first)?;
     for operation in following {
-        let current_edges = body.edge_keys().collect::<Vec<_>>();
-        let selected_edges = |ordinals: &[i32]| {
-            ordinals
-                .iter()
-                .map(|ordinal| {
-                    usize::try_from(*ordinal)
-                        .ok()
-                        .and_then(|ordinal| current_edges.get(ordinal).copied())
-                        .ok_or(HistoryRebuildError::InvalidParameters)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        };
-        let (rebuilt, transform) = match operation {
-            SolidHistoryOperation::Fillet(value) => {
-                let radius = *value
-                    .radii
-                    .first()
-                    .ok_or(HistoryRebuildError::InvalidParameters)?;
-                (
-                    brep::fillet_edges(&body, &selected_edges(&value.edges)?, radius)?,
-                    value.base.transform,
-                )
-            }
-            SolidHistoryOperation::Chamfer(value) => {
-                let faces = body.face_keys().collect::<Vec<_>>();
-                let base_face = usize::try_from(value.base_face)
-                    .ok()
-                    .and_then(|ordinal| faces.get(ordinal).copied())
-                    .ok_or(HistoryRebuildError::InvalidParameters)?;
-                (
-                    brep::chamfer_edges(
-                        &body,
-                        &selected_edges(&value.edges)?,
-                        base_face,
-                        value.base_distance,
-                        value.other_distance,
-                    )?,
-                    value.base.transform,
-                )
-            }
-            _ => return Err(HistoryRebuildError::Unsupported),
-        };
-        body = brep::transform(&rebuilt, &placement(transform)?)
-            .ok_or(HistoryRebuildError::InvalidTransform)?;
+        body = rebuild_step(operation, std::slice::from_ref(&body))?;
     }
     Ok(body)
+}
+
+/// Rebuild a history tree: each step over what its operands rebuild to, so a
+/// boolean step combines both solids it joined.
+pub fn rebuild_history_tree(tree: &SolidHistoryTree) -> Result<Body, HistoryRebuildError> {
+    if tree.operands.is_empty() {
+        return rebuild_body(&tree.operation);
+    }
+    let operands = tree
+        .operands
+        .iter()
+        .map(rebuild_history_tree)
+        .collect::<Result<Vec<_>, _>>()?;
+    rebuild_step(&tree.operation, &operands)
+}
+
+/// One step over the bodies of its operands, placed by the step's own
+/// transform.
+fn rebuild_step(
+    operation: &SolidHistoryOperation,
+    operands: &[Body],
+) -> Result<Body, HistoryRebuildError> {
+    let (rebuilt, transform) = match (operation, operands) {
+        (SolidHistoryOperation::Fillet(value), [body]) => {
+            let current_edges = body.edge_keys().collect::<Vec<_>>();
+            let edges = selected_edges(&current_edges, &value.edges)?;
+            let radius = *value
+                .radii
+                .first()
+                .ok_or(HistoryRebuildError::InvalidParameters)?;
+            (brep::fillet_edges(body, &edges, radius)?, value.base.transform)
+        }
+        (SolidHistoryOperation::Chamfer(value), [body]) => {
+            let current_edges = body.edge_keys().collect::<Vec<_>>();
+            let faces = body.face_keys().collect::<Vec<_>>();
+            let base_face = usize::try_from(value.base_face)
+                .ok()
+                .and_then(|ordinal| faces.get(ordinal).copied())
+                .ok_or(HistoryRebuildError::InvalidParameters)?;
+            (
+                brep::chamfer_edges(
+                    body,
+                    &selected_edges(&current_edges, &value.edges)?,
+                    base_face,
+                    value.base_distance,
+                    value.other_distance,
+                )?,
+                value.base.transform,
+            )
+        }
+        (SolidHistoryOperation::Boolean(value), [first, second]) => {
+            let how = match value.operation {
+                SolidHistoryBoolean::UNION => brep::Operation::Union,
+                SolidHistoryBoolean::INTERSECT => brep::Operation::Intersection,
+                SolidHistoryBoolean::SUBTRACT => brep::Operation::Difference,
+                _ => return Err(HistoryRebuildError::Unsupported),
+            };
+            let tolerance = brep::operation_tolerance(&[first, second]);
+            let combined = brep::combine(first.clone(), second.clone(), how, tolerance)
+                .map_err(|_| HistoryRebuildError::Boolean)?;
+            (combined, value.base.transform)
+        }
+        _ => return Err(HistoryRebuildError::Unsupported),
+    };
+    brep::transform(&rebuilt, &placement(transform)?).ok_or(HistoryRebuildError::InvalidTransform)
+}
+
+fn selected_edges<K: Copy>(edges: &[K], ordinals: &[i32]) -> Result<Vec<K>, HistoryRebuildError> {
+    ordinals
+        .iter()
+        .map(|ordinal| {
+            usize::try_from(*ordinal)
+                .ok()
+                .and_then(|ordinal| edges.get(ordinal).copied())
+                .ok_or(HistoryRebuildError::InvalidParameters)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opencadcodec::objects::{SolidHistoryBox, SolidHistoryNodeBase};
+
+    fn cube(id: i32, size: [f64; 3]) -> SolidHistoryTree {
+        SolidHistoryTree {
+            operation: SolidHistoryOperation::Box(SolidHistoryBox {
+                base: SolidHistoryNodeBase::new(id),
+                length: size[0],
+                width: size[1],
+                height: size[2],
+                ..SolidHistoryBox::default()
+            }),
+            operands: Vec::new(),
+        }
+    }
+
+    fn volume(body: &Body) -> f64 {
+        let mesh = brep::mesh::body(body, crate::tessellation::DEFAULT_ANGLE, 1e-9);
+        mesh.mass_properties().expect("a closed result").0
+    }
+
+    #[test]
+    fn a_boolean_step_rebuilds_from_both_operands() {
+        let mut tree = SolidHistoryTree {
+            operation: SolidHistoryOperation::Boolean(SolidHistoryBoolean {
+                base: SolidHistoryNodeBase::new(3),
+                operation: SolidHistoryBoolean::SUBTRACT,
+                first_operand: 1,
+                second_operand: 2,
+                ..SolidHistoryBoolean::default()
+            }),
+            operands: vec![cube(1, [4.0, 4.0, 4.0]), cube(2, [2.0, 2.0, 8.0])],
+        };
+        let body = rebuild_history_tree(&tree).expect("a box with a square hole");
+        assert!((volume(&body) - 48.0).abs() < 1e-6, "{}", volume(&body));
+
+        // Editing the tool reshapes the composite.
+        let SolidHistoryOperation::Box(tool) = &mut tree.find_mut(2).unwrap().operation else {
+            unreachable!();
+        };
+        tool.length = 1.0;
+        let body = rebuild_history_tree(&tree).expect("a box with a narrower hole");
+        assert!((volume(&body) - 56.0).abs() < 1e-6, "{}", volume(&body));
+    }
 }
