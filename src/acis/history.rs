@@ -1315,7 +1315,8 @@ fn rebuild_spatial_sweep(value: &SolidHistorySweep) -> Option<Result<Body, Histo
     };
     let options = brep::SweepOptions {
         align: value.align_option == 1,
-        base_point: value.has_align_start
+        // Group 294: a base point the user picked.
+        base_point: value.flags_294_296[0]
             .then_some([value.reference_point.x, value.reference_point.y, value.reference_point.z]),
         rotation: value.align_angle,
         twist: value.twist_angle,
