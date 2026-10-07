@@ -84,6 +84,11 @@ pub fn characteristic_points(curve: &Curve) -> Vec<SnapPoint> {
                 ));
                 if let Curve::Arc(arc) = segment {
                     out.push(SnapPoint::new(SnapKind::Centre, arc.centre, 0.0));
+                    // An arc segment has the quadrants its sweep covers, as
+                    // an arc does.
+                    let arc_quadrants =
+                        quadrants(segment, arc.centre, Some((arc.start_angle, arc.end_angle)));
+                    out.extend(arc_quadrants.into_iter().map(|q| SnapPoint { t: span(q.t), ..q }));
                 }
             }
             if !polyline.closed {
@@ -337,6 +342,25 @@ mod tests {
         assert!(ends.iter().any(|p| near(*p, [0.0, 0.0])));
         assert!(ends.iter().any(|p| near(*p, [10.0, 4.0])));
         assert!(near(of_kind(&points, SnapKind::Midpoint)[0], [5.0, 2.0]));
+    }
+
+    #[test]
+    fn a_polyline_arc_segment_offers_its_centre_and_quadrants() {
+        use crate::geom2d::{Polyline, PolylineVertex};
+        // A straight run, then a half turn bulging below the chord.
+        let chain = Curve::Polyline(Polyline {
+            vertices: vec![
+                PolylineVertex { position: [-2.0, 0.0], bulge: 0.0 },
+                PolylineVertex { position: [0.0, 0.0], bulge: 1.0 },
+                PolylineVertex { position: [2.0, 0.0], bulge: 0.0 },
+            ],
+            closed: false,
+        });
+        let points = characteristic_points(&chain);
+        assert!(near(of_kind(&points, SnapKind::Centre)[0], [1.0, 0.0]));
+        let quadrants = of_kind(&points, SnapKind::Quadrant);
+        assert!(quadrants.iter().any(|p| near(*p, [1.0, -1.0])), "{quadrants:?}");
+        assert!(!quadrants.iter().any(|p| near(*p, [1.0, 1.0])), "{quadrants:?}");
     }
 
     #[test]
