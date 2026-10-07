@@ -269,6 +269,90 @@ pub fn sweep_path(
     profile_plane: Plane,
     wires: &[Vec<Curve>],
     path: SweepPath<'_>,
+    options: SweepOptions,
+) -> Option<Body> {
+    sweep_path_lifted(profile_plane, wires, None, path, options)
+}
+
+/// Whether a sweep path has a corner (including a closed path's closing
+/// corner).
+pub fn sweep_path_has_corner(path: SweepPath<'_>) -> Option<bool> {
+    let pieces = path_pieces(path)?;
+    let start = pieces.first()?.point(0.0);
+    let end = pieces.last()?.point(1.0);
+    let extent = pieces.iter().map(|piece| piece.length()).sum::<f64>();
+    let closed = start.distance(end) <= extent.max(1.0) * 1e-9;
+    let joints = pieces.windows(2).map(|pair| (&pair[0], &pair[1]))
+        .chain(closed.then(|| (pieces.last().unwrap(), &pieces[0])));
+    let mut cornered = false;
+    for (before, after) in joints {
+        cornered |= is_corner(before.tangent(1.0)?, after.tangent(0.0)?);
+    }
+    Some(cornered)
+}
+
+/// The anchor of a spatial polyline profile: the mean of twenty equally
+/// spaced samples along it (by 3D length, both ends included), the same
+/// rule as for planar profiles.
+pub fn sweep_polyline_base(points: &[[f64; 3]], closed: bool) -> Option<[f64; 3]> {
+    let mut chain = points.iter().map(|p| Vec3::from(*p)).collect::<Vec<_>>();
+    if closed { chain.push(*chain.first()?); }
+    let lengths = chain.windows(2).map(|pair| pair[0].distance(pair[1])).collect::<Vec<_>>();
+    let total = lengths.iter().sum::<f64>();
+    if chain.len() < 2 || !total.is_finite() || total <= 1e-14 { return None; }
+    let mut sum = Vec3::ZERO;
+    for sample in 0..20 {
+        let mut distance = total * sample as f64 / 19.0;
+        let mut index = 0;
+        while index + 1 < lengths.len() && distance > lengths[index] {
+            distance -= lengths[index];
+            index += 1;
+        }
+        let t = if lengths[index] > 0.0 { (distance / lengths[index]).clamp(0.0, 1.0) } else { 0.0 };
+        sum = sum + chain[index] + (chain[index + 1] - chain[index]) * t;
+    }
+    Some((sum * (1.0 / 20.0)).to_array())
+}
+
+/// Sweeps a spatial (non-planar) polyline profile as a surface, as the
+/// reference modeler does: the profile is kept in the XY plane through its
+/// anchor, and the height of each point above that plane is carried along
+/// the path tangent (scaled and twisted with the section). A profile whose
+/// plan view has a zero-length side cannot be swept.
+pub fn sweep_spatial_polyline(points: &[[f64; 3]], closed: bool, path: SweepPath<'_>, mut options: SweepOptions) -> Option<Body> {
+    if points.len() < 2 { return None; }
+    let count = points.len();
+    // A path that starts on the profile sweeps it where it stands.
+    let start = Vec3::from(sweep_path_start(path)?);
+    let size = points.iter().map(|p| Vec3::from(*p).distance(start)).fold(1.0_f64, f64::max);
+    let on_profile = (0..if closed { count } else { count - 1 }).any(|index| {
+        let (a, b) = (Vec3::from(points[index]), Vec3::from(points[(index + 1) % count]));
+        let along = b - a;
+        let t = ((start - a).dot(along) / along.dot(along).max(1e-300)).clamp(0.0, 1.0);
+        (a + along * t).distance(start) <= size * 1e-9
+    });
+    let base = options.base_point
+        .or_else(|| on_profile.then_some(start.to_array()))
+        .or_else(|| sweep_polyline_base(points, closed))?;
+    let plane = Plane::from_axes([0.0, 0.0, base[2]], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+    let segments = if closed { count } else { count - 1 };
+    let mut wire = Vec::with_capacity(segments);
+    for index in 0..segments {
+        let (a, b) = (points[index], points[(index + 1) % count]);
+        if (b[0] - a[0]).hypot(b[1] - a[1]) <= 1e-9 * a[0].abs().max(a[1].abs()).max(1.0) { return None; }
+        wire.push(Curve::Line(Line { start: [a[0], a[1]], end: [b[0], b[1]] }));
+    }
+    let heights = points.iter().map(|p| p[2] - base[2]).collect::<Vec<_>>();
+    options.base_point = Some(base);
+    options.surface = true;
+    sweep_path_lifted(plane, &[wire], Some(&heights), path, options)
+}
+
+fn sweep_path_lifted(
+    profile_plane: Plane,
+    wires: &[Vec<Curve>],
+    lift: Option<&[f64]>,
+    path: SweepPath<'_>,
     mut options: SweepOptions,
 ) -> Option<Body> {
     if !options.rotation.is_finite() || !options.twist.is_finite()
@@ -316,6 +400,13 @@ pub fn sweep_path(
     let up = aligned_normal.dot(tangent);
     if !sheet && up.abs() <= 1e-8 {
         return None;
+    }
+    if lift.is_some() {
+        let radius = wires.iter().flat_map(|wire| &wire.curves).flat_map(|curve| &curve.points)
+            .map(|p| Vec3::from(profile_plane.point_at(*p)).distance(base))
+            .fold(1.0_f64, f64::max) * options.scale.max(1.0);
+        let (patches, runs) = transported_runs(&pieces, first, options, extent, radius, closed)?;
+        return build_body_in_runs(&wires, &patches, &runs, true, closed, true, false, lift);
     }
     if up.abs() > 1.0 - 1e-10 && rotationally_invariant(&source_wires) {
         // Turning a complete concentric circle changes its seam parameter,
@@ -398,7 +489,7 @@ pub fn sweep_path(
         }
     }
     // One face per profile curve and path run, as the reference builds it.
-    let joined = build_body_in_runs(&wires, &patches, &runs, sheet, closed, outward, true)?;
+    let joined = build_body_in_runs(&wires, &patches, &runs, sheet, closed, outward, true, None)?;
     // A run face too large to triangulate falls back to one face per patch.
     // ponytail: probe meshing at display settings; replace with a cheaper size bound if this shows up in profiles.
     let meshes = joined.face_keys().all(|face| super::mesh::face(&joined, face, 0.05, 1e-5).is_some());
@@ -2197,7 +2288,17 @@ fn fit_patch(
 }
 
 fn build_body(wires: &[Wire], patches: &[Patch], sheet: bool, closed_path: bool, outward: bool) -> Option<Body> {
-    build_body_in_runs(wires, patches, &vec![1; patches.len()], sheet, closed_path, outward, false)
+    build_body_in_runs(wires, patches, &vec![1; patches.len()], sheet, closed_path, outward, false, None)
+}
+
+/// A profile point placed on a section frame, lifted along the section
+/// normal (scaled with the section) by its height.
+fn lifted_point(frame: &Frame, point: [f64; 2], height: f64) -> Vec3 {
+    let point3 = frame.point(point);
+    if height == 0.0 { return point3; }
+    let scale = frame.y.length();
+    let normal = frame.x.cross(frame.y) * (1.0 / scale.max(1e-300));
+    point3 + normal * height
 }
 
 /// A whole round wire as one closed rational curve (C0 where its arcs
@@ -2272,7 +2373,10 @@ fn joined_run(patches: &[Patch]) -> (Vec<Frame>, Vec<f64>, Vec<f64>) {
     (frames, weights, knots)
 }
 
-fn build_body_in_runs(wires: &[Wire], patches: &[Patch], runs: &[usize], sheet: bool, closed_path: bool, outward: bool, round: bool) -> Option<Body> {
+#[allow(clippy::too_many_arguments)]
+fn build_body_in_runs(wires: &[Wire], patches: &[Patch], runs: &[usize], sheet: bool, closed_path: bool, outward: bool, round: bool, lift: Option<&[f64]>) -> Option<Body> {
+    // Heights of a lifted (spatial) single wire of straight pieces, by vertex.
+    let height = |index: usize| lift.map_or(0.0, |heights| heights.get(index).copied().unwrap_or(0.0));
     let merged = wires.iter().map(|wire| round.then(|| merged_round(wire)).flatten()).collect::<Vec<_>>();
     let wires = &wires.iter().zip(merged).map(|(wire, merged)| merged.unwrap_or_else(|| Wire {
         source: wire.source.clone(), curves: wire.curves.clone(), closed: wire.closed })).collect::<Vec<_>>();
@@ -2299,12 +2403,19 @@ fn build_body_in_runs(wires: &[Wire], patches: &[Patch], runs: &[usize], sheet: 
                 continue;
             }
             let frame = if station == 0 { patches[0][0] } else { groups[station - 1].last()?[3] };
-            let ring = coords.iter().map(|p| body.vertices.insert(Vertex {
-                point: frame.point(*p).to_array(), provenance: Provenance::Synthesized,
+            let ring = coords.iter().enumerate().map(|(index, p)| body.vertices.insert(Vertex {
+                point: lifted_point(&frame, *p, height(index)).to_array(), provenance: Provenance::Synthesized,
             })).collect::<Vec<_>>();
             let edges = wire.curves.iter().enumerate().map(|(index, curve)| {
-                let lifted = curve.lifted(&frame.plane());
-                add_curve_edge(&mut body, &lifted, ring[index], ring[(index + 1) % ring.len()])
+                let next = (index + 1) % coords.len();
+                let lifted = if lift.is_some() {
+                    RationalCurve3 { degree: 1, knots: vec![0.0, 0.0, 1.0, 1.0], weights: vec![1.0, 1.0],
+                        points: vec![lifted_point(&frame, coords[index], height(index)).to_array(),
+                            lifted_point(&frame, coords[next], height(next)).to_array()] }
+                } else {
+                    curve.lifted(&frame.plane())
+                };
+                add_curve_edge(&mut body, &lifted, ring[index], ring[next])
             }).collect::<Option<Vec<_>>>()?;
             vertices.push(ring);
             rims.push(edges);
@@ -2315,14 +2426,17 @@ fn build_body_in_runs(wires: &[Wire], patches: &[Patch], runs: &[usize], sheet: 
             let span = 1.0;
             let rails = coords.iter().enumerate().map(|(index, point)| {
                 let curve = RationalCurve3 { degree: 3, knots: knots.clone(),
-                    points: frames.iter().map(|frame| frame.point(*point).to_array()).collect(),
+                    points: frames.iter().map(|frame| lifted_point(frame, *point, height(index)).to_array()).collect(),
                     weights: along.clone() };
                 add_curve_edge(&mut body, &curve, vertices[band][index], vertices[band + 1][index])
             }).collect::<Option<Vec<_>>>()?;
             for (index, curve) in wire.curves.iter().enumerate() {
                 let next = (index + 1) % coords.len();
-                let points = curve.points.iter().map(|point|
-                    frames.iter().map(|frame| frame.point(*point).to_array()).collect()).collect();
+                let ends = [height(index), height(next)];
+                let points = curve.points.iter().enumerate().map(|(k, point)| {
+                    let h = if lift.is_some() { ends[k.min(1)] } else { 0.0 };
+                    frames.iter().map(|frame| lifted_point(frame, *point, h).to_array()).collect()
+                }).collect();
                 let weights = curve.weights.iter()
                     .map(|weight| along.iter().map(|along| weight * along).collect())
                     .collect();

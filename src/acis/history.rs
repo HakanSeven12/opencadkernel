@@ -1249,6 +1249,9 @@ pub fn rebuild_sweep_with_mode(
             Err(HistoryRebuildError::Unsupported)
         };
     }
+    if let Some(spatial) = rebuild_spatial_sweep(value) {
+        return spatial;
+    }
     let geometry = sweep_history_geometry(value, surface)?;
     if let Some(why) = brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options) {
         return Err(HistoryRebuildError::Refused(why));
@@ -1269,6 +1272,58 @@ pub fn rebuild_sweep_with_mode(
 pub fn sweep_history_refusal(value: &SolidHistorySweep) -> Option<brep::SweepRefusal> {
     let geometry = sweep_history_geometry(value, false).ok()?;
     brep::sweep_corner_refusal(geometry.path.borrowed(), geometry.options)
+}
+
+/// The vertices of a straight-sided wire-body profile that does not lie in
+/// one plane, with whether it is closed.
+pub fn sweep_spatial_profile(entity: &EmbeddedEntity, transform: [f64; 16]) -> Option<(Vec<[f64; 3]>, bool)> {
+    let spans = body_wire_spans(entity)?;
+    if spans.is_empty() || !spans.iter().all(|span| matches!(span.curve, brep::Curve3::Line(_))) {
+        return None;
+    }
+    let place = placement(transform).ok()?;
+    let mut points = spans.iter().map(|span| place.point(span.start)).collect::<Vec<_>>();
+    let last = place.point(spans.last()?.end);
+    let closed = Vec3::from(last).distance(Vec3::from(points[0])) <= 1e-9 * Vec3::from(points[0]).length().max(1.0);
+    if !closed { points.push(last); }
+    // Planar profiles take the ordinary route.
+    let first = Vec3::from(points[0]);
+    let normal = (0..points.len()).fold(Vec3::ZERO, |sum, index| {
+        let a = Vec3::from(points[index]) - first;
+        let b = Vec3::from(points[(index + 1) % points.len()]) - first;
+        sum + a.cross(b)
+    }).normalize()?;
+    let size = points.iter().map(|p| Vec3::from(*p).distance(first)).fold(1.0_f64, f64::max);
+    let planar = points.iter().all(|p| (Vec3::from(*p) - first).dot(normal).abs() <= size * 1e-9);
+    (!planar).then_some((points, closed))
+}
+
+/// Whether the record's path has a corner.
+pub fn sweep_history_path_has_corner(value: &SolidHistorySweep) -> Option<bool> {
+    let (_, path_transform) = sweep_entity_transforms(value);
+    let path = embedded_sweep_path(value.path_entity.as_ref()?, path_transform).ok()?;
+    brep::sweep_path_has_corner(path.borrowed())
+}
+
+/// A sweep record whose profile is a spatial polyline: a swept surface.
+fn rebuild_spatial_sweep(value: &SolidHistorySweep) -> Option<Result<Body, HistoryRebuildError>> {
+    let (profile_transform, path_transform) = sweep_entity_transforms(value);
+    let (points, closed) = sweep_spatial_profile(value.sweep_entity.as_ref()?, profile_transform)?;
+    let path = match embedded_sweep_path(value.path_entity.as_ref()?, path_transform) {
+        Ok(path) => path,
+        Err(error) => return Some(Err(error)),
+    };
+    let options = brep::SweepOptions {
+        align: value.align_option == 1,
+        base_point: value.has_align_start
+            .then_some([value.reference_point.x, value.reference_point.y, value.reference_point.z]),
+        rotation: value.align_angle,
+        twist: value.twist_angle,
+        scale: value.scale_factor,
+        bank: value.bank,
+        surface: true,
+    };
+    Some(finish(brep::sweep_spatial_polyline(&points, closed, path.borrowed(), options), value.base.transform))
 }
 
 fn rebuild_sweep(value: &SolidHistorySweep) -> Result<Body, HistoryRebuildError> {
