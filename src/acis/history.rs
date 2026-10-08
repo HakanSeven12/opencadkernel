@@ -1221,7 +1221,8 @@ pub fn sweep_default_base(
     let identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
     let path = embedded_sweep_path(path, identity)?;
     let start = brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
-    brep::sweep_profile_base_from(plane, &wires, start).ok_or(HistoryRebuildError::InvalidParameters)
+    let tangent = brep::sweep_path_tangent(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
+    brep::sweep_profile_base_from(plane, &wires, start, tangent).ok_or(HistoryRebuildError::InvalidParameters)
 }
 
 /// The displayed reference point; new aligned sweeps reference the path start.
