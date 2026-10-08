@@ -180,6 +180,25 @@ pub fn sweep_profile_base(plane: Plane, wires: &[Vec<Curve>]) -> Option<[f64; 3]
     Some((origin + moment / total).to_array())
 }
 
+/// The base point of one profile swept along a path that starts at
+/// `start`. A path starting in the profile's plane, inside its region or on
+/// its boundary, sweeps the profile where it stands: the start is the base.
+/// Any other start uses the profile's own anchor (`sweep_profile_base`).
+pub fn sweep_profile_base_from(plane: Plane, wires: &[Vec<Curve>], start: [f64; 3]) -> Option<[f64; 3]> {
+    let anchor = sweep_profile_base(plane, wires)?;
+    let uv = plane.project(start)?;
+    let size = Vec3::from(anchor).distance(Vec3::from(start)).max(1.0);
+    if Vec3::from(plane.point_at(uv)).distance(Vec3::from(start)) > size * 1e-9 {
+        return Some(anchor);
+    }
+    let tolerance = crate::geom2d::Tolerance::new(size * 1e-9);
+    // Holes are taken out of the region: inside an odd number of loops.
+    let inside = wires.iter().filter(|wire| crate::geom2d::containment::contains(wire, uv, tolerance)).count() % 2 == 1;
+    let on_boundary = wires.iter().flatten()
+        .any(|curve| crate::geom2d::containment::distance_to(curve, uv) <= tolerance.linear());
+    Some(if inside || on_boundary { start } else { anchor })
+}
+
 fn conic_anchor(pieces: &[Curve]) -> Option<[f64; 2]> {
     let center = match pieces.first()? {
         Curve::Arc(first) if pieces.iter().all(|piece| matches!(piece, Curve::Arc(arc)

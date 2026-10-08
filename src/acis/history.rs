@@ -1209,6 +1209,21 @@ pub fn sweep_history_placements(
     ))
 }
 
+/// The base point of a profile swept along a path when none was picked:
+/// the path start when the path starts in the profile's plane inside or on
+/// the profile, else the profile's own anchor.
+pub fn sweep_default_base(
+    profile: &EmbeddedEntity,
+    profile_transform: [f64; 16],
+    path: &EmbeddedEntity,
+) -> Result<[f64; 3], HistoryRebuildError> {
+    let (plane, wires, _) = sweep_profile_geometry(profile, profile_transform)?;
+    let identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+    let path = embedded_sweep_path(path, identity)?;
+    let start = brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
+    brep::sweep_profile_base_from(plane, &wires, start).ok_or(HistoryRebuildError::InvalidParameters)
+}
+
 /// The displayed reference point; new aligned sweeps reference the path start.
 pub fn sweep_history_reference_point(value: &SolidHistorySweep) -> Result<[f64; 3], HistoryRebuildError> {
     let reference = if value.has_align_start || value.align_option != 0 {
