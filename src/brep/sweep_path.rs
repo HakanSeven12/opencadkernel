@@ -130,9 +130,9 @@ fn initial_placement(plane: Plane, base: Vec3, start: Vec3, tangent: Vec3, optio
 }
 
 /// Default source-profile anchor. Closed conics use their centre and open
-/// conics their middle point; other chains use
-/// twenty equally spaced boundary samples including the directed endpoints.
-/// The endpoint convention deliberately preserves a polyline's start vertex.
+/// conics their middle point; other open chains use their middle point by
+/// length, and other closed chains the mean of twenty equally spaced
+/// boundary samples including the directed endpoints.
 /// Multiple boundary loops contribute in proportion to their curve lengths.
 pub fn sweep_profile_base(plane: Plane, wires: &[Vec<Curve>]) -> Option<[f64; 3]> {
     plane.normal()?;
@@ -142,34 +142,39 @@ pub fn sweep_profile_base(plane: Plane, wires: &[Vec<Curve>]) -> Option<[f64; 3]
     for wire in wires {
         let pieces = expanded(wire)?;
         let senses = chain_senses(&pieces)?;
+        let closed = chain_closed(&pieces, &senses);
         let path = pieces.iter().zip(senses).map(|(curve, forward)|
             Piece::Planar(plane, curve.clone(), forward)).collect::<Vec<_>>();
         let lengths = path.iter().map(Piece::length).collect::<Vec<_>>();
         let length = lengths.iter().sum::<f64>();
         if !length.is_finite() || length <= 1e-14 { return None; }
-        let conic_anchor = conic_anchor(&pieces);
-        let anchor = if let Some(point) = conic_anchor {
+        // The point `distance` along the chain.
+        let along = |mut distance: f64| {
+            let mut index = 0;
+            while index + 1 < path.len() && distance > lengths[index] {
+                distance -= lengths[index];
+                index += 1;
+            }
+            let parameter = if matches!(&pieces[index], Curve::Line(_) | Curve::Arc(_)) && plane.is_orthonormal() {
+                (distance / lengths[index]).clamp(0.0, 1.0)
+            } else {
+                let (mut low, mut high) = (0.0, 1.0);
+                for _ in 0..40 {
+                    let middle = (low + high) * 0.5;
+                    if path[index].length_to(middle) < distance { low = middle; } else { high = middle; }
+                }
+                (low + high) * 0.5
+            };
+            path[index].point(parameter)
+        };
+        let anchor = if let Some(point) = conic_anchor(&pieces) {
             Vec3::from(plane.point_at(point))
+        } else if !closed {
+            along(length * 0.5)
         } else {
             let mut samples = Vec3::ZERO;
             for sample in 0..20 {
-                let mut distance = length * sample as f64 / 19.0;
-                let mut index = 0;
-                while index + 1 < path.len() && distance > lengths[index] {
-                    distance -= lengths[index];
-                    index += 1;
-                }
-                let parameter = if matches!(&pieces[index], Curve::Line(_) | Curve::Arc(_)) && plane.is_orthonormal() {
-                    (distance / lengths[index]).clamp(0.0, 1.0)
-                } else {
-                    let (mut low, mut high) = (0.0, 1.0);
-                    for _ in 0..40 {
-                        let middle = (low + high) * 0.5;
-                        if path[index].length_to(middle) < distance { low = middle; } else { high = middle; }
-                    }
-                    (low + high) * 0.5
-                };
-                samples = samples + (path[index].point(parameter) - origin);
+                samples = samples + (along(length * sample as f64 / 19.0) - origin);
             }
             origin + samples / 20.0
         };
@@ -316,25 +321,30 @@ pub fn sweep_path_has_corner(path: SweepPath<'_>) -> Option<bool> {
     Some(cornered)
 }
 
-/// The anchor of a spatial polyline profile: the mean of twenty equally
-/// spaced samples along it (by 3D length, both ends included), the same
-/// rule as for planar profiles.
+/// The anchor of a spatial polyline profile, by 3D length, the same rule as
+/// for planar profiles: an open one's middle point, a closed one's mean of
+/// twenty equally spaced samples along it (both ends included).
 pub fn sweep_polyline_base(points: &[[f64; 3]], closed: bool) -> Option<[f64; 3]> {
     let mut chain = points.iter().map(|p| Vec3::from(*p)).collect::<Vec<_>>();
     if closed { chain.push(*chain.first()?); }
     let lengths = chain.windows(2).map(|pair| pair[0].distance(pair[1])).collect::<Vec<_>>();
     let total = lengths.iter().sum::<f64>();
     if chain.len() < 2 || !total.is_finite() || total <= 1e-14 { return None; }
-    let mut sum = Vec3::ZERO;
-    for sample in 0..20 {
-        let mut distance = total * sample as f64 / 19.0;
+    let along = |mut distance: f64| {
         let mut index = 0;
         while index + 1 < lengths.len() && distance > lengths[index] {
             distance -= lengths[index];
             index += 1;
         }
         let t = if lengths[index] > 0.0 { (distance / lengths[index]).clamp(0.0, 1.0) } else { 0.0 };
-        sum = sum + chain[index] + (chain[index + 1] - chain[index]) * t;
+        chain[index] + (chain[index + 1] - chain[index]) * t
+    };
+    if !closed {
+        return Some(along(total * 0.5).to_array());
+    }
+    let mut sum = Vec3::ZERO;
+    for sample in 0..20 {
+        sum = sum + along(total * sample as f64 / 19.0);
     }
     Some((sum * (1.0 / 20.0)).to_array())
 }
@@ -347,6 +357,19 @@ pub fn sweep_polyline_base(points: &[[f64; 3]], closed: bool) -> Option<[f64; 3]
 pub fn sweep_spatial_polyline(points: &[[f64; 3]], closed: bool, path: SweepPath<'_>, mut options: SweepOptions) -> Option<Body> {
     if points.len() < 2 { return None; }
     let count = points.len();
+    // A closed profile runs counter-clockwise in plan, so each point keeps
+    // its own height when the section is oriented.
+    let plan_area = (0..count).map(|index| {
+        let (a, b) = (points[index], points[(index + 1) % count]);
+        a[0] * b[1] - b[0] * a[1]
+    }).sum::<f64>();
+    let reordered;
+    let points = if closed && plan_area < 0.0 {
+        reordered = std::iter::once(points[0]).chain(points[1..].iter().rev().copied()).collect::<Vec<_>>();
+        &reordered[..]
+    } else {
+        points
+    };
     // A path that starts on the profile sweeps it where it stands.
     let start = Vec3::from(sweep_path_start(path)?);
     let size = points.iter().map(|p| Vec3::from(*p).distance(start)).fold(1.0_f64, f64::max);
