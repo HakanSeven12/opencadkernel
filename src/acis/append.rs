@@ -76,8 +76,11 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 .and_then(|ring| body.faces.get(ring.owner))
                 .ok_or(Unappendable::Inconsistent)?;
             let needs_curve = matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_)));
-            let curve = acis_pcurve(body, coedge, face.surface, curve);
-            match curve.and_then(|curve| add_pcurve(document, &curve, ids.surface(face.surface))) {
+            // A pcurve that cannot be put in the edge's parameterisation (a
+            // degenerate edge has no range to map onto) is written as it is,
+            // as before, rather than refusing the whole body.
+            let curve = acis_pcurve(body, coedge, face.surface, curve).unwrap_or_else(|| curve.clone());
+            match add_pcurve(document, &curve, ids.surface(face.surface)) {
                 Some(id) => {
                     ids.pcurves.insert(key, id);
                 }
