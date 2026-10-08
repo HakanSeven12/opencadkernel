@@ -822,21 +822,6 @@ pub fn sweep_profile_geometry(
     let closed = profile.curve.is_closed();
     Ok((profile.plane, vec![sweep_profile_pieces(&profile.curve)?], closed))
 }
-/// The base point of a profile swept along a path when none was picked:
-/// the path start when the path starts in the profile's plane inside or on
-/// the profile, else the profile's own anchor.
-pub fn sweep_default_base(
-    profile: &EmbeddedEntity,
-    profile_transform: [f64; 16],
-    path: &EmbeddedEntity,
-) -> Result<[f64; 3], HistoryRebuildError> {
-    let (plane, wires, _) = sweep_profile_geometry(profile, profile_transform)?;
-    let identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
-    let path = embedded_sweep_path(path, identity)?;
-    let start = brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
-    let tangent = brep::sweep_path_tangent(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
-    brep::sweep_profile_base_from(plane, &wires, start, tangent).ok_or(HistoryRebuildError::InvalidParameters)
-}
 
 enum HistorySweepPath {
     Planar { plane: Plane, curves: Vec<Curve>, start: [f64; 3] },
@@ -1223,6 +1208,22 @@ pub fn sweep_history_placements(
         compose_placements(base, compose_placements(profile, placement(profile_transform)?)),
         compose_placements(base, compose_placements(path_shift, placement(path_transform)?)),
     ))
+}
+
+/// The base point of a profile swept along a path when none was picked:
+/// the path start when the path starts in the profile's plane inside or on
+/// the profile, else the profile's own anchor.
+pub fn sweep_default_base(
+    profile: &EmbeddedEntity,
+    profile_transform: [f64; 16],
+    path: &EmbeddedEntity,
+) -> Result<[f64; 3], HistoryRebuildError> {
+    let (plane, wires, _) = sweep_profile_geometry(profile, profile_transform)?;
+    let identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+    let path = embedded_sweep_path(path, identity)?;
+    let start = brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
+    let tangent = brep::sweep_path_tangent(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
+    brep::sweep_profile_base_from(plane, &wires, start, tangent).ok_or(HistoryRebuildError::InvalidParameters)
 }
 
 /// The displayed reference point; new aligned sweeps reference the path start.

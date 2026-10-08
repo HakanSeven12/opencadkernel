@@ -76,7 +76,11 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 .and_then(|ring| body.faces.get(ring.owner))
                 .ok_or(Unappendable::Inconsistent)?;
             let needs_curve = matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_)));
-            match add_pcurve(document, curve, ids.surface(face.surface)) {
+            // A pcurve that cannot be put in the edge's parameterisation (a
+            // degenerate edge has no range to map onto) is written as it is,
+            // as before, rather than refusing the whole body.
+            let curve = acis_pcurve(body, coedge, face.surface, curve).unwrap_or_else(|| curve.clone());
+            match add_pcurve(document, &curve, ids.surface(face.surface)) {
                 Some(id) => {
                     ids.pcurves.insert(key, id);
                 }
@@ -486,6 +490,72 @@ fn add_curve(document: &mut SatDocument, curve: &Curve3) -> Option<i32> {
         spline.is_rational().then_some(spline.weights()),
         0.0,
     ))
+}
+
+/// A coedge's pcurve in the parameterisation ACIS expects: it runs with the
+/// edge and over the edge's own parameter range on a forward coedge, and
+/// over the negated range (so against the edge) on a reversed one. The
+/// kernel keeps pcurves as plain traces in their own parameters, often in
+/// the loop's direction, which the reference rejects as an invalid solid.
+fn acis_pcurve(
+    body: &Body,
+    coedge: &crate::brep::Coedge,
+    surface: SurfaceKey,
+    pcurve: &Curve2,
+) -> Option<Curve2> {
+    use crate::geom2d::NurbsCurve;
+    let nurbs = match pcurve {
+        Curve2::Line(line) => NurbsCurve::new_strict(1, vec![line.start, line.end], vec![0.0, 0.0, 1.0, 1.0], vec![1.0, 1.0])?,
+        Curve2::Nurbs(curve) => curve.clone(),
+        _ => return None,
+    };
+    let surface = body.surfaces.get(surface)?;
+    let edge = body.edges.get(coedge.edge)?;
+    let curve = body.curves.get(edge.curve)?;
+    let (a, b) = (edge.start_parameter, edge.end_parameter);
+    let (start, end) = (Vec3::from(curve.point_at(a)), Vec3::from(curve.point_at(b)));
+    let image = |curve: &NurbsCurve, t: f64| {
+        let uv = curve.point_at(t);
+        Vec3::from(surface.point_at(uv[0], uv[1]))
+    };
+    let (t0, t1) = nurbs.domain();
+    let (first, last) = (image(&nurbs, t0), image(&nurbs, t1));
+    let along = first.distance(start) + last.distance(end);
+    let against = first.distance(end) + last.distance(start);
+    let mut nurbs = if against < along { nurbs.reversed() } else { nurbs };
+    let (low, high) = if coedge.forward { (a, b) } else {
+        nurbs = nurbs.reversed();
+        (-b, -a)
+    };
+    let (t0, t1) = nurbs.domain();
+    let scale = (high - low) / (t1 - t0);
+    let knots = nurbs.knots().iter().map(|knot| low + (knot - t0) * scale).collect();
+    let controls = nurbs.control_points().iter().map(|point| acis_uv(surface, *point)).collect();
+    NurbsCurve::new_strict(nurbs.degree(), controls, knots, nurbs.weights().to_vec())
+        .map(Curve2::Nurbs)
+}
+
+/// A surface point's kernel parameters in the modeller's own: a cone or
+/// cylinder runs u along its generators, in units of the base radius, and v
+/// round it; a torus or sphere takes its two angles the other way round.
+/// Both maps are linear, so a pcurve's control points map exactly.
+pub(super) fn acis_uv(surface: &Surface, [u, v]: [f64; 2]) -> [f64; 2] {
+    match surface {
+        Surface::Cylinder(cylinder) => [v / cylinder.radius, u],
+        Surface::Cone(cone) => [v / (cone.radius * cone.half_angle.cos()), u],
+        Surface::Torus(_) | Surface::Sphere(_) => [v, u],
+        _ => [u, v],
+    }
+}
+
+/// The inverse of [`acis_uv`].
+pub(super) fn kernel_uv(surface: &Surface, [u, v]: [f64; 2]) -> [f64; 2] {
+    match surface {
+        Surface::Cylinder(cylinder) => [v, u * cylinder.radius],
+        Surface::Cone(cone) => [v, u * cone.radius * cone.half_angle.cos()],
+        Surface::Torus(_) | Surface::Sphere(_) => [v, u],
+        _ => [u, v],
+    }
 }
 
 fn add_pcurve(
