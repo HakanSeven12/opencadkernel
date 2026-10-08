@@ -1592,64 +1592,11 @@ fn band_side(runs: &[Run2], distance: f64, closed: bool) -> Option<Vec<Run2>> {
 /// the solid is the band its in-plane edges sweep, extruded across the
 /// plane, with exact planar and cylindrical faces.
 fn planar_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], closed: bool) -> Option<Body> {
-    let plane = pieces.iter().find_map(|piece| match piece {
-        Piece::Planar(plane, _, _) => Some(*plane),
-        _ => None,
-    })?;
+    let (plane, runs) = planar_runs(pieces)?;
     let normal = Vec3::from(plane.normal()?);
     let origin = Vec3::from(plane.origin);
-    let runs = pieces.iter().map(|piece| Some(match piece {
-        Piece::Line(a, b) => {
-            let scale = a.length().max(b.length()).max(1.0) * 1e-9;
-            if (*a - origin).dot(normal).abs() > scale || (*b - origin).dot(normal).abs() > scale {
-                return None;
-            }
-            Run2::Segment(plane.project(a.to_array())?, plane.project(b.to_array())?)
-        }
-        Piece::Planar(other, _, _) => {
-            if Vec3::from(other.normal()?).dot(normal).abs() < 1.0 - 1e-12
-                || (Vec3::from(other.origin) - origin).dot(normal).abs() > 1e-9 * origin.length().max(1.0)
-            {
-                return None;
-            }
-            // A circular arc, however it is represented: the circle through
-            // its ends and middle, which every other sample must lie on.
-            let at = |t: f64| plane.project(piece.point(t).to_array());
-            let (p0, pm, p1) = (at(0.0)?, at(0.5)?, at(1.0)?);
-            let (b, c) = ([pm[0] - p0[0], pm[1] - p0[1]], [p1[0] - p0[0], p1[1] - p0[1]]);
-            let denominator = 2.0 * (b[0] * c[1] - b[1] * c[0]);
-            if denominator.abs() <= 1e-12 * piece.length() * piece.length() {
-                return None;
-            }
-            let (bb, cc) = (b[0] * b[0] + b[1] * b[1], c[0] * c[0] + c[1] * c[1]);
-            let centre = [p0[0] + (c[1] * bb - b[1] * cc) / denominator, p0[1] + (b[0] * cc - c[0] * bb) / denominator];
-            let radius = (p0[0] - centre[0]).hypot(p0[1] - centre[1]);
-            for t in [0.125, 0.25, 0.375, 0.625, 0.75, 0.875] {
-                let q = at(t)?;
-                if ((q[0] - centre[0]).hypot(q[1] - centre[1]) - radius).abs() > 1e-9 * radius.max(1.0) {
-                    return None;
-                }
-            }
-            let angle = |q: [f64; 2]| (q[1] - centre[1]).atan2(q[0] - centre[0]);
-            let sign = denominator.signum();
-            let sweep = sign * ((angle(p1) - angle(p0)) * sign).rem_euclid(TAU);
-            if sweep.abs() <= 1e-12 {
-                return None;
-            }
-            Run2::Turn { centre, radius, start: angle(p0), sweep }
-        }
-        _ => return None,
-    })).collect::<Option<Vec<_>>>()?;
     // Only where a corner meets an arc; the general sweep handles the rest.
-    let count = runs.len();
-    let joints = if closed { count } else { count - 1 };
-    let corner_on_turn = (0..joints).any(|index| {
-        let next = (index + 1) % count;
-        let (t1, t2) = (runs[index].tangent(1.0), runs[next].tangent(0.0));
-        t1[0] * t2[0] + t1[1] * t2[1] < 1.0 - 1e-9
-            && (matches!(runs[index], Run2::Turn { .. }) || matches!(runs[next], Run2::Turn { .. }))
-    });
-    if !corner_on_turn {
+    if !corner_on_turn(&runs, closed) {
         return None;
     }
     // The placed section: a rectangle with sides across and along the plane.
@@ -2124,7 +2071,7 @@ fn planar_polygon_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], c
         }
         Some(sum)
     };
-    let mut place = |body: &mut Body, surface: Surface, edges: &[EdgeKey], outward: Vec3, at: Vec3| -> Option<FaceKey> {
+    let place = |body: &mut Body, surface: Surface, edges: &[EdgeKey], outward: Vec3, at: Vec3| -> Option<FaceKey> {
         let mut circuit = chain(body, edges)?;
         if newell(body, &circuit)?.dot(outward) < 0.0 {
             circuit = circuit.into_iter().rev().map(|(edge, forward)| (edge, !forward)).collect();
