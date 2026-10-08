@@ -236,7 +236,7 @@ fn lift_face(
                 note_broken(loss, record);
                 break;
             };
-            let pcurve = read_pcurve(document, source_coedge.pcurve(), reversed_v);
+            let pcurve = read_pcurve(document, source_coedge.pcurve(), reversed_v, body.surfaces.get(surface));
             if let Some(edge) = edge_of(
                 document,
                 body,
@@ -484,7 +484,7 @@ fn partner_surface_curve(
     let surface_record = resolve(document, face.surface())?;
     let reversed_v = analytic_surface_reversed(surface_record);
     let surface = read_surface(document, surface_record)?;
-    let pcurve = read_pcurve(document, partner.pcurve(), reversed_v)?;
+    let pcurve = read_pcurve(document, partner.pcurve(), reversed_v, Some(&surface))?;
     surface_curve(&surface, &pcurve)
 }
 
@@ -657,6 +657,7 @@ fn read_pcurve(
     document: &SatDocument,
     pointer: SatPointer,
     reversed_v: bool,
+    surface: Option<&Surface>,
 ) -> Option<Curve2> {
     let source = SatPCurve::from_record(resolve(document, pointer)?)?;
     let (degree, knots, controls) = source.bspline_in(document)?;
@@ -667,16 +668,14 @@ fn read_pcurve(
         if !weight.is_finite() || weight <= 0.0 {
             return None;
         }
-        points.push([control[0] / weight, control[1] / weight]);
+        let mut point = [control[0] / weight, control[1] / weight];
+        if reversed_v {
+            point[1] = -point[1];
+        }
+        points.push(surface.map_or(point, |surface| super::append::kernel_uv(surface, point)));
         weights.push(weight);
     }
-    let curve = Curve2::Nurbs(NurbsCurve::new_strict(degree, points, knots, weights)?);
-    let curve = if reversed_v {
-        curve.transformed(&crate::geom2d::Transform::scale(1.0, -1.0))?
-    } else {
-        curve
-    };
-    Some(curve)
+    Some(Curve2::Nurbs(NurbsCurve::new_strict(degree, points, knots, weights)?))
 }
 
 fn analytic_surface_reversed(record: &SatRecord) -> bool {
