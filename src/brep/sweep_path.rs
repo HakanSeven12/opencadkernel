@@ -1159,11 +1159,11 @@ fn circular_tube(pieces: &[Piece], first: Frame, centre: [f64; 2], radius: f64, 
         if !between {
             span += if span > 0.0 { -TAU } else { TAU };
         }
-        let samples = 48;
-        let mut points = vec![j2];
-        for step in 1..samples {
-            // Denser towards the ends, where the two surfaces touch.
-            let share = (1.0 - (PI * step as f64 / samples as f64).cos()) * 0.5;
+        let surface_a = tube_surface(runs[a], &tube_section(starts[a], centre, pieces[a].tangent(0.0)?)?, radius)?;
+        let surface_b = tube_surface(runs[b], &start, radius)?;
+        // Where the section point at `share` of the turn from j2 to j1,
+        // carried along run b, leaves tube a.
+        let cross = |share: f64| -> Option<Vec3> {
             let section_point = start.centre + rotate(from, d2, span * share);
             let length = run_length(runs[b], section_point).max(radius);
             let steps = ((length / (radius / 64.0)).ceil() as usize).clamp(16, 100_000);
@@ -1181,23 +1181,65 @@ fn circular_tube(pieces: &[Piece], first: Frame, centre: [f64; 2], radius: f64, 
             }
             let found = run_point(runs[b], section_point, 0.5 * (low + high));
             let (gap, within) = solid.probe(found);
-            if gap.abs() > tolerance * 1e3 || !within { return None; }
-            points.push(found);
+            (gap.abs() <= tolerance * 1e3 && within).then_some(found)
+        };
+        // The crossing is interpolated through points on both tubes, evenly
+        // spaced in the turn and with the tangents of the true curve at the
+        // ends of each half (a natural end loses two orders of accuracy).
+        // ACIS takes it as an exact curve, so it must stay on both surfaces
+        // to well within the modeller's resolution (1e-6) between the points
+        // too: the sampling is refined until it does.
+        let fit_tolerance = 1e-8 * radius.max(1.0);
+        let off_surfaces = |point: Vec3| -> Option<f64> {
+            let (u, v) = surface_b.parameters_at(point.to_array())?;
+            Some(solid.probe(point).0.abs().max(Vec3::from(surface_b.point_at(u, v)).distance(point)))
+        };
+        // d point / d share, one-sided into the half it ends.
+        let slope = |share: f64, at: Vec3, inward: f64| -> Option<Vec3> {
+            let h = 1e-4 * inward;
+            let (near, far) = (cross(share + h)?, cross(share + 2.0 * h)?);
+            Some((at * -3.0 + near * 4.0 - far) / (2.0 * h))
+        };
+        let mut fitted = None;
+        for samples in [48usize, 96, 192, 384, 768, 1536] {
+            let mut points = vec![j2];
+            for step in 1..samples {
+                points.push(cross(step as f64 / samples as f64)?);
+            }
+            points.push(j1);
+            // Two halves, split where the curve reaches deepest into the corner.
+            let middle = samples / 2;
+            let middle_share = middle as f64 / samples as f64;
+            let ends = [(0.0, &points[0], 1.0), (middle_share, &points[middle], -1.0), (middle_share, &points[middle], 1.0), (1.0, &points[samples], -1.0)];
+            // Tangents per unit of the uniform parameter (one per sample).
+            let tangents = ends.iter().map(|(share, at, inward)| Some(slope(*share, **at, *inward)? / samples as f64)).collect::<Option<Vec<_>>>()?;
+            let halves = [(0, middle, tangents[0], tangents[1]), (middle, samples, tangents[2], tangents[3])];
+            let mut worst: f64 = 0.0;
+            let mut curves = Vec::new();
+            for (from_index, to_index, start_tangent, end_tangent) in halves {
+                let part = &points[from_index..=to_index];
+                let crossing = NurbsCurve3::interpolate_fit(&part.iter().map(|p| p.to_array()).collect::<Vec<_>>(), Some(start_tangent.to_array()), Some(end_tangent.to_array()), crate::space::Parameterization::Uniform)?;
+                // point_at takes the parameter normalised to [0, 1].
+                for step in 0..part.len() - 1 {
+                    let t = (step as f64 + 0.5) / (part.len() - 1) as f64;
+                    worst = worst.max(off_surfaces(Vec3::from(crossing.point_at(t)))?);
+                }
+                curves.push((part.to_vec(), crossing, start_tangent, end_tangent));
+            }
+            if worst <= fit_tolerance || samples == 1536 {
+                fitted = Some(curves);
+                break;
+            }
         }
-        points.push(j1);
-        // Two halves, split where the curve reaches deepest into the corner.
-        let middle = points.len() / 2;
-        let vm = vertex(&mut body, points[middle]);
+        let curves = fitted?;
+        let vm = vertex(&mut body, curves[0].0[curves[0].0.len() - 1]);
         let mut halves = Vec::new();
-        let surface_a = tube_surface(runs[a], &tube_section(starts[a], centre, pieces[a].tangent(0.0)?)?, radius)?;
-        let surface_b = tube_surface(runs[b], &start, radius)?;
-        for (part, from, to) in [(&points[..=middle], v2, vm), (&points[middle..], vm, v1)] {
-            let crossing = NurbsCurve3::interpolate_fit(&part.iter().map(|p| p.to_array()).collect::<Vec<_>>(), None, None, crate::space::Parameterization::Uniform)?;
+        for ((part, crossing, start_tangent, end_tangent), (from, to)) in curves.into_iter().zip([(v2, vm), (vm, v1)]) {
             let (low, high) = crossing.domain();
             let key = edge(&mut body, Curve3::Nurbs(crossing), from, to, low, high);
             // The same points in each surface's parameters, interpolated with
-            // the same parameter values, so each face carries the same trace
-            // (they agree at the samples; between them both are fits).
+            // the same parameter values and end tangents, so each face
+            // carries the same trace.
             for (run, surface) in [(a, &surface_a), (b, &surface_b)] {
                 let mut uv: Vec<[f64; 2]> = Vec::with_capacity(part.len());
                 for point in part.iter() {
@@ -1208,7 +1250,20 @@ fn circular_tube(pieces: &[Piece], first: Frame, centre: [f64; 2], radius: f64, 
                     }
                     uv.push([u, v]);
                 }
-                let trace = NurbsCurve::interpolate(&uv, None, None, crate::space::Parameterization::Uniform)?;
+                // The parameter-space tangent: the spatial tangent through the
+                // surface's inverse at each end.
+                let uv_tangent = |point: Vec3, tangent: Vec3, at: [f64; 2]| -> Option<[f64; 2]> {
+                    let h = 1e-6 / tangent.length().max(1e-12);
+                    let (mut u, mut v) = surface.parameters_at((point + tangent * h).to_array())?;
+                    u += TAU * ((at[0] - u) / TAU).round();
+                    if matches!(surface, Surface::Torus(_)) { v += TAU * ((at[1] - v) / TAU).round(); }
+                    Some([(u - at[0]) / h, (v - at[1]) / h])
+                };
+                let first = uv[0];
+                let last = uv[uv.len() - 1];
+                let start_uv = uv_tangent(part[0], start_tangent, first)?;
+                let end_uv = uv_tangent(part[part.len() - 1], end_tangent, last)?;
+                let trace = NurbsCurve::interpolate(&uv, Some(start_uv), Some(end_uv), crate::space::Parameterization::Uniform)?;
                 let (start_knot, end_knot) = trace.domain();
                 let knots = trace.knots().iter().map(|k| low + (k - start_knot) / (end_knot - start_knot) * (high - low)).collect();
                 let trace = NurbsCurve::new_strict(trace.degree(), trace.control_points().to_vec(), knots, trace.weights().to_vec())?;
