@@ -93,7 +93,7 @@ pub use sweep::{
 };
 pub(crate) use sweep_path::reversed_path_curves;
 pub use sweep_path::{
-    sweep_corner_refusal, sweep_path, sweep_path_has_corner, sweep_polyline_base, sweep_spatial_polyline, SweepRefusal, sweep_path_start, sweep_path_tangent, sweep_profile_base,
+sweep_corner_refusal, sweep_path, sweep_path_has_corner, sweep_polyline_base, sweep_spatial_polyline, SweepRefusal, sweep_path_start, sweep_path_tangent, sweep_profile_base, sweep_profile_base_from,
     sweep_profile_group_base,
     sweep_profile_placement, SweepOptions, SweepPath,
 };
@@ -106,7 +106,7 @@ pub use topology::{
 /// A node's origin in the document it was lifted from.
 ///
 /// Opaque here on purpose: this layer knows a node came from record *n* of
-/// something, not what a record is. The format layer owns the mapping — see
+/// something, not what a record is. The format layer owns the mapping â€” see
 /// the `acis` module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceRef(u32);

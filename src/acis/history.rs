@@ -805,6 +805,7 @@ pub fn sweep_profile_geometry(
     transform: [f64; 16],
 ) -> Result<(Plane, Vec<Vec<Curve>>, bool), HistoryRebuildError> {
     if let EmbeddedEntity::Region(region) = entity {
+
         let (mut plane, wires) = region_sweep_profile(region)?;
         let place = placement(transform)?;
         if place.scale().is_none() {
@@ -820,6 +821,21 @@ pub fn sweep_profile_geometry(
     let profile = placed_curve(embedded_curve(entity)?, transform)?;
     let closed = profile.curve.is_closed();
     Ok((profile.plane, vec![sweep_profile_pieces(&profile.curve)?], closed))
+}
+/// The base point of a profile swept along a path when none was picked:
+/// the path start when the path starts in the profile's plane inside or on
+/// the profile, else the profile's own anchor.
+pub fn sweep_default_base(
+    profile: &EmbeddedEntity,
+    profile_transform: [f64; 16],
+    path: &EmbeddedEntity,
+) -> Result<[f64; 3], HistoryRebuildError> {
+    let (plane, wires, _) = sweep_profile_geometry(profile, profile_transform)?;
+    let identity = [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+    let path = embedded_sweep_path(path, identity)?;
+    let start = brep::sweep_path_start(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
+    let tangent = brep::sweep_path_tangent(path.borrowed()).ok_or(HistoryRebuildError::InvalidParameters)?;
+    brep::sweep_profile_base_from(plane, &wires, start, tangent).ok_or(HistoryRebuildError::InvalidParameters)
 }
 
 enum HistorySweepPath {
