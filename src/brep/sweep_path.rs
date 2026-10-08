@@ -2424,10 +2424,32 @@ fn joined_run(patches: &[Patch]) -> (Vec<Frame>, Vec<f64>, Vec<f64>) {
         // At most 96 spans: dense enough for a C2 fit of a smooth transport,
         // small enough for a single face to stay cheap to evaluate.
         let count = (patches.len() * 3).min(96);
+        // Stations evenly spaced along the run, so the uniform parameter
+        // follows its length. Patches differ in length (the path is divided
+        // adaptively); stations evenly spaced per patch made the fit stall
+        // and race, leaving a surface whose speed nearly vanishes in places,
+        // which the reference rejects.
+        const STEPS: usize = 16;
+        let mut table = vec![(0.0, 0usize, 0.0)];
+        let mut length = 0.0;
+        for (index, patch) in patches.iter().enumerate() {
+            let mut last = bezier(patch, 0.0).origin;
+            for step in 1..=STEPS {
+                let t = step as f64 / STEPS as f64;
+                let point = bezier(patch, t).origin;
+                length += point.distance(last);
+                last = point;
+                table.push((length, index, t));
+            }
+        }
         let stations = (0..=count).map(|k| {
-            let at = k as f64 * patches.len() as f64 / count as f64;
-            let index = (at.floor() as usize).min(patches.len() - 1);
-            bezier(&patches[index], at - index as f64)
+            let target = length * k as f64 / count as f64;
+            let slot = table.partition_point(|entry| entry.0 < target).clamp(1, table.len() - 1);
+            let (l0, i0, t0) = table[slot - 1];
+            let (l1, i1, t1) = table[slot];
+            let share = if l1 > l0 { (target - l0) / (l1 - l0) } else { 0.0 };
+            let (index, t) = if i0 == i1 { (i1, t0 + (t1 - t0) * share) } else { (i1, t1 * share) };
+            bezier(&patches[index], t.clamp(0.0, 1.0))
         }).collect::<Vec<_>>();
         let flat = |f: Frame| [f.origin.x, f.origin.y, f.origin.z, f.x.x, f.x.y, f.x.z, f.y.x, f.y.y, f.y.z];
         let points = stations.iter().map(|frame| flat(*frame)).collect::<Vec<_>>();
