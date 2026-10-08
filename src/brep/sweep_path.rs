@@ -1029,11 +1029,11 @@ fn circle_curve(section: &TubeSection, radius: f64) -> Option<Curve3> {
 }
 
 /// Builds a circular tube along straight and circular runs meeting at
-/// corners where at least one circular run takes part. Each run keeps its
-/// exact cylinder or torus. At a corner the outer side is closed by straight
-/// extensions of both runs to the mitre plane; on the inner side the two runs
-/// meet along the curve where their surfaces cross, which is how the
-/// reference modeler joins a curved run at a corner.
+/// corners. Each run keeps its exact cylinder or torus. At a corner the
+/// outer side is closed by straight extensions of both runs to the mitre
+/// plane; on the inner side the two runs meet along the curve where their
+/// surfaces cross (the rest of the mitre between two straight runs), which
+/// is how the reference modeler joins a round tube at a corner.
 fn circular_tube(pieces: &[Piece], first: Frame, centre: [f64; 2], radius: f64, closed: bool) -> Option<Body> {
     let runs = pieces.iter().map(|piece| match piece {
         Piece::Line(from, to) => Some(TubeRun::Straight { from: *from, to: *to }),
@@ -1048,9 +1048,7 @@ fn circular_tube(pieces: &[Piece], first: Frame, centre: [f64; 2], radius: f64, 
     };
     let mut wanted = false;
     for joint in 0..joints {
-        if corner(joint)? && (matches!(runs[joint], TubeRun::Turn { .. }) || matches!(runs[(joint + 1) % count], TubeRun::Turn { .. })) {
-            wanted = true;
-        }
+        wanted |= corner(joint)?;
     }
     if !wanted { return None; }
 

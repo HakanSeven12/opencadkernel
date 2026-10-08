@@ -527,8 +527,32 @@ fn acis_pcurve(
     let (t0, t1) = nurbs.domain();
     let scale = (high - low) / (t1 - t0);
     let knots = nurbs.knots().iter().map(|knot| low + (knot - t0) * scale).collect();
-    NurbsCurve::new_strict(nurbs.degree(), nurbs.control_points().to_vec(), knots, nurbs.weights().to_vec())
+    let controls = nurbs.control_points().iter().map(|point| acis_uv(surface, *point)).collect();
+    NurbsCurve::new_strict(nurbs.degree(), controls, knots, nurbs.weights().to_vec())
         .map(Curve2::Nurbs)
+}
+
+/// A surface point's kernel parameters in the modeller's own: a cone or
+/// cylinder runs u along its generators, in units of the base radius, and v
+/// round it; a torus or sphere takes its two angles the other way round.
+/// Both maps are linear, so a pcurve's control points map exactly.
+pub(super) fn acis_uv(surface: &Surface, [u, v]: [f64; 2]) -> [f64; 2] {
+    match surface {
+        Surface::Cylinder(cylinder) => [v / cylinder.radius, u],
+        Surface::Cone(cone) => [v / (cone.radius * cone.half_angle.cos()), u],
+        Surface::Torus(_) | Surface::Sphere(_) => [v, u],
+        _ => [u, v],
+    }
+}
+
+/// The inverse of [`acis_uv`].
+pub(super) fn kernel_uv(surface: &Surface, [u, v]: [f64; 2]) -> [f64; 2] {
+    match surface {
+        Surface::Cylinder(cylinder) => [v, u * cylinder.radius],
+        Surface::Cone(cone) => [v, u * cone.radius * cone.half_angle.cos()],
+        Surface::Torus(_) | Surface::Sphere(_) => [v, u],
+        _ => [u, v],
+    }
 }
 
 fn add_pcurve(
