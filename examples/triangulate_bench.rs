@@ -88,7 +88,7 @@ fn main() {
         {
             continue;
         }
-        let (vertices, triangles) = cadkernel::geom2d::triangulate_rings(&rings);
+        let (vertices, triangles) = opencadkernel::geom2d::triangulate_rings(&rings);
         // Compare output hashes across revisions using the same Rust toolchain.
         let mut mesh_hash = DefaultHasher::new();
         for point in &vertices {
@@ -109,7 +109,7 @@ fn main() {
         for _ in 0..5 {
             let start = Instant::now();
             for _ in 0..repeats {
-                black_box(cadkernel::geom2d::triangulate_rings(black_box(&rings)));
+                black_box(opencadkernel::geom2d::triangulate_rings(black_box(&rings)));
             }
             times.push(start.elapsed().as_nanos() as f64 / repeats as f64);
         }

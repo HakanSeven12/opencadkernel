@@ -2159,10 +2159,10 @@ mod tests {
             of_elliptic(frustum([0.0, 0.0, 0.0], 5.0, 3.0, 2.0, 10.0)),
             of_elliptic(frustum([0.0, 0.0, 0.0], 5.0, 3.0, 0.0, 10.0)),
         ] {
-            let mut document = cadcodec::entities::acis::SatDocument::new();
+            let mut document = opencadcodec::entities::acis::SatDocument::new();
             assert!(crate::acis::append(&body, &mut document).is_ok());
             let parsed =
-                cadcodec::entities::acis::SatDocument::parse(&document.to_sat_string()).unwrap();
+                opencadcodec::entities::acis::SatDocument::parse(&document.to_sat_string()).unwrap();
             let (restored, loss) = crate::acis::lift(&parsed);
             assert!(loss.is_empty(), "{loss:?}");
             assert_eq!(restored.len(), 1);
@@ -2186,11 +2186,11 @@ mod tests {
         // read sine 0, cosine 1 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â measured from the authored gold
         // fixtures this form was built against.
         let body = elliptical_cylinder([0.0, 0.0, 0.0], 5.0, 3.0, 10.0).unwrap();
-        let mut document = cadcodec::entities::acis::SatDocument::new();
+        let mut document = opencadcodec::entities::acis::SatDocument::new();
         crate::acis::append(&body, &mut document).unwrap();
-        let parsed = cadcodec::entities::acis::SatDocument::parse(&document.to_sat_string()).unwrap();
+        let parsed = opencadcodec::entities::acis::SatDocument::parse(&document.to_sat_string()).unwrap();
         for record in &parsed.records {
-            if let Some(cone) = cadcodec::entities::acis::SatConeSurface::from_record(record) {
+            if let Some(cone) = opencadcodec::entities::acis::SatConeSurface::from_record(record) {
                 let (mx, my, mz) = cone.major_axis();
                 assert!(
                     ((mx.hypot(my).hypot(mz)) - 5.0).abs() < 1e-12,

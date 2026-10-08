@@ -3,7 +3,7 @@
 //! Unsupported records remain attached through provenance and appear in
 //! [`Loss`].
 
-use cadcodec::entities::acis::types::{
+use opencadcodec::entities::acis::types::{
     SatBSplineSurface, SatBody, SatCoedge, SatConeSurface, SatDocument, SatEdge, SatEllipseCurve, SatFace, SatIntCurve,
     SatLoop, SatLump, SatPCurve, SatPlaneSurface, SatPoint, SatPointer, SatRecord, SatShell,
     SatSphereSurface, SatSplineSurface, SatStraightCurve, SatTorusSurface, SatVertex, Sense,

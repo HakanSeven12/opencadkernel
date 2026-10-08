@@ -1380,7 +1380,7 @@ mod tests {
 
             #[cfg(feature = "acis")]
             if distance > 0.0 {
-                let mut sat = cadcodec::entities::acis::types::SatDocument::default();
+                let mut sat = opencadcodec::entities::acis::types::SatDocument::default();
                 crate::acis::append(&solid, &mut sat).unwrap();
                 let (bodies, loss) = crate::acis::lift(&sat);
                 assert_eq!(bodies.len(), 1, "{loss:?}");
@@ -1464,7 +1464,7 @@ mod tests {
     fn thickened_sector_round_trips_through_acis() {
         let solid = thicken(&cylinder_sheet(PI * 1.99), 0.5).unwrap();
         let expected = analytic_mass_properties(&solid).unwrap();
-        let mut sat = cadcodec::entities::acis::types::SatDocument::default();
+        let mut sat = opencadcodec::entities::acis::types::SatDocument::default();
         crate::acis::append(&solid, &mut sat).unwrap();
         let (bodies, loss) = crate::acis::lift(&sat);
         assert_eq!(bodies.len(), 1, "{loss:?}");

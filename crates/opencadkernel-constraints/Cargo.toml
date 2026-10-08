@@ -1,5 +1,5 @@
 [package]
-name = "cadkernel-constraints"
+name = "opencadkernel-constraints"
 version = "0.1.0"
 edition = "2021"
 description = "Two-dimensional geometric constraint solver"
