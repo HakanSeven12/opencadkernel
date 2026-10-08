@@ -2204,8 +2204,11 @@ fn planar_polygon_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], c
     body.lumps.get_mut(lump)?.shells = vec![shell];
     body.roots = vec![lump];
     // Faces either side of a section edge split over the path share one
-    // surface: join them.
+    // surface: join them, and the straight edges left meeting in line there.
     analytic_ruled_faces(&mut body)?;
+    while let Some(vertex) = { let found = body.vertices.keys().find(|vertex| super::boolean::collinear_pair(&body, *vertex).is_some()); found } {
+        super::boolean::join_edges(&mut body, vertex)?;
+    }
     // Each crossing's trace on the faces it bounds, in their final surfaces.
     for (key, points, start_tangent, end_tangent) in crossings {
         let Some(edge) = body.edges.get(key).cloned() else { continue };

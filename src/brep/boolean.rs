@@ -245,7 +245,7 @@ fn join_faces(body: &mut Body, key: EdgeKey, tolerance: f64) -> Option<()> {
 
 /// Two straight edges meeting in line at a vertex nothing else uses, both
 /// between the same two faces.
-fn collinear_pair(body: &Body, vertex: VertexKey) -> Option<[EdgeKey; 2]> {
+pub(super) fn collinear_pair(body: &Body, vertex: VertexKey) -> Option<[EdgeKey; 2]> {
     let mut edges = body
         .edges
         .iter()
@@ -279,7 +279,7 @@ fn collinear_pair(body: &Body, vertex: VertexKey) -> Option<[EdgeKey; 2]> {
 }
 
 /// Extends the first edge over the second through `vertex`.
-fn join_edges(body: &mut Body, vertex: VertexKey) -> Option<()> {
+pub(super) fn join_edges(body: &mut Body, vertex: VertexKey) -> Option<()> {
     let [keep, gone] = collinear_pair(body, vertex)?;
     let removed = body.edges.remove(gone)?;
     let far = if removed.start == vertex { removed.end } else { removed.start };
