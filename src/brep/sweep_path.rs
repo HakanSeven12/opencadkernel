@@ -1820,20 +1820,22 @@ enum Bound {
     Cross(usize),
 }
 
-/// The band boundary at a left offset of an open planar path, with each
-/// corner joined the way `inner` says (the side the offset lies on): the
-/// pieces in order, with the bounds between them. Pieces may have no
-/// length (an offset on the path itself); the structure depends only on
-/// `inner`, so every offset with the same sides shares it.
-fn polygon_rail(runs: &[Run2], distance: f64, inner: &[bool]) -> Option<(Vec<Run2>, Vec<Bound>)> {
+/// The band boundary at a left offset of a planar path, with each corner
+/// joined the way `inner` says (the side the offset lies on, one per
+/// joint): the pieces in order, with the bounds at both ends of each (one
+/// more bound than pieces). A closed path's boundary starts and ends at its
+/// closing joint. Pieces may have no length (an offset on the path itself);
+/// the structure depends only on `inner`, so every offset with the same
+/// sides shares it.
+fn polygon_rail(runs: &[Run2], distance: f64, inner: &[bool], closed: bool) -> Option<(Vec<Run2>, Vec<Bound>)> {
     let count = runs.len();
     let mut sides = runs.iter().map(|run| run.offset(distance)).collect::<Option<Vec<_>>>()?;
     let mut before = vec![None; count];
     let mut after = vec![None; count];
     let mut joints = vec![Bound::Joint; count];
     let on_path = distance.abs() <= 1e-12;
-    for index in 0..count - 1 {
-        let next = index + 1;
+    for index in 0..inner.len() {
+        let next = (index + 1) % count;
         let (t1, t2) = (runs[index].tangent(1.0), runs[next].tangent(0.0));
         let turn = t1[0] * t2[1] - t1[1] * t2[0];
         if turn.abs() <= 1e-9 && t1[0] * t2[0] + t1[1] * t2[1] > 0.0 {
@@ -1859,7 +1861,8 @@ fn polygon_rail(runs: &[Run2], distance: f64, inner: &[bool]) -> Option<(Vec<Run
             }
         }
     }
-    let (mut pieces, mut bounds) = (Vec::new(), Vec::new());
+    let ends = if closed { joints[count - 1] } else { Bound::Joint };
+    let (mut pieces, mut bounds) = (Vec::new(), vec![ends]);
     for index in 0..count {
         if let Some(run) = before[index] {
             pieces.push(run);
@@ -1870,27 +1873,22 @@ fn polygon_rail(runs: &[Run2], distance: f64, inner: &[bool]) -> Option<(Vec<Run
             bounds.push(Bound::Joint);
             pieces.push(run);
         }
-        if index + 1 < count {
-            bounds.push(joints[index]);
-        }
+        bounds.push(if index + 1 < count { joints[index] } else { ends });
     }
     Some((pieces, bounds))
 }
 
-/// A convex straight-sided section square to an open planar path whose
+/// A straight-sided section square to a planar path, open or closed, whose
 /// corners meet arcs. As the reference modeler joins such a corner, every
 /// slice of the solid along the path's plane is the band its section
 /// sweeps there: on the outer side of a corner each run carries on straight
 /// to where the two meet, on the inner side the runs are cut where they
 /// cross. Each section edge sweeps planes along straight runs and cones
 /// round arcs; the inner crossings are the exact intersections of those
-/// faces.
+/// faces. The section may be concave: every edge sweeps its own faces.
 fn planar_polygon_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], closed: bool) -> Option<Body> {
-    if closed {
-        return None;
-    }
     let (plane, runs) = planar_runs(pieces)?;
-    if !plane.is_orthonormal() || runs.len() < 2 || !corner_on_turn(&runs, false) {
+    if !plane.is_orthonormal() || runs.len() < 2 || !corner_on_turn(&runs, closed) {
         return None;
     }
     let normal = Vec3::from(plane.normal()?);
@@ -1927,7 +1925,7 @@ fn planar_polygon_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], c
     let count = section.len();
     for index in 0..count {
         let (a, b, c) = (section[index], section[(index + 1) % count], section[(index + 2) % count]);
-        if (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]) <= 1e-12 * size * size {
+        if ((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])).abs() <= 1e-12 * size * size {
             return None;
         }
     }
@@ -1943,9 +1941,10 @@ fn planar_polygon_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], c
         }
     }
     let count = vertices.len();
-    let corners = runs.len() - 1;
+    let corners = if closed { runs.len() } else { runs.len() - 1 };
+    let following = |corner: usize| (corner + 1) % runs.len();
     let turns = (0..corners).map(|index| {
-        let (t1, t2) = (runs[index].tangent(1.0), runs[index + 1].tangent(0.0));
+        let (t1, t2) = (runs[index].tangent(1.0), runs[following(index)].tangent(0.0));
         t1[0] * t2[1] - t1[1] * t2[0]
     }).collect::<Vec<_>>();
     let inner_for = |side: f64| turns.iter().map(|turn| side * turn > 0.0).collect::<Vec<_>>();
@@ -2001,8 +2000,8 @@ fn planar_polygon_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], c
         let (k, l) = (index, (index + 1) % count);
         let (a, b) = (vertices[k], vertices[l]);
         let inner = inner_for(side_of(a, b));
-        let (pieces_a, bounds) = polygon_rail(&runs, a[0], &inner)?;
-        let (pieces_b, _) = polygon_rail(&runs, b[0], &inner)?;
+        let (pieces_a, bounds) = polygon_rail(&runs, a[0], &inner, closed)?;
+        let (pieces_b, _) = polygon_rail(&runs, b[0], &inner, closed)?;
         let slots = pieces_a.len();
         // The points of both rails at every bound, the ends included.
         let points = |rail: &[Run2]| {
@@ -2030,15 +2029,20 @@ fn planar_polygon_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], c
         // Edges across the strip at every bound.
         let mut across: Vec<EdgeKey> = Vec::new();
         for bound in 0..=slots {
+            // A closed rail ends where it starts.
+            if closed && bound == slots {
+                across.push(across[0]);
+                continue;
+            }
             if bound > 0 && keys_a[bound] == keys_a[bound - 1] && keys_b[bound] == keys_b[bound - 1] {
                 across.push(*across.last()?);
                 continue;
             }
-            let kind = if bound == 0 || bound == slots { Bound::Joint } else { bounds[bound - 1] };
+            let kind = bounds[bound];
             let from = (keys_a[bound], at_a[bound]);
             let to = (keys_b[bound], at_b[bound]);
             let both_straight = matches!(kind, Bound::Cross(corner)
-                if matches!((runs[corner], runs[corner + 1]), (Run2::Segment(..), Run2::Segment(..))));
+                if matches!((runs[corner], runs[following(corner)]), (Run2::Segment(..), Run2::Segment(..))));
             let edge = match kind {
                 Bound::Cross(corner) if !both_straight => {
                     // The two pieces' crossing as the offset moves along the
@@ -2046,7 +2050,7 @@ fn planar_polygon_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], c
                     let cross = |share: f64| -> Option<Vec3> {
                         let distance = a[0] + (b[0] - a[0]) * share;
                         let height = a[1] + (b[1] - a[1]) * share;
-                        let (one, two) = (runs[corner].offset(distance)?, runs[corner + 1].offset(distance)?);
+                        let (one, two) = (runs[corner].offset(distance)?, runs[following(corner)].offset(distance)?);
                         let end = one.point(1.0);
                         let point = if distance.abs() <= 1e-12 { end } else { one.meet(two, end)? };
                         Some(lift(point, height))
@@ -2191,7 +2195,8 @@ fn planar_polygon_band(pieces: &[Piece], first: Frame, profile: &[Vec<Curve>], c
     }
     let end_tangent = pieces.last()?.tangent(1.0)?;
     let end = pieces.last()?.point(1.0);
-    for (edges, outward, at) in [(start_cap, -start_tangent, start), (end_cap, end_tangent, end)] {
+    let caps = if closed { Vec::new() } else { vec![(start_cap, -start_tangent, start), (end_cap, end_tangent, end)] };
+    for (edges, outward, at) in caps {
         let x = normal.cross(outward).normalize()?;
         let surface = Surface::Plane(Plane::orthonormal(at.to_array(), x.to_array(), outward.to_array())?);
         place(&mut body, surface, &edges, outward, at)?;
