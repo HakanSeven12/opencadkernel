@@ -76,7 +76,8 @@ pub fn append(body: &Body, document: &mut SatDocument) -> Result<Written, Unappe
                 .and_then(|ring| body.faces.get(ring.owner))
                 .ok_or(Unappendable::Inconsistent)?;
             let needs_curve = matches!(body.surfaces.get(face.surface), Some(Surface::Nurbs(_)));
-            match add_pcurve(document, curve, ids.surface(face.surface)) {
+            let curve = acis_pcurve(body, coedge, face.surface, curve);
+            match curve.and_then(|curve| add_pcurve(document, &curve, ids.surface(face.surface))) {
                 Some(id) => {
                     ids.pcurves.insert(key, id);
                 }
@@ -486,6 +487,48 @@ fn add_curve(document: &mut SatDocument, curve: &Curve3) -> Option<i32> {
         spline.is_rational().then_some(spline.weights()),
         0.0,
     ))
+}
+
+/// A coedge's pcurve in the parameterisation ACIS expects: it runs with the
+/// edge and over the edge's own parameter range on a forward coedge, and
+/// over the negated range (so against the edge) on a reversed one. The
+/// kernel keeps pcurves as plain traces in their own parameters, often in
+/// the loop's direction, which the reference rejects as an invalid solid.
+fn acis_pcurve(
+    body: &Body,
+    coedge: &crate::brep::Coedge,
+    surface: SurfaceKey,
+    pcurve: &Curve2,
+) -> Option<Curve2> {
+    use crate::geom2d::NurbsCurve;
+    let nurbs = match pcurve {
+        Curve2::Line(line) => NurbsCurve::new_strict(1, vec![line.start, line.end], vec![0.0, 0.0, 1.0, 1.0], vec![1.0, 1.0])?,
+        Curve2::Nurbs(curve) => curve.clone(),
+        _ => return None,
+    };
+    let surface = body.surfaces.get(surface)?;
+    let edge = body.edges.get(coedge.edge)?;
+    let curve = body.curves.get(edge.curve)?;
+    let (a, b) = (edge.start_parameter, edge.end_parameter);
+    let (start, end) = (Vec3::from(curve.point_at(a)), Vec3::from(curve.point_at(b)));
+    let image = |curve: &NurbsCurve, t: f64| {
+        let uv = curve.point_at(t);
+        Vec3::from(surface.point_at(uv[0], uv[1]))
+    };
+    let (t0, t1) = nurbs.domain();
+    let (first, last) = (image(&nurbs, t0), image(&nurbs, t1));
+    let along = first.distance(start) + last.distance(end);
+    let against = first.distance(end) + last.distance(start);
+    let mut nurbs = if against < along { nurbs.reversed() } else { nurbs };
+    let (low, high) = if coedge.forward { (a, b) } else {
+        nurbs = nurbs.reversed();
+        (-b, -a)
+    };
+    let (t0, t1) = nurbs.domain();
+    let scale = (high - low) / (t1 - t0);
+    let knots = nurbs.knots().iter().map(|knot| low + (knot - t0) * scale).collect();
+    NurbsCurve::new_strict(nurbs.degree(), nurbs.control_points().to_vec(), knots, nurbs.weights().to_vec())
+        .map(Curve2::Nurbs)
 }
 
 fn add_pcurve(
