@@ -140,8 +140,48 @@ pub fn fillets_between(
     if radius.is_nan() || radius <= 0.0 || !radius.is_finite() {
         return Vec::new();
     }
+    // Survey coordinates: solve near the origin and move the fillets back.
+    // The converged path below cannot reach its tolerance at 1e6 otherwise.
+    let anchors = [a.point_at(0.0), b.point_at(0.0)].map(|p| [p[0], p[1], 0.0]);
+    let origin = super::Frame::around(anchors.iter()).origin();
+    if origin[0].abs().max(origin[1].abs()) >= 1e3 {
+        let shift = super::Transform::translation([-origin[0], -origin[1]]);
+        if let (Some(local_a), Some(local_b)) = (a.transformed(&shift), b.transformed(&shift)) {
+            let back = |p: [f64; 2]| [p[0] + origin[0], p[1] + origin[1]];
+            return fillets_between(&local_a, &local_b, radius, tolerance)
+                .into_iter()
+                .map(|f| Fillet {
+                    tangent1: back(f.tangent1),
+                    tangent2: back(f.tangent2),
+                    centre: back(f.centre),
+                    ..f
+                })
+                .collect();
+        }
+    }
+    // A polyline fillets segment by segment, each a line or an arc with a
+    // closed form; taken whole, its corners would seed false centres.
+    if matches!(a, Curve::Polyline(_)) || matches!(b, Curve::Polyline(_)) {
+        let pieces = |c: &Curve| match c {
+            Curve::Polyline(_) => c.segments(),
+            other => vec![other.clone()],
+        };
+        let mut out: Vec<Fillet> = Vec::new();
+        for first in pieces(a) {
+            for second in pieces(b) {
+                for fillet in fillets_between(&first, &second, radius, tolerance) {
+                    let centre = Vec2::from(fillet.centre);
+                    let near = |kept: &Fillet| Vec2::from(kept.centre).distance(centre);
+                    if !out.iter().any(|kept| near(kept) <= tolerance.linear()) {
+                        out.push(fillet);
+                    }
+                }
+            }
+        }
+        return out;
+    }
     let (Some(a_offsets), Some(b_offsets)) = (offsets(a, radius), offsets(b, radius)) else {
-        return Vec::new();
+        return general_fillets(a, b, radius, tolerance);
     };
     let mut out: Vec<Fillet> = Vec::new();
     for first in &a_offsets {
@@ -167,6 +207,160 @@ pub fn fillets_between(
         }
     }
     out
+}
+
+/// How far along a curve a fillet may land, as a parameterised path: the
+/// straight kinds run on as their infinite line and the round ones as their
+/// whole circle or ellipse — a fillet extends them as well as trims — while
+/// a spline or polyline keeps to the part that is drawn.
+struct Extended {
+    curve: Curve,
+    from: f64,
+    to: f64,
+}
+
+impl Extended {
+    fn of(curve: &Curve, reach: f64) -> Option<Self> {
+        use super::curve::EllipseArc;
+        Some(match curve {
+            Curve::Line(_) | Curve::Ray(_) | Curve::XLine(_) => {
+                let (origin, along) = curve.as_ray()?;
+                let unit = Vec2::from(along).normalize()?;
+                // Unit speed, centred on the drawn origin, out to `reach`.
+                let line = Curve::Line(super::curve::Line {
+                    start: (Vec2::from(origin) - unit * reach).to_array(),
+                    end: (Vec2::from(origin) + unit * reach).to_array(),
+                });
+                Self { curve: line, from: 0.0, to: 1.0 }
+            }
+            Curve::Arc(arc) => Self {
+                curve: Curve::Circle(Circle { centre: arc.centre, radius: arc.radius }),
+                from: 0.0,
+                to: 1.0,
+            },
+            Curve::Ellipse(arc) => Self {
+                curve: Curve::Ellipse(EllipseArc::full(arc.ellipse)),
+                from: 0.0,
+                to: 1.0,
+            },
+            other => Self { curve: other.clone(), from: 0.0, to: 1.0 },
+        })
+    }
+
+    fn point(&self, t: f64) -> Vec2 {
+        Vec2::from(self.curve.point_at(t))
+    }
+
+    /// Unit left normal at `t`, by a central difference kept inside the span.
+    fn normal(&self, t: f64) -> Option<Vec2> {
+        let h = 1e-6 * (self.to - self.from);
+        let (lo, hi) = ((t - h).max(self.from), (t + h).min(self.to));
+        (self.point(hi) - self.point(lo)).normalize().map(|d| d.perpendicular())
+    }
+
+    /// The offset point at `t` on `side` (+1 left, -1 right).
+    fn offset(&self, t: f64, side: f64, radius: f64) -> Option<Vec2> {
+        Some(self.point(t) + self.normal(t)? * (radius * side))
+    }
+}
+
+/// Fillets between curves whose offsets have no closed form — an ellipse, a
+/// spline, a polyline — and anything they are paired with.
+///
+/// A fillet centre lies on an offset of each curve, so it is where the two
+/// offset paths cross: sampled to find each crossing, then converged by
+/// Newton on `a(t) + r·n_a(t) = b(u) + r·n_b(u)`. The tangent points are the
+/// curve points the converged parameters name, so they lie on the curves to
+/// the solver's precision rather than to the sampling's.
+fn general_fillets(a: &Curve, b: &Curve, radius: f64, tolerance: Tolerance) -> Vec<Fillet> {
+    const SAMPLES: usize = 256;
+    let size = |c: &Curve| {
+        let pts = c.tessellate(4.0);
+        pts.iter().fold(0.0_f64, |m, p| m.max(Vec2::from(*p).distance(Vec2::from(pts[0]))))
+    };
+    let reach = 4.0 * (size(a) + size(b) + radius);
+    let (Some(ea), Some(eb)) = (Extended::of(a, reach), Extended::of(b, reach)) else {
+        return Vec::new();
+    };
+    let params = |e: &Extended| -> Vec<f64> {
+        (0..=SAMPLES).map(|i| e.from + (e.to - e.from) * i as f64 / SAMPLES as f64).collect()
+    };
+    let (ta, tb) = (params(&ea), params(&eb));
+    let mut out: Vec<Fillet> = Vec::new();
+    for side_a in [1.0, -1.0] {
+        for side_b in [1.0, -1.0] {
+            let pa: Vec<Option<Vec2>> = ta.iter().map(|t| ea.offset(*t, side_a, radius)).collect();
+            let pb: Vec<Option<Vec2>> = tb.iter().map(|t| eb.offset(*t, side_b, radius)).collect();
+            for i in 0..SAMPLES {
+                let (Some(a0), Some(a1)) = (pa[i], pa[i + 1]) else { continue };
+                for j in 0..SAMPLES {
+                    let (Some(b0), Some(b1)) = (pb[j], pb[j + 1]) else { continue };
+                    let Some((s, w)) = super::intersect::line_line(
+                        a0.to_array(),
+                        (a1 - a0).to_array(),
+                        b0.to_array(),
+                        (b1 - b0).to_array(),
+                    ) else {
+                        continue;
+                    };
+                    if !(0.0..=1.0).contains(&s) || !(0.0..=1.0).contains(&w) {
+                        continue;
+                    }
+                    let seed = (ta[i] + (ta[i + 1] - ta[i]) * s, tb[j] + (tb[j + 1] - tb[j]) * w);
+                    let converged = converge(&ea, &eb, side_a, side_b, radius, seed, tolerance);
+                    let Some((t, u)) = converged else { continue };
+                    let (Some(centre), Some(tangent1), tangent2) =
+                        (ea.offset(t, side_a, radius), Some(ea.point(t)), eb.point(u))
+                    else {
+                        continue;
+                    };
+                    if (centre.distance(tangent2) - radius).abs() > tolerance.linear() {
+                        continue;
+                    }
+                    let near = |kept: &Fillet| Vec2::from(kept.centre).distance(centre);
+                    if !out.iter().any(|kept| near(kept) <= tolerance.linear()) {
+                        out.push(arc_through(centre, tangent1, tangent2));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Newton on the offset crossing, from a sampled seed.
+fn converge(
+    a: &Extended,
+    b: &Extended,
+    side_a: f64,
+    side_b: f64,
+    radius: f64,
+    seed: (f64, f64),
+    tolerance: Tolerance,
+) -> Option<(f64, f64)> {
+    let residual = |t: f64, u: f64| -> Option<Vec2> {
+        Some(a.offset(t, side_a, radius)? - b.offset(u, side_b, radius)?)
+    };
+    let (mut t, mut u) = seed;
+    let (ha, hb) = (1e-7 * (a.to - a.from), 1e-7 * (b.to - b.from));
+    for _ in 0..40 {
+        let f = residual(t, u)?;
+        if f.length() <= tolerance.linear() * 1e-3 {
+            return Some((t, u));
+        }
+        let dt = (residual(t + ha, u)? - residual(t - ha, u)?) * (0.5 / ha);
+        let du = (residual(t, u + hb)? - residual(t, u - hb)?) * (0.5 / hb);
+        let det = dt.x * du.y - dt.y * du.x;
+        if det.abs() < 1e-300 {
+            return None;
+        }
+        t -= (f.x * du.y - f.y * du.x) / det;
+        u -= (dt.x * f.y - dt.y * f.x) / det;
+        t = t.clamp(a.from, a.to);
+        u = u.clamp(b.from, b.to);
+    }
+    let f = residual(t, u)?;
+    (f.length() <= tolerance.linear()).then_some((t, u))
 }
 
 /// The two curves parallel to `curve` at `radius`, or `None` where that is

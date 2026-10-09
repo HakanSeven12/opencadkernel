@@ -78,6 +78,9 @@ struct Seen {
     edges: HashMap<u32, EdgeKey>,
     curves: HashMap<u32, CurveKey>,
     surfaces: HashMap<u32, SurfaceKey>,
+    /// Elliptical cones and cylinders, built over a provisional height until
+    /// their faces say how far along the axis they reach.
+    elliptic: Vec<(SurfaceKey, EllipticCone)>,
 }
 
 fn lift_one(
@@ -137,6 +140,7 @@ fn lift_one(
     if body.roots.is_empty() {
         return None;
     }
+    fit_elliptic_cones(&mut body, &seen);
     // The topology is stored in body space; the body's `transform` record
     // places it in the world (a moved solid only rewrites that record).
     let Some(record) = resolve(document, source.transform()) else {
@@ -195,7 +199,6 @@ fn lift_face(
     shell: crate::brep::ShellKey,
 ) -> Option<()> {
     let surface_record = resolve(document, source.surface())?;
-    let reversed_v = analytic_surface_reversed(surface_record);
     let surface = match surface_of(document, body, seen, loss, source.surface()) {
         Some(surface) => surface,
         // Still counted as lost: the patch only stands in for the surface.
@@ -203,7 +206,9 @@ fn lift_face(
     };
     let face = body.faces.insert(Face {
         surface,
-        forward: ((source.sense() == Sense::Forward) != reversed_v) != cone_points_inward(surface_record),
+        // A reversed `v` only turns the parameters, not the normal: the
+        // pcurves read below take it up.
+        forward: (source.sense() == Sense::Forward) != points_inward(surface_record),
         loops: Vec::new(),
         owner: shell,
         provenance: clean(record),
@@ -236,7 +241,12 @@ fn lift_face(
                 note_broken(loss, record);
                 break;
             };
-            let pcurve = read_pcurve(document, source_coedge.pcurve(), reversed_v, body.surfaces.get(surface));
+            let pcurve = read_pcurve(
+                document,
+                source_coedge.pcurve(),
+                surface_record,
+                body.surfaces.get(surface),
+            );
             if let Some(edge) = edge_of(
                 document,
                 body,
@@ -388,6 +398,21 @@ fn edge_of(
             }
             (low, high)
         }
+        // A whole circle or ellipse: one vertex, one turn, and the vertex
+        // fixes where the turn starts. The stored range only says which turn
+        // — negated on a reversed edge — and ACIS before 7.0 writes none at
+        // all, which read as zero collapsed the circle to a point.
+        Some(shape @ (Curve3::Circle(_) | Curve3::Ellipse(_))) if !apart => {
+            let near = if edge_forward { stored_low } else { -stored_high };
+            let low = periodic_near(shape.parameter_at(ends.0), near, TAU);
+            (low, low + TAU)
+        }
+        Some(shape @ Curve3::Nurbs(nurbs))
+            if !apart && nurbs.periodicity() && stored_high - stored_low <= 1e-12 =>
+        {
+            let low = shape.parameter_at(ends.0);
+            (low, low + (nurbs.domain().1 - nurbs.domain().0))
+        }
         _ => (stored_low, stored_high),
     };
     let key = body.edges.insert(Edge {
@@ -482,9 +507,8 @@ fn partner_surface_curve(
     let owner_loop = SatLoop::from_record(resolve(document, partner.owner_loop())?)?;
     let face = SatFace::from_record(resolve(document, owner_loop.face())?)?;
     let surface_record = resolve(document, face.surface())?;
-    let reversed_v = analytic_surface_reversed(surface_record);
     let surface = read_surface(document, surface_record)?;
-    let pcurve = read_pcurve(document, partner.pcurve(), reversed_v, Some(&surface))?;
+    let pcurve = read_pcurve(document, partner.pcurve(), surface_record, Some(&surface))?;
     surface_curve(&surface, &pcurve)
 }
 
@@ -656,10 +680,20 @@ fn pcurve_on_edge(
 fn read_pcurve(
     document: &SatDocument,
     pointer: SatPointer,
-    reversed_v: bool,
+    surface_record: &SatRecord,
     surface: Option<&Surface>,
 ) -> Option<Curve2> {
     let source = SatPCurve::from_record(resolve(document, pointer)?)?;
+    let reversed_v = analytic_surface_reversed(surface_record);
+    // A plane's parameters run along its stored u derivative, which need not
+    // be unit; the kernel's plane is.
+    let scale = SatPlaneSurface::from_record(surface_record)
+        .map(|plane| {
+            let (x, y, z) = plane.u_direction();
+            Vec3::new(x, y, z).length()
+        })
+        .filter(|length| length.is_finite() && *length > 0.0)
+        .unwrap_or(1.0);
     let (degree, knots, controls) = source.bspline_in(document)?;
     let mut points = Vec::with_capacity(controls.len());
     let mut weights = Vec::with_capacity(controls.len());
@@ -668,7 +702,7 @@ fn read_pcurve(
         if !weight.is_finite() || weight <= 0.0 {
             return None;
         }
-        let mut point = [control[0] / weight, control[1] / weight];
+        let mut point = [control[0] / weight * scale, control[1] / weight * scale];
         if reversed_v {
             point[1] = -point[1];
         }
@@ -688,10 +722,12 @@ fn analytic_surface_reversed(record: &SatRecord) -> bool {
 }
 
 /// A cone record with a negative cosine has its normal towards the axis (the
-/// inner wall of a swept bend, for example). The kernel's cones and
-/// cylinders always face away from the axis, so the face turns instead.
-fn cone_points_inward(record: &SatRecord) -> bool {
+/// inner wall of a swept bend, for example), and a sphere with a negative
+/// radius towards its centre. The kernel's cones, cylinders and spheres
+/// always face outward, so the face turns instead.
+fn points_inward(record: &SatRecord) -> bool {
     SatConeSurface::from_record(record).is_some_and(|cone| cone.cos_half_angle() < 0.0)
+        || SatSphereSurface::from_record(record).is_some_and(|sphere| sphere.radius() < 0.0)
 }
 
 fn surface_of(
@@ -712,7 +748,126 @@ fn surface_of(
     })?;
     let key = body.surfaces.insert(surface);
     seen.surfaces.insert(index, key);
+    if let Some(cone) = EllipticCone::from_record(record) {
+        seen.elliptic.push((key, cone));
+    }
     Some(key)
+}
+
+/// A cone or cylinder whose cross-section is an ellipse. The kernel's
+/// analytic cones are circular, so it becomes the exact rational surface
+/// instead: a full rational quadratic ellipse swept linearly along the axis,
+/// scaling as it goes. Linear in height because the section's scale is.
+#[derive(Debug, Clone, Copy)]
+struct EllipticCone {
+    centre: Vec3,
+    major: Vec3,
+    minor: Vec3,
+    axis: Vec3,
+    /// How the section scales per unit of height (zero for a cylinder).
+    shrink: f64,
+}
+
+impl EllipticCone {
+    fn from_record(record: &SatRecord) -> Option<Self> {
+        let cone = SatConeSurface::from_record(record)?;
+        let ratio = cone.ratio();
+        if !ratio.is_finite() || ratio <= 0.0 || (ratio - 1.0).abs() <= 1e-12 {
+            return None;
+        }
+        let (cx, cy, cz) = cone.center();
+        let (ax, ay, az) = cone.axis();
+        let (mx, my, mz) = cone.major_axis();
+        let radius = Vec3::new(mx, my, mz).length();
+        let frame = Plane::orthonormal([cx, cy, cz], [mx, my, mz], [ax, ay, az])?;
+        let axis = Vec3::from(frame.normal()?);
+        // Same half-angle convention as the circular cone in `read_surface`.
+        let (sine, cosine) = (cone.sin_half_angle(), cone.cos_half_angle());
+        let (sine, cosine) = if cosine < 0.0 { (-sine, -cosine) } else { (sine, cosine) };
+        let tangent = (-sine.atan2(cosine)).tan();
+        (radius > 0.0 && tangent.is_finite()).then_some(Self {
+            centre: Vec3::new(cx, cy, cz),
+            major: Vec3::from(frame.x_axis) * radius,
+            minor: Vec3::from(frame.y_axis) * (radius * ratio),
+            axis,
+            shrink: tangent / radius,
+        })
+    }
+
+    fn height_of(&self, point: [f64; 3]) -> f64 {
+        (Vec3::from(point) - self.centre).dot(self.axis)
+    }
+
+    /// The surface between heights `low` and `high` along the axis. `u` runs
+    /// counter-clockwise about the axis and `v` up it, so the normal faces
+    /// away from the axis like the kernel's own cones.
+    fn surface(&self, low: f64, high: f64) -> Option<NurbsSurface3> {
+        let corner = std::f64::consts::FRAC_1_SQRT_2;
+        let section: [(f64, f64, f64); 9] = [
+            (1.0, 0.0, 1.0),
+            (1.0, 1.0, corner),
+            (0.0, 1.0, 1.0),
+            (-1.0, 1.0, corner),
+            (-1.0, 0.0, 1.0),
+            (-1.0, -1.0, corner),
+            (0.0, -1.0, 1.0),
+            (1.0, -1.0, corner),
+            (1.0, 0.0, 1.0),
+        ];
+        let at = |x: f64, y: f64, height: f64| {
+            let scale = 1.0 - height * self.shrink;
+            let across = (self.major * x + self.minor * y) * scale;
+            (self.centre + across + self.axis * height).to_array()
+        };
+        let points = section.iter().map(|&(x, y, _)| vec![at(x, y, low), at(x, y, high)]).collect();
+        let weights = section.iter().map(|&(_, _, w)| vec![w, w]).collect();
+        let knots = vec![0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0];
+        NurbsSurface3::new(2, 1, points, knots, vec![0.0, 0.0, 1.0, 1.0], Some(weights))
+    }
+}
+
+/// Bounds each elliptical cone's height by the edges of the faces on it, a
+/// little past them so meshing never clamps a boundary point. Any pcurves
+/// were written in the record's own parameters, which the rational surface
+/// does not share; the edges' 3D curves bound those faces instead.
+fn fit_elliptic_cones(body: &mut Body, seen: &Seen) {
+    for (key, cone) in &seen.elliptic {
+        let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+        let mut coedges = Vec::new();
+        for (_, face) in body.faces.iter().filter(|(_, face)| face.surface == *key) {
+            for ring in &face.loops {
+                let Some(ring) = body.loops.get(*ring) else { continue };
+                for coedge in &ring.coedges {
+                    coedges.push(*coedge);
+                    let edge = body.coedges.get(*coedge).and_then(|c| body.edges.get(c.edge));
+                    let Some(edge) = edge else { continue };
+                    let Some(curve) = body.curves.get(edge.curve) else { continue };
+                    let span = edge.end_parameter - edge.start_parameter;
+                    for i in 0..=32 {
+                        let t = edge.start_parameter + span * i as f64 / 32.0;
+                        let height = cone.height_of(curve.point_at(t));
+                        if height.is_finite() {
+                            low = low.min(height);
+                            high = high.max(height);
+                        }
+                    }
+                }
+            }
+        }
+        if !(high >= low) {
+            continue;
+        }
+        let pad = ((high - low) * 0.05).max(1e-6 * (1.0 + low.abs().max(high.abs())));
+        let Some(surface) = cone.surface(low - pad, high + pad) else { continue };
+        if let Some(slot) = body.surfaces.get_mut(*key) {
+            *slot = Surface::Nurbs(surface);
+        }
+        for coedge in coedges {
+            if let Some(coedge) = body.coedges.get_mut(coedge) {
+                coedge.pcurve = None;
+            }
+        }
+    }
 }
 
 fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
@@ -728,6 +883,11 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
             [nx, ny, nz],
         )?));
     }
+    if let Some(cone) = EllipticCone::from_record(record) {
+        // Provisional height; `fit_elliptic_cones` bounds it by its faces.
+        let reach = cone.major.length().max(cone.minor.length());
+        return Some(Surface::Nurbs(cone.surface(-reach, reach)?));
+    }
     if let Some(cone) = SatConeSurface::from_record(record) {
         let (cx, cy, cz) = cone.center();
         let (ax, ay, az) = cone.axis();
@@ -737,7 +897,7 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
         let radius = Vec3::new(mx, my, mz).length();
         let base = Plane::orthonormal([cx, cy, cz], [mx, my, mz], [ax, ay, az])?;
         // Only the ratio shapes the cone; a negative cosine flips the normal,
-        // which `cone_points_inward` carries on the face.
+        // which `points_inward` carries on the face.
         let (sine, cosine) = (cone.sin_half_angle(), cone.cos_half_angle());
         let (sine, cosine) = if cosine < 0.0 { (-sine, -cosine) } else { (sine, cosine) };
         return Some(if sine.abs() < 1e-12 {
@@ -756,7 +916,7 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
         let (px, py, pz) = sphere.pole();
         return Some(Surface::Sphere(Sphere {
             frame: Plane::orthonormal([cx, cy, cz], [ux, uy, uz], [px, py, pz])?,
-            radius: sphere.radius(),
+            radius: sphere.radius().abs(),
         }));
     }
     if let Some(torus) = SatTorusSurface::from_record(record) {

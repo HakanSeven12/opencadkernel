@@ -46,6 +46,29 @@ pub fn analytic_mass_properties(body: &Body) -> Option<MassProperties> {
         .or_else(|| cylinder_properties(body))
 }
 
+/// Mass properties of any closed body: exact where
+/// [`analytic_mass_properties`] knows the shape, otherwise integrated over a
+/// mesh fine enough that the answer holds to a few parts in a hundred
+/// thousand. `None` when the body cannot be meshed whole.
+pub fn mass_properties(body: &Body) -> Option<MassProperties> {
+    if let Some(properties) = analytic_mass_properties(body) {
+        return Some(properties);
+    }
+    let points: Vec<[f64; 3]> = body.vertices.iter().map(|(_, vertex)| vertex.point).collect();
+    let size = super::bounds::around_points(&points)
+        .map(|bounds| Vec3::from(bounds.min).distance(Vec3::from(bounds.max)))
+        .filter(|size| *size > 0.0)
+        .unwrap_or(1.0);
+    let mesh = super::mesh::tessellate(
+        body,
+        super::mesh::TessellationTolerance::new(0.02, size * 1e-6),
+    );
+    if !mesh.missing_faces.is_empty() {
+        return None;
+    }
+    mesh.mesh.inertial_properties()
+}
+
 fn cylindrical_sector_properties(body: &Body) -> Option<MassProperties> {
     let mut cylinders = Vec::new();
     for face_key in body.face_keys() {

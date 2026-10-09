@@ -23,6 +23,7 @@ pub(crate) mod constrained;
 pub mod constraint_inference;
 pub mod cross;
 pub mod curve;
+pub mod curve_offset;
 pub mod deviation;
 pub mod dimension;
 pub mod fillet;
@@ -60,6 +61,7 @@ pub use construct::{
 };
 pub use cross::{intersect, Crossing};
 pub use curve::{Arc, Circle, Curve, EllipseArc, Extent, Line, Ray, XLine};
+pub use curve_offset::offset_curve;
 pub use nurbs::{NurbsCurve, Parameterization};
 pub use frame::Frame;
 pub use fillet::{fillet_between_rays, fillets_between, Fillet};

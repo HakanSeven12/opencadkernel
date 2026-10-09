@@ -91,8 +91,7 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
         // On a cylinder `u` runs round and `v` along the axis, so the two
         // curves that stay straight there are the ones aligned with it: a
         // circle at one height, and a generator. A slanted section is a sine
-        // wave, which is why the general case is absent rather than
-        // approximated.
+        // wave, kept as a sampled chain.
         Surface::Cylinder(cylinder) => match curve {
             Curve3::Circle(circle) => {
                 let axis = Vec3::from(cylinder.base.normal()?);
@@ -115,7 +114,7 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
                     line.origin,
                 )?))
             }
-            _ => None,
+            _ => sampled_closed_conic(surface, curve),
         },
 
         // The same two shapes on a cone, with `v` measured along the axis as
@@ -146,7 +145,7 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
                 }
                 Some(generator_at(start))
             }
-            _ => None,
+            _ => sampled_closed_conic(surface, curve),
         },
 
         // A torus closes both ways, so both families of circles on it are
@@ -154,7 +153,7 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
         // one place on the tube, and the meridians, which run round the tube
         // at one place on the ring. Between them they are every edge a
         // revolution puts on one. Anything else — a circle cutting across
-        // both — is a quartic's section and has no closed form here.
+        // both — is a quartic's section, kept as a sampled chain.
         Surface::Torus(torus) => match curve {
             Curve3::Circle(circle) => {
                 let axis = Vec3::from(torus.frame.normal()?);
@@ -176,10 +175,10 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
                 } else if plane_normal.dot(axis).abs() <= tolerance {
                     Some(meridian_at(angle_about(&torus.frame, circle.plane.origin)?))
                 } else {
-                    None
+                    sampled_closed_conic(surface, curve)
                 }
             }
-            _ => None,
+            _ => sampled_closed_conic(surface, curve),
         },
 
         // A latitude is straight in a sphere's `(u, v)` space. This is the
@@ -214,7 +213,7 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
                         curve.point_at(0.0),
                     )?));
                 }
-                sampled_sphere_circle(surface, curve)
+                sampled_closed_conic(surface, curve)
             }
             _ => None,
         },
@@ -251,37 +250,47 @@ fn sampled_image(surface: &Surface, curve: &Curve3) -> Option<Curve> {
     }))
 }
 
-/// A general circle on a sphere is not a conic in longitude/latitude space.
-/// Store its pcurve as a dense closed parameter-space chain through exact
-/// samples while retaining the analytic circle as the space edge.
-fn sampled_sphere_circle(surface: &Surface, curve: &Curve3) -> Option<Curve> {
+/// A closed conic with no closed-form image — a general circle on a
+/// sphere, a slanted section of a cylinder (a sine wave), a conic across a
+/// cone or a torus. Its pcurve is a dense parameter-space chain through
+/// exact samples while the analytic curve stays the space edge.
+fn sampled_closed_conic(surface: &Surface, curve: &Curve3) -> Option<Curve> {
     const SAMPLES: usize = 96;
-    let mut points = Vec::with_capacity(SAMPLES);
-    let mut previous = None;
-    for index in 0..SAMPLES {
-        let parameter = TAU * index as f64 / SAMPLES as f64;
-        let (mut u, v) = surface.parameters_at(curve.point_at(parameter))?;
-        if let Some(last) = previous {
-            u = unwound(u, last, TAU);
-        }
-        previous = Some(u);
-        points.push([u, v]);
-    }
-    let (mut final_u, final_v) = surface.parameters_at(curve.point_at(TAU))?;
-    final_u = unwound(final_u, previous?, TAU);
-    let first = points[0];
-    if (final_v - first[1]).abs() > 1.0e-6 {
+    if !matches!(curve, Curve3::Circle(_) | Curve3::Ellipse(_)) {
         return None;
     }
-    // A circle round the pole axis comes back a turn along, like a band of
-    // latitude: one turn, left open, which its periodic images continue.
-    let closed = match (final_u - first[0]).abs() {
-        gap if gap <= 1.0e-6 => true,
-        gap if (gap - TAU).abs() <= 1.0e-6 => false,
-        _ => return None,
+    let periods = periods(surface);
+    let unwind = |here: [f64; 2], last: [f64; 2]| -> [f64; 2] {
+        std::array::from_fn(|axis| match periods[axis] {
+            Some(period) => unwound(here[axis], last[axis], period),
+            None => here[axis],
+        })
     };
+    let mut points: Vec<[f64; 2]> = Vec::with_capacity(SAMPLES + 1);
+    for index in 0..SAMPLES {
+        let parameter = TAU * index as f64 / SAMPLES as f64;
+        let (u, v) = surface.parameters_at(curve.point_at(parameter))?;
+        let here = points.last().map_or([u, v], |last| unwind([u, v], *last));
+        points.push(here);
+    }
+    let (u, v) = surface.parameters_at(curve.point_at(TAU))?;
+    let last = unwind([u, v], *points.last()?);
+    let first = points[0];
+    // A curve round the axis comes back a turn along, like a band of
+    // latitude: one turn, left open, which its periodic images continue.
+    let mut closed = true;
+    for axis in 0..2 {
+        let gap = (last[axis] - first[axis]).abs();
+        if gap <= 1.0e-6 {
+            continue;
+        }
+        match periods[axis] {
+            Some(period) if (gap - period).abs() <= 1.0e-6 => closed = false,
+            _ => return None,
+        }
+    }
     if !closed {
-        points.push([final_u, final_v]);
+        points.push(last);
     }
     Some(Curve::Polyline(Polyline {
         vertices: points
@@ -674,6 +683,8 @@ pub(crate) fn contains_parameter(
     tolerance: crate::geom2d::Tolerance,
 ) -> bool {
     let periods = periods(surface);
+    let closed = apex_closed(surface, boundary, tolerance);
+    let boundary = closed.as_deref().unwrap_or(boundary);
     // A band's rims are not polygons, and a polygon test over them reads a
     // point in one of the band's holes as inside it; counted along `v` the
     // holes and rims all answer alike.
@@ -701,6 +712,65 @@ pub(crate) fn contains_parameter(
         point[1] >= levels[0] - tolerance.linear()
             && point[1] <= levels[1] + tolerance.linear()
     })
+}
+
+/// A cone face running up to its apex along a seam has no edge there: in
+/// `(u, v)` its loop stops at one end of the apex line and goes on from the
+/// other, an open chain no polygon test reads. The apex line closes it.
+/// `None` when nothing needed closing.
+pub(super) fn apex_closed(
+    surface: &Surface,
+    boundary: &[Curve],
+    tolerance: crate::geom2d::Tolerance,
+) -> Option<Vec<Curve>> {
+    let Surface::Cone(cone) = surface else {
+        return None;
+    };
+    let apex = cone.radius / cone.half_angle.tan();
+    if !apex.is_finite() {
+        return None;
+    }
+    let slack = tolerance.linear().max(apex.abs() * 1e-9);
+    let at_apex = |point: [f64; 2]| (point[1] - apex).abs() <= slack;
+    let joined = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= TAU * 1e-3;
+    let line = |start: [f64; 2], end: [f64; 2]| Curve::Line(Line { start, end });
+    let mut out = Vec::with_capacity(boundary.len() + 3);
+    let mut changed = false;
+    let mut loop_start = 0;
+    // Where a rim running once round ends, and from where it started.
+    let mut wrapping = Vec::new();
+    for (index, curve) in boundary.iter().enumerate() {
+        out.push(curve.clone());
+        let end = curve.point_at(1.0);
+        match boundary.get(index + 1).map(|next| next.point_at(0.0)) {
+            Some(next) if joined(next, end) => continue,
+            Some(next) if at_apex(end) && at_apex(next) => {
+                out.push(line(end, next));
+                changed = true;
+                continue;
+            }
+            _ => {}
+        }
+        let start = boundary[loop_start].point_at(0.0);
+        if !joined(start, end) && at_apex(start) && at_apex(end) {
+            out.push(line(end, start));
+            changed = true;
+        } else if ((end[0] - start[0]).abs() - TAU).abs() <= TAU * 1e-3
+            && (end[1] - start[1]).abs() <= TAU * 1e-3
+        {
+            wrapping.push((out.len(), start, end));
+        }
+        loop_start = index + 1;
+    }
+    // A face with one rim round the cone and nothing else — its apex loop
+    // has no curve — is everything from the rim up to the apex.
+    if let [(at, start, end)] = wrapping[..] {
+        let (over_end, over_start) = ([end[0], apex], [start[0], apex]);
+        let closing = [line(end, over_end), line(over_end, over_start), line(over_start, start)];
+        out.splice(at..at, closing);
+        changed = true;
+    }
+    changed.then_some(out)
 }
 
 /// Whether a point is inside a band — a face whose rims wrap round the
@@ -835,14 +905,16 @@ fn periodic_band_levels(
     let period = periods(surface)[0]?;
     let mut levels: Vec<(f64, f64)> = Vec::new();
     for curve in boundary {
-        let Curve::Line(line) = curve else {
-            return None;
-        };
-        if (line.end[1] - line.start[1]).abs() > tolerance {
+        // Any curve that holds one `v` — a line, or a spline rim on a
+        // spline band.
+        let (start, end) = (curve.point_at(0.0), curve.point_at(1.0));
+        if (1..8).any(|step| (curve.point_at(step as f64 / 8.0)[1] - start[1]).abs() > tolerance)
+            || (end[1] - start[1]).abs() > tolerance
+        {
             return None;
         }
-        let level = 0.5 * (line.start[1] + line.end[1]);
-        let span = (line.end[0] - line.start[0]).abs();
+        let level = 0.5 * (start[1] + end[1]);
+        let span = (end[0] - start[0]).abs();
         if let Some((_, covered)) = levels
             .iter_mut()
             .find(|(existing, _)| (*existing - level).abs() <= tolerance)
@@ -852,10 +924,13 @@ fn periodic_band_levels(
             levels.push((level, span));
         }
     }
+    // Coverage is an angle, the tolerance a length: on a small cylinder the
+    // pieces of a cut rim meet a few nano-radians apart and still close.
+    let slack = tolerance.max(period * 1e-6);
     if levels.len() != 2
         || levels
             .iter()
-            .any(|(_, covered)| *covered < period - tolerance)
+            .any(|(_, covered)| *covered < period - slack)
     {
         return None;
     }
