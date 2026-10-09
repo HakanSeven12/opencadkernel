@@ -6,7 +6,9 @@
 //! that changes concave solids, holes, and unrelated lumps into another shape.
 
 use super::nurbs_builder::RationalCurve2;
-use super::{Body, Curve3, EdgeKey, FaceKey, Meeting, Operation, Placement, Surface};
+use super::{
+    Body, CoedgeKey, Curve3, EdgeKey, FaceKey, LoopKey, Meeting, Operation, Placement, Surface,
+};
 use crate::geom2d::{Arc, Curve, EllipseArc, Line, Polyline, PolylineVertex, Tolerance, Transform};
 use crate::space::{Plane, Vec3};
 use std::collections::{HashMap, HashSet};
@@ -119,7 +121,8 @@ pub fn presspull_face(
     let profile = planar_face_profile(body, key)?;
     match mode {
         PresspullMode::Extrude => glued_pull(body, key, &profile, distance)
-            .or_else(|| presspull_region(body, &profile, distance)),
+            .or_else(|| presspull_region(body, &profile, distance))
+            .or_else(|| glued_clear_pull(body, key, &profile, distance)),
         PresspullMode::Offset => {
             // Working near the edited face avoids cancellation in intersections
             // of unit-sized solids located far from the world origin.
@@ -134,7 +137,8 @@ pub fn presspull_face(
     }
 }
 
-/// An offset of a convex face whose every neighbour is a plane: the slab
+/// An offset of a convex face whose every neighbour round its outside is a
+/// plane, and whose holes have upright walls: the slab
 /// between the face and where it moves to, on the face's side of each
 /// neighbour's plane, is what the edit takes away or adds — each neighbour
 /// running on along its own plane, and dropping out where the others close
@@ -146,29 +150,49 @@ fn convex_offset(
     profile: &PlanarFaceProfile,
     distance: f64,
 ) -> Option<Body> {
-    if profile.loops.len() != 1 {
-        return None;
-    }
     let tolerance = super::operation_tolerance(&[body]);
     let normal = Vec3::from(profile.outward);
-    let corners = |face: FaceKey| -> Option<Vec<Vec3>> {
-        body.face_coedges(face)
-            .into_iter()
-            .map(|coedge| {
-                let (start, _) = body.coedge_vertices(coedge)?;
-                Some(Vec3::from(body.vertices.get(start)?.point))
-            })
-            .collect()
+    let rings = &body.faces.get(key)?.loops;
+    if rings.len() != profile.loops.len() {
+        return None;
+    }
+    let coedges_of = |ring: LoopKey| -> Option<Vec<CoedgeKey>> {
+        Some(body.loops.get(ring)?.coedges.clone())
     };
-    let own = corners(key)?;
-    let mut sides: Vec<(Vec3, Vec3, bool)> = Vec::new();
-    for coedge in body.face_coedges(key) {
+    let neighbour_of = |coedge: CoedgeKey| -> Option<FaceKey> {
         let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
-        let neighbour = edge.coedges.iter().find_map(|other| {
+        edge.coedges.iter().find_map(|other| {
             let face = body.loops.get(body.coedges.get(*other)?.owner)?.owner;
             (face != key).then_some(face)
-        })?;
-        let node = body.faces.get(neighbour)?;
+        })
+    };
+    // A hole's walls must stand square to the face, so the hole runs on
+    // through whatever the face moves through.
+    for ring in &rings[1..] {
+        for coedge in coedges_of(*ring)? {
+            let node = body.faces.get(neighbour_of(coedge)?)?;
+            let upright = match body.surfaces.get(node.surface)? {
+                Surface::Plane(plane) => Vec3::from(plane.normal()?).dot(normal).abs() <= 1e-9,
+                Surface::Cylinder(cylinder) => {
+                    Vec3::from(cylinder.base.normal()?).dot(normal).abs() >= 1.0 - 1e-9
+                }
+                _ => false,
+            };
+            if !upright {
+                return None;
+            }
+        }
+    }
+    let own: Vec<Vec3> = coedges_of(rings[0])?
+        .into_iter()
+        .map(|coedge| {
+            let (start, _) = body.coedge_vertices(coedge)?;
+            Some(Vec3::from(body.vertices.get(start)?.point))
+        })
+        .collect::<Option<_>>()?;
+    let mut sides: Vec<(Vec3, Vec3, bool)> = Vec::new();
+    for coedge in coedges_of(rings[0])? {
+        let node = body.faces.get(neighbour_of(coedge)?)?;
         let Surface::Plane(plane) = body.surfaces.get(node.surface)? else {
             return None;
         };
@@ -205,7 +229,15 @@ fn convex_offset(
         let grown = if distance < 0.0 && convex { origin + side * lift } else { origin };
         planes.push((grown, side));
     }
-    let slab = super::blend::bounded_by(&planes, tolerance)?;
+    let mut slab = super::blend::bounded_by(&planes, tolerance)?;
+    // Each hole, a column through the slab and a little past both ends.
+    for ring in &profile.loops[1..] {
+        let mut base = profile.plane;
+        base.origin = at(low - lift).to_array();
+        let reach = normal * (high - low + 2.0 * lift);
+        let column = super::extrude_region(base, &[split_closed_curves(ring)], reach.to_array())?;
+        slab = super::combine(slab, column, Operation::Difference, tolerance).ok()?;
+    }
     let how = if distance < 0.0 { Operation::Difference } else { Operation::Union };
     let edited = super::combine(body.clone(), slab, how, tolerance).ok()?;
     (!edited.roots.is_empty() && edited.validate().is_empty()).then_some(edited)
@@ -255,6 +287,46 @@ fn glued_pull(
     region: &PlanarFaceProfile,
     distance: f64,
 ) -> Option<Body> {
+    glued(body, key, region, distance, false)
+}
+
+/// [`glued_pull`] for a body not wholly behind the face, where the prism
+/// the face is pulled through, started a little off the face, meets none of
+/// it: the walls and top still join the body along the face's edges alone.
+fn glued_clear_pull(
+    body: &Body,
+    key: FaceKey,
+    region: &PlanarFaceProfile,
+    distance: f64,
+) -> Option<Body> {
+    if distance <= 0.0 {
+        return None;
+    }
+    let normal = Vec3::from(region.outward).normalize()?;
+    let origin = Vec3::from(region.plane.origin);
+    let local = super::transform(body, &Placement::at((-origin).to_array()))?;
+    let tolerance = super::operation_tolerance(&[&local]);
+    let lift = tolerance * 1e3;
+    let mut plane = region.plane;
+    plane.origin = (normal * lift).to_array();
+    let loops: Vec<Vec<Curve>> =
+        region.loops.iter().map(|ring| split_closed_curves(ring)).collect();
+    let tool = super::extrude_region(plane, &loops, (normal * (distance - lift)).to_array())?;
+    let tolerance = tolerance.max(super::operation_tolerance(&[&tool]));
+    let met = super::combine(local, tool, Operation::Intersection, tolerance).ok()?;
+    if !met.faces.is_empty() {
+        return None;
+    }
+    glued(body, key, region, distance, true)
+}
+
+fn glued(
+    body: &Body,
+    key: FaceKey,
+    region: &PlanarFaceProfile,
+    distance: f64,
+    clear: bool,
+) -> Option<Body> {
     if distance <= 0.0 {
         return None;
     }
@@ -299,7 +371,7 @@ fn glued_pull(
             }),
         }
     });
-    if !edges_behind || !faces_behind {
+    if !clear && (!edges_behind || !faces_behind) {
         return None;
     }
     let mut plane = region.plane;
