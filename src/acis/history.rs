@@ -1389,9 +1389,13 @@ pub fn rebuild_extrusion_with_mode(value: &SolidHistorySweep, surface: bool) -> 
     {
         return Err(HistoryRebuildError::Unsupported);
     }
+    // Flags 295/296: the profile and path are stored where they stand, and
+    // the matrices only describe their frames (the reference writes an
+    // extrusion so, with the profile frame at its anchor).
+    let (profile_transform, path_transform) = sweep_entity_transforms(value);
     let (plane, wires, closed) = sweep_profile_geometry(
         value.sweep_entity.as_ref().ok_or(HistoryRebuildError::InvalidParameters)?,
-        value.sweep_entity_transform,
+        profile_transform,
     )?;
     if !surface && !closed { return Err(HistoryRebuildError::InvalidParameters); }
     let body = if let Some(path) = value.path_entity.as_ref() {
@@ -1399,7 +1403,7 @@ pub fn rebuild_extrusion_with_mode(value: &SolidHistorySweep, surface: bool) -> 
             return Err(HistoryRebuildError::Unsupported);
         }
         let pieces = &wires[0];
-        let mut path = placed_curve(embedded_curve(path)?, value.path_entity_transform)?;
+        let mut path = placed_curve(embedded_curve(path)?, path_transform)?;
         let profile_center = pieces
             .iter()
             .map(|piece| Vec3::from(plane.point_at(piece.point_at(0.0))))
