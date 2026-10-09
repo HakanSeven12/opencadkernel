@@ -42,6 +42,11 @@ pub struct SweepOptions {
     pub bank: bool,
     /// Omit caps, including when the supplied profile is closed.
     pub surface: bool,
+    /// Axes of the profile's own plane where it was drawn, when the profile
+    /// supplied has already been placed on the path. They size the rail a
+    /// scaled sweep follows (see `sweep_rail_length`); `None` uses the
+    /// supplied profile plane.
+    pub profile_axes: Option<[[f64; 3]; 2]>,
 }
 
 impl Default for SweepOptions {
@@ -54,6 +59,7 @@ impl Default for SweepOptions {
             scale: 1.0,
             bank: false,
             surface: false,
+            profile_axes: None,
         }
     }
 }
@@ -449,11 +455,14 @@ fn sweep_path_lifted(
     if !sheet && up.abs() <= 1e-8 {
         return None;
     }
+    let rail = sweep_rail_length(&source_wires,
+        options.profile_axes.unwrap_or([profile_plane.x_axis, profile_plane.y_axis]), tangent)
+        .map(|length| RailLaw { length, twist: options.twist });
     if lift.is_some() {
         let radius = wires.iter().flat_map(|wire| &wire.curves).flat_map(|curve| &curve.points)
             .map(|p| Vec3::from(profile_plane.point_at(*p)).distance(base))
             .fold(1.0_f64, f64::max) * options.scale.max(1.0);
-        let (patches, runs) = transported_runs(&pieces, first, options, extent, radius, closed)?;
+        let (patches, runs) = transported_runs(&pieces, first, options, extent, radius, closed, rail)?;
         return build_body_in_runs(&wires, &patches, &runs, true, closed, true, false, lift);
     }
     if up.abs() > 1.0 - 1e-10 && rotationally_invariant(&source_wires) {
@@ -527,10 +536,11 @@ fn sweep_path_lifted(
         }
     }
     let (patches, runs) = transported_runs(&pieces, first, options,
-        extent, radius, closed)?;
+        extent, radius, closed, rail)?;
     // A sheet need not sweep out any volume (for example an in-plane line
     // translated sideways), so only solid sections use the volume check.
-    let outward = if sheet { up >= 0.0 } else { regular_transport(&wires, &patches)? };
+    let deformed = options.twist.abs() > 1e-12 || (options.scale - 1.0).abs() > 1e-12;
+    let outward = if sheet { up >= 0.0 } else { regular_transport(&wires, &patches, deformed)? };
     if options.twist.abs() <= 1e-12 && (options.scale - 1.0).abs() <= 1e-12 {
         let mut exact = build_body(&wires, &patches, sheet, closed, outward)?;
         let all_analytic = |body: &Body| body.faces.iter().all(|(_, face)|
@@ -543,8 +553,33 @@ fn sweep_path_lifted(
     let joined = build_body_in_runs(&wires, &patches, &runs, sheet, closed, outward, true, None)?;
     // A run face too large to triangulate falls back to one face per patch.
     // ponytail: probe meshing at display settings; replace with a cheaper size bound if this shows up in profiles.
-    let meshes = joined.face_keys().all(|face| super::mesh::face(&joined, face, 0.05, 1e-5).is_some());
+    let meshes = super::mesh::tessellate(&joined, super::mesh::TessellationTolerance::new(0.05, 1e-5)).missing_faces.is_empty();
     if meshes { Some(joined) } else { build_body(&wires, &patches, sheet, closed, outward) }
+}
+
+/// Length of the rail the reference lays beside a scaled sweep's path
+/// (`RailLaw`), measured on its records: half the profile's largest
+/// coordinate from its anchor along its own plane axes, at most one; times,
+/// unless the profile is a single circle, the length of the plane axis
+/// least aligned with the path start once projected across the path.
+/// `wires` are relative to the anchor.
+fn sweep_rail_length(wires: &[Vec<Curve>], axes: [[f64; 3]; 2], tangent: Vec3) -> Option<f64> {
+    let mut reach = 0.0_f64;
+    for curve in wires.iter().flatten() {
+        for sample in 0..=64 {
+            let point = curve.point_at(sample as f64 / 64.0);
+            reach = reach.max(point[0].abs()).max(point[1].abs());
+        }
+    }
+    let lean = if wires.len() == 1 && profile_circle(&wires[0]).is_some() { 1.0 } else {
+        let across = |axis: [f64; 3]| -> Option<f64> {
+            let axis = Vec3::from(axis).normalize()?;
+            Some((axis - tangent * axis.dot(tangent)).length())
+        };
+        across(axes[0])?.max(across(axes[1])?)
+    };
+    let length = (reach * 0.5).min(1.0) * lean;
+    (length.is_finite() && length > 1e-12).then_some(length)
 }
 
 /// Faces swept along straight and circular runs without twist or scaling
@@ -1465,7 +1500,7 @@ fn closed_turned_polyline(
     }
     let mut runs = Vec::new();
     for patches in [&head_patches, &tail_patches] {
-        let outward = regular_transport(wires, patches)?;
+        let outward = regular_transport(wires, patches, false)?;
         let mut part = build_body(wires, patches, false, false, outward)?;
         analytic_ruled_faces(&mut part);
         runs.push(part);
@@ -2398,11 +2433,12 @@ impl Piece {
     }
 
     fn spline_derivative(&self, t: f64) -> Vec3 {
-        // Stay inside this knot span. A global central difference straddles
-        // repeated knots and rounds a deliberately sharp polyline corner.
-        let a = (t - 1e-5).max(0.0);
-        let b = (t + 1e-5).min(1.0);
-        (self.point(b) - self.point(a)) / (b - a)
+        // The analytic derivative, held just inside this knot span so a
+        // deliberately sharp polyline corner at its ends is not rounded. A
+        // difference quotient here was too rough for the sections' fits.
+        let Self::Spline(curve, a, b) = self else { return Vec3::ZERO };
+        let inset = (b - a) * 1e-10;
+        Vec3::from(curve.derivative_at_knot((a + (b - a) * t).clamp(a + inset, b - inset))) * (b - a)
     }
 
     fn length_to(&self, end: f64) -> f64 {
@@ -2415,13 +2451,42 @@ impl Piece {
                 return curve.length() * end;
             }
         }
-        (0..16).map(|panel| GAUSS.into_iter().map(|(node, weight)| {
-            let t = end * (panel as f64 + 0.5 + node * 0.5) / 16.0;
-            self.speed(t) * weight * end / 32.0
-        }).sum::<f64>()).sum()
+        // Integrate knot span by knot span: the speed of a spline is only
+        // piecewise smooth, and a panel across a knot loses accuracy.
+        let mut breaks = vec![0.0];
+        if let Self::Planar(_, Curve::Nurbs(curve), forward) = self {
+            let (start, stop) = curve.domain();
+            breaks.extend(curve.knots().iter()
+                .map(|knot| (knot - start) / (stop - start))
+                .map(|t| if *forward { t } else { 1.0 - t })
+                .filter(|t| *t > 1e-12 && *t < end - 1e-12));
+            breaks.sort_by(f64::total_cmp);
+        }
+        breaks.push(end);
+        let panels = if breaks.len() > 2 { 8 } else { 16 };
+        breaks.windows(2).map(|range| {
+            let width = range[1] - range[0];
+            (0..panels).map(|panel| GAUSS.into_iter().map(|(node, weight)| {
+                let t = range[0] + width * (panel as f64 + 0.5 + node * 0.5) / panels as f64;
+                self.speed(t) * weight * width / (2 * panels) as f64
+            }).sum::<f64>()).sum::<f64>()
+        }).sum()
     }
 
     fn length(&self) -> f64 { self.length_to(1.0) }
+
+    /// The parameter `distance` along the piece from its start.
+    fn parameter_at_length(&self, distance: f64) -> f64 {
+        let length = self.length();
+        let mut t = (distance / length).clamp(0.0, 1.0);
+        if matches!(self, Self::Line(..)) { return t; }
+        for _ in 0..8 {
+            let speed = self.speed(t);
+            if !(speed > 1e-12) { break; }
+            t = (t - (self.length_to(t) - distance) / speed).clamp(0.0, 1.0);
+        }
+        t
+    }
 }
 
 fn path_pieces(path: SweepPath<'_>) -> Option<Vec<Piece>> {
@@ -2531,8 +2596,10 @@ fn twist_frame(frame: Frame, point: Vec3, angle: f64, scale: f64) -> Option<Fram
 
 /// Cubic Bezier control frames of one path patch, with their weights: one
 /// for transport fits, rational for an exact turn about a circular run.
+/// `span` is the patch's share of its run's parameter, which spaces the
+/// run's knots so that Hermite patches join smoothly.
 #[derive(Clone, Copy)]
-struct Patch { frames: [Frame; 4], weights: [f64; 4] }
+struct Patch { frames: [Frame; 4], weights: [f64; 4], span: f64 }
 
 impl std::ops::Index<usize> for Patch {
     type Output = Frame;
@@ -2601,6 +2668,7 @@ fn turning_patches(start: Frame, centre: Vec3, axis: Vec3, angle: f64, result: &
                 last,
             ],
             weights: [1.0, inner / 3.0, inner / 3.0, 1.0],
+            span: step,
         });
     }
 }
@@ -2609,13 +2677,106 @@ fn transported_patches(
     pieces: &[Piece], first: Frame, options: SweepOptions,
     total: f64, radius: f64, closed: bool,
 ) -> Option<Vec<Patch>> {
-    Some(transported_runs(pieces, first, options, total, radius, closed)?.0)
+    Some(transported_runs(pieces, first, options, total, radius, closed, None)?.0)
+}
+
+/// The rail the reference modeller lays beside a scaled sweep's path: the
+/// first section's x axis, `length` long, carried along the path, twisted
+/// by `twist` and scaled like the profile. It approximates that rail by
+/// cubic Hermite spans and takes each section's turn and scale from the
+/// approximation, not from the exact laws, so its solids carry the
+/// approximation's error in turn and scale; reproduce it.
+#[derive(Clone, Copy)]
+struct RailLaw { length: f64, twist: f64 }
+
+/// One piecewise cubic Hermite rail over a run parameter.
+struct Rail { knots: Vec<f64>, points: Vec<Vec3>, slopes: Vec<Vec3> }
+
+impl Rail {
+    fn at(&self, u: f64) -> Vec3 {
+        let span = self.knots.partition_point(|knot| *knot <= u).clamp(1, self.knots.len() - 1) - 1;
+        let (a, b) = (self.knots[span], self.knots[span + 1]);
+        let h = b - a;
+        let t = ((u - a) / h).clamp(0.0, 1.0);
+        let s = 1.0 - t;
+        let (p0, p3) = (self.points[span], self.points[span + 1]);
+        let p1 = p0 + self.slopes[span] * (h / 3.0);
+        let p2 = p3 - self.slopes[span + 1] * (h / 3.0);
+        p0 * (s * s * s) + p1 * (3.0 * s * s * t) + p2 * (3.0 * s * t * t) + p3 * (t * t * t)
+    }
+}
+
+/// Target and limit of the reference rail fit: a span is accepted at an
+/// error up to `RAIL_TOLERANCE`; a refused span is resized by the fourth
+/// root of `RAIL_TARGET` over its error, as the reference sizes its spans.
+const RAIL_TOLERANCE: f64 = 1e-3;
+const RAIL_TARGET: f64 = 8.20691e-4;
+
+/// The reference rail fit over `0..=length`: Hermite spans marched from the
+/// start. The first trial span covers `first` (an eighth of a turn of the
+/// path and twist together), later trials twice the span before. A refused
+/// span is resized until it fits; a first span fitting well inside the
+/// target is retried from the whole rest instead. Measured on straight and
+/// circular paths, the knots this gives match the reference's to about
+/// 0.1 % of a span; along a spline they drift further (the reference's own
+/// trial rule there is not known).
+fn fit_rail(exact: &impl Fn(f64) -> Option<Vec3>, length: f64, first: f64) -> Option<Rail> {
+    let step = length * 1e-6;
+    let slope = |u: f64| -> Option<Vec3> {
+        Some(if u - step < 0.0 {
+            (exact(u)? * -3.0 + exact(u + step)? * 4.0 - exact(u + 2.0 * step)?) / (2.0 * step)
+        } else if u + step > length {
+            (exact(u)? * 3.0 - exact(u - step)? * 4.0 + exact(u - 2.0 * step)?) / (2.0 * step)
+        } else {
+            (exact(u + step)? - exact(u - step)?) / (2.0 * step)
+        })
+    };
+    let error = |a: f64, b: f64, pa: Vec3, da: Vec3| -> Option<(f64, Vec3, Vec3)> {
+        let (pb, db) = (exact(b)?, slope(b)?);
+        let rail = Rail { knots: vec![a, b], points: vec![pa, pb], slopes: vec![da, db] };
+        let mut worst = 0.0_f64;
+        for sample in 1..32 {
+            let u = a + (b - a) * sample as f64 / 32.0;
+            worst = worst.max(rail.at(u).distance(exact(u)?));
+        }
+        Some((worst, pb, db))
+    };
+    let mut rail = Rail { knots: vec![0.0], points: vec![exact(0.0)?], slopes: vec![slope(0.0)?] };
+    let mut at = 0.0;
+    while at < length * (1.0 - 1e-12) {
+        if rail.knots.len() > 4096 { return None; }
+        let rest = length - at;
+        let (pa, da) = (*rail.points.last()?, *rail.slopes.last()?);
+        let fit = |trial: f64| -> Option<(f64, f64, Vec3, Vec3)> {
+            let mut span = trial.min(rest);
+            for _ in 0..64 {
+                let (worst, pb, db) = error(at, at + span, pa, da)?;
+                if !worst.is_finite() { return None; }
+                if worst <= RAIL_TOLERANCE { return Some((span, worst, pb, db)); }
+                span = (span * (RAIL_TARGET / worst).powf(0.25)).min(rest);
+            }
+            None
+        };
+        let previous = rail.knots.len().checked_sub(2).map(|index| at - rail.knots[index]);
+        let mut found = fit(previous.map_or(first, |span| 2.0 * span))?;
+        if rail.knots.len() == 1 && found.1 < RAIL_TARGET && found.0 < rest {
+            found = fit(rest)?;
+        }
+        let (span, _, pb, db) = found;
+        at = if span >= rest { length } else { at + span };
+        rail.knots.push(at);
+        rail.points.push(pb);
+        rail.slopes.push(db);
+    }
+    Some(rail)
 }
 
 /// The transported patches and how many of them each path piece has.
+/// With `rail`, sections take their turn and scale from the reference's
+/// approximated rail (see `RailLaw`) instead of the exact laws.
 fn transported_runs(
     pieces: &[Piece], first: Frame, options: SweepOptions,
-    total: f64, radius: f64, closed: bool,
+    total: f64, radius: f64, closed: bool, rail: Option<RailLaw>,
 ) -> Option<(Vec<Patch>, Vec<usize>)> {
     let mut frame = first;
     let mut previous_point = pieces[0].point(0.0);
@@ -2644,18 +2805,89 @@ fn transported_runs(
         let b = (first.x - axis * first.x.dot(axis)).normalize()?;
         axis.dot(a.cross(b)).atan2(a.dot(b))
     } else { 0.0 };
+    // The twist and scale laws run linearly in the path's own parameter:
+    // the knot parameter along a spline, as the reference measures it, and
+    // the length along anything else.
+    let spline = pieces.iter().all(|piece| matches!(piece, Piece::Spline(..)));
+    let widths = pieces.iter().map(|piece| match piece {
+        Piece::Spline(_, a, b) if spline => b - a,
+        _ => piece.length(),
+    }).collect::<Vec<_>>();
+    let lengths = pieces.iter().map(Piece::length).collect::<Vec<_>>();
+    let width_total = widths.iter().sum::<f64>();
+    let before = |values: &[f64], index: usize| values[..index].iter().sum::<f64>();
+    let fraction = |index: usize, t: f64| if spline {
+        (before(&widths, index) + widths[index] * t) / width_total
+    } else {
+        (before(&lengths, index) + pieces[index].length_to(t)) / total
+    };
+    let raw = |index: usize, t: f64| -> Option<Frame> {
+        let (parameters, frames) = &walks[index];
+        let slot = parameters.partition_point(|parameter| *parameter <= t).saturating_sub(1).min(parameters.len() - 2);
+        curved_transport(frames[slot], &pieces[index], parameters[slot], t, options.bank)
+    };
+    // The reference fits one rail per path piece, one along a whole spline.
+    let rail = rail.filter(|_| (options.scale - 1.0).abs() > 1e-12);
+    let groups = if spline { vec![(0, pieces.len())] } else { (0..pieces.len()).map(|index| (index, index + 1)).collect() };
+    let mut rails = Vec::new();
+    if let Some(law) = rail {
+        for &(from, to) in &groups {
+            let length = widths[from..to].iter().sum::<f64>();
+            // A spline's rail runs in its knot parameter, a piece's rail
+            // in its length.
+            let locate = |u: f64| -> (usize, f64) {
+                if !spline { return (from, pieces[from].parameter_at_length(u)); }
+                let mut index = from;
+                let mut start = 0.0;
+                while index + 1 < to && u > start + widths[index] {
+                    start += widths[index];
+                    index += 1;
+                }
+                (index, ((u - start) / widths[index]).clamp(0.0, 1.0))
+            };
+            let exact = |u: f64| -> Option<Vec3> {
+                let (index, t) = locate(u);
+                let section = raw(index, t)?;
+                let normal = section.x.cross(section.y).normalize()?;
+                let f = fraction(index, t);
+                Some(pieces[index].point(t) + rotate(section.x.normalize()?, normal, law.twist * f)
+                    * (law.length * (1.0 + (options.scale - 1.0) * f)))
+            };
+            // An eighth of a turn of the path and the twist together.
+            let mut turning = law.twist.abs() * length / width_total;
+            for index in from..to {
+                for pair in walks[index].0.windows(2) {
+                    turning += pieces[index].tangent(pair[0])?.dot(pieces[index].tangent(pair[1])?).clamp(-1.0, 1.0).acos();
+                }
+            }
+            let first = if turning > PI / 4.0 { length * PI / 4.0 / turning } else { length };
+            rails.push(fit_rail(&exact, length, first)?);
+        }
+    }
+    let rail_at = |index: usize, t: f64| -> Option<(usize, f64)> {
+        let group = groups.iter().position(|&(from, to)| index >= from && index < to)?;
+        if !spline { return Some((group, pieces[index].length_to(t))); }
+        Some((group, before(&widths, index) - before(&widths, groups[group].0) + widths[index] * t))
+    };
     let mut patches = Vec::new();
     let mut runs = Vec::new();
-    let mut travelled = 0.0;
     for (index, piece) in pieces.iter().enumerate() {
-        let length = piece.length();
-        let (parameters, frames) = &walks[index];
         let evaluate_raw = |t: f64| -> Option<Frame> {
-            let slot = parameters.partition_point(|parameter| *parameter <= t).saturating_sub(1).min(parameters.len() - 2);
-            let raw = curved_transport(frames[slot], piece, parameters[slot], t, options.bank)?;
-            let fraction = (travelled + piece.length_to(t)) / total;
-            twist_frame(raw, piece.point(t), options.twist * fraction + closure_roll * fraction,
-                1.0 + (options.scale - 1.0) * fraction)
+            let section = raw(index, t)?;
+            let point = piece.point(t);
+            let f = fraction(index, t);
+            let Some(law) = rail else {
+                return twist_frame(section, point, options.twist * f + closure_roll * f,
+                    1.0 + (options.scale - 1.0) * f);
+            };
+            let (group, u) = rail_at(index, t)?;
+            let normal = section.x.cross(section.y).normalize()?;
+            let x = section.x.normalize()?;
+            let offset = rails[group].at(u) - point;
+            let offset = offset - normal * offset.dot(normal);
+            // A round profile ignores the turn (the twist was dropped).
+            let turn = if options.twist.abs() > 1e-12 { normal.dot(x.cross(offset)).atan2(x.dot(offset)) } else { 0.0 };
+            twist_frame(section, point, turn, offset.length() / law.length)
         };
         let raw_start = evaluate_raw(0.0)?;
         let raw_end = evaluate_raw(1.0)?;
@@ -2672,12 +2904,6 @@ fn transported_runs(
         let evaluate = |t: f64| -> Option<Frame> {
             Some(evaluate_raw(t)?.plus(delta_start.lerp(delta_end, t)))
         };
-        let subdivisions = ((options.twist.abs() + closure_roll.abs()) * length / total / 0.1).ceil().max(1.0) as usize;
-        if subdivisions > 8192 { return None; }
-        let mut cuts = parameters.clone();
-        cuts.extend((1..subdivisions).map(|i| i as f64 / subdivisions as f64));
-        cuts.sort_by(f64::total_cmp);
-        cuts.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
         // An untwisted, unscaled run round a circle that meets its neighbours
         // without a corner is an exact turn: keep it exact rather than fitted.
         let delta = delta_start.origin.length() + delta_start.x.length() + delta_start.y.length()
@@ -2688,11 +2914,18 @@ fn transported_runs(
         if let Some((centre, axis, angle)) = exact {
             turning_patches(evaluate(0.0)?, centre, axis, angle, &mut patches);
         } else {
-            for span in cuts.windows(2) {
-                fit_patch(&evaluate, span[0], span[1], radius, total.max(radius) * 1e-7, 0, &mut patches)?;
+            // The rail's knots, where the sections are only once smooth, cut
+            // the fit.
+            let mut cuts = vec![0.0, 1.0];
+            if rail.is_some() {
+                let (group, offset) = rail_at(index, 0.0)?;
+                cuts.extend(rails[group].knots.iter()
+                    .map(|knot| if spline { (knot - offset) / widths[index] } else { piece.parameter_at_length(*knot) })
+                    .filter(|t| *t > 1e-9 && *t < 1.0 - 1e-9));
+                cuts.sort_by(f64::total_cmp);
             }
+            hermite_fit(&evaluate, &cuts, widths[index], radius, radius * 1e-7, &mut patches)?;
         }
-        travelled += length;
         runs.push(patches.len() - runs.iter().sum::<usize>());
     }
     // Shared topology requires exactly the same section on both sides of a
@@ -2708,10 +2941,65 @@ fn transported_runs(
         patches.last_mut()?[3] = start;
     }
     // The knot spans of one spline are a single run.
-    if pieces.iter().all(|piece| matches!(piece, Piece::Spline(..))) {
+    if spline {
         runs = vec![patches.len()];
     }
     Some((patches, runs))
+}
+
+/// A failed fit span is cut at this share of its length and the near part
+/// tried again, the reference modeller's own split.
+const FIT_SPLIT: f64 = 0.506107193;
+
+/// Cubic Hermite patches through `evaluate` over each interval of `cuts`
+/// (piece parameters), with its exact end derivatives so neighbouring
+/// patches join smoothly. Spans are marched from each interval's start:
+/// the whole rest is tried, and a span over `tolerance` is cut at
+/// `FIT_SPLIT` until it fits. `width` is the run parameter per unit of `t`.
+fn hermite_fit(
+    evaluate: &impl Fn(f64) -> Option<Frame>, cuts: &[f64], width: f64,
+    radius: f64, tolerance: f64, result: &mut Vec<Patch>,
+) -> Option<()> {
+    const STEP: f64 = 1e-5;
+    let slope = |t: f64| -> Option<Frame> {
+        Some(if t - STEP < 0.0 {
+            evaluate(t)?.times(-3.0).plus(evaluate(t + STEP)?.times(4.0)).minus(evaluate(t + 2.0 * STEP)?).times(0.5 / STEP)
+        } else if t + STEP > 1.0 {
+            evaluate(t)?.times(3.0).minus(evaluate(t - STEP)?.times(4.0)).plus(evaluate(t - 2.0 * STEP)?).times(0.5 / STEP)
+        } else {
+            evaluate(t + STEP)?.minus(evaluate(t - STEP)?).times(0.5 / STEP)
+        })
+    };
+    for interval in cuts.windows(2) {
+        let (mut a, end) = (interval[0], interval[1]);
+        let (mut fa, mut da) = (evaluate(a)?, slope(a)?);
+        while a < end {
+            let mut b = end;
+            loop {
+                let (fb, db) = (evaluate(b)?, slope(b)?);
+                let h = b - a;
+                let patch = Patch {
+                    frames: [fa, fa.plus(da.times(h / 3.0)), fb.minus(db.times(h / 3.0)), fb],
+                    weights: [1.0; 4],
+                    span: width * h,
+                };
+                let mut error = 0.0_f64;
+                for t in [0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875] {
+                    error = error.max(frame_error(bezier(&patch, t), evaluate(a + h * t)?, radius));
+                }
+                if !error.is_finite() { return None; }
+                if error <= tolerance {
+                    if result.len() >= 8192 { return None; }
+                    result.push(patch);
+                    (a, fa, da) = (b, fb, db);
+                    break;
+                }
+                if h <= (end - interval[0]) * 1e-9 { return None; }
+                b = a + h * FIT_SPLIT;
+            }
+        }
+    }
+    Some(())
 }
 
 fn divide_path(piece: &Piece, a: f64, b: f64, depth: usize, result: &mut Vec<f64>) -> Option<()> {
@@ -2756,7 +3044,10 @@ fn bezier_derivative(p: &Patch, t: f64) -> Frame {
 /// checks local regularity, not distant intersections between separate runs.
 /// A consistently negative Jacobian remains regular for an off-path anchor;
 /// return that orientation so the complete shell can be turned accordingly.
-fn regular_transport(wires: &[Wire], patches: &[Patch]) -> Option<bool> {
+/// With `folds` a local fold is accepted (as the reference modeller keeps a
+/// twisted or scaled sweep whose sections overlap round a tight bend) and
+/// the orientation most samples have is returned.
+fn regular_transport(wires: &[Wire], patches: &[Patch], folds: bool) -> Option<bool> {
     let mut points = Vec::new();
     for curve in wires.iter().flat_map(|wire| &wire.curves) {
         let spline = NurbsCurve::new_strict(curve.degree, curve.points.clone(),
@@ -2773,6 +3064,7 @@ fn regular_transport(wires: &[Wire], patches: &[Patch]) -> Option<bool> {
         }
     }
     let mut orientation = None;
+    let mut balance = 0_i64;
     for patch in patches {
         for at in [0.0, 0.125, 0.25, 0.5, 0.75, 0.875, 1.0] {
             let frame = bezier(patch, at);
@@ -2784,48 +3076,24 @@ fn regular_transport(wires: &[Wire], patches: &[Patch]) -> Option<bool> {
                 let velocity = derivative.point(*point);
                 let jacobian = normal.dot(velocity);
                 let tolerance = normal_length * velocity.length() * 1e-10;
-                if !jacobian.is_finite() || !tolerance.is_finite() || jacobian.abs() <= tolerance {
+                if !jacobian.is_finite() || !tolerance.is_finite() { return None; }
+                if jacobian.abs() <= tolerance {
+                    if folds { continue; }
                     return None;
                 }
                 let forward = jacobian > 0.0;
-                if orientation.is_some_and(|previous| previous != forward) { return None; }
+                balance += if forward { 1 } else { -1 };
+                if orientation.is_some_and(|previous| previous != forward) && !folds { return None; }
                 orientation = Some(forward);
             }
         }
     }
+    if folds && balance != 0 { return Some(balance > 0); }
     orientation
 }
 
 fn frame_error(a: Frame, b: Frame, radius: f64) -> f64 {
     a.origin.distance(b.origin) + radius * (a.x.distance(b.x) + a.y.distance(b.y))
-}
-
-fn fit_patch(
-    evaluate: &impl Fn(f64) -> Option<Frame>, a: f64, b: f64,
-    radius: f64, tolerance: f64, depth: usize, result: &mut Vec<Patch>,
-) -> Option<()> {
-    let p0 = evaluate(a)?;
-    let p3 = evaluate(b)?;
-    let q1 = evaluate(a + (b - a) / 3.0)?;
-    let q2 = evaluate(a + (b - a) * 2.0 / 3.0)?;
-    let c = q1.times(27.0).minus(p0.times(8.0)).minus(p3);
-    let d = q2.times(27.0).minus(p0).minus(p3.times(8.0));
-    let patch = Patch { frames: [p0, c.times(2.0).minus(d).times(1.0 / 18.0),
-        d.times(2.0).minus(c).times(1.0 / 18.0), p3], weights: [1.0; 4] };
-    let mut error = 0.0_f64;
-    for t in [0.125, 0.25, 0.5, 0.75, 0.875] {
-        error = error.max(frame_error(bezier(&patch, t), evaluate(a + (b - a) * t)?, radius));
-    }
-    if !error.is_finite() { return None; }
-    if error > tolerance {
-        if depth >= 14 || result.len() >= 8192 { return None; }
-        let middle = (a + b) * 0.5;
-        fit_patch(evaluate, a, middle, radius, tolerance, depth + 1, result)?;
-        fit_patch(evaluate, middle, b, radius, tolerance, depth + 1, result)?;
-    } else {
-        result.push(patch);
-    }
-    Some(())
 }
 
 fn build_body(wires: &[Wire], patches: &[Patch], sheet: bool, closed_path: bool, outward: bool) -> Option<Body> {
@@ -2873,65 +3141,27 @@ fn merged_round(wire: &Wire) -> Option<Wire> {
 }
 
 /// The patches of one run joined into a single rational cubic B-spline in
-/// the path direction (C0 at the patch joins), so each profile curve gives
-/// one face per path run, as the reference modeler builds a twisted or
-/// scaled sweep. Weights are rescaled so neighbouring patches agree at the
-/// shared frame.
+/// the path direction, so each profile curve gives one face per path run,
+/// as the reference modeler builds a twisted or scaled sweep. Knots are
+/// triple (C0 in the knot vector) and spaced by the patches' spans, so the
+/// Hermite patches' shared end derivatives make the run smooth. Weights are
+/// rescaled so neighbouring patches agree at the shared frame.
 fn joined_run(patches: &[Patch]) -> (Vec<Frame>, Vec<f64>, Vec<f64>) {
-    // Fitted (polynomial) patches only meet with matching positions, so a
-    // face made of them would carry creases. Pass one smooth C2 cubic through
-    // frames sampled along them instead; rational exact turns stay joined.
-    if patches.len() > 1 && patches.iter().all(|patch| patch.weights.iter().all(|w| (*w - 1.0).abs() <= 1e-12)) {
-        // At most 96 spans: dense enough for a C2 fit of a smooth transport,
-        // small enough for a single face to stay cheap to evaluate.
-        let count = (patches.len() * 3).min(96);
-        // Stations evenly spaced along the run, so the uniform parameter
-        // follows its length. Patches differ in length (the path is divided
-        // adaptively); stations evenly spaced per patch made the fit stall
-        // and race, leaving a surface whose speed nearly vanishes in places,
-        // which the reference rejects.
-        const STEPS: usize = 16;
-        let mut table = vec![(0.0, 0usize, 0.0)];
-        let mut length = 0.0;
-        for (index, patch) in patches.iter().enumerate() {
-            let mut last = bezier(patch, 0.0).origin;
-            for step in 1..=STEPS {
-                let t = step as f64 / STEPS as f64;
-                let point = bezier(patch, t).origin;
-                length += point.distance(last);
-                last = point;
-                table.push((length, index, t));
-            }
-        }
-        let stations = (0..=count).map(|k| {
-            let target = length * k as f64 / count as f64;
-            let slot = table.partition_point(|entry| entry.0 < target).clamp(1, table.len() - 1);
-            let (l0, i0, t0) = table[slot - 1];
-            let (l1, i1, t1) = table[slot];
-            let share = if l1 > l0 { (target - l0) / (l1 - l0) } else { 0.0 };
-            let (index, t) = if i0 == i1 { (i1, t0 + (t1 - t0) * share) } else { (i1, t1 * share) };
-            bezier(&patches[index], t.clamp(0.0, 1.0))
-        }).collect::<Vec<_>>();
-        let flat = |f: Frame| [f.origin.x, f.origin.y, f.origin.z, f.x.x, f.x.y, f.x.z, f.y.x, f.y.y, f.y.z];
-        let points = stations.iter().map(|frame| flat(*frame)).collect::<Vec<_>>();
-        if let Some((controls, knots)) = crate::space::spline::interpolate_open(&points, None, None, crate::space::Parameterization::Uniform) {
-            let (low, high) = (knots[0], knots[knots.len() - 1]);
-            let frames = controls.iter().map(|c| Frame { origin: Vec3::new(c[0], c[1], c[2]), x: Vec3::new(c[3], c[4], c[5]), y: Vec3::new(c[6], c[7], c[8]) }).collect::<Vec<_>>();
-            let weights = vec![1.0; frames.len()];
-            return (frames, weights, knots.iter().map(|k| (k - low) / (high - low)).collect());
-        }
-    }
+    let total = patches.iter().map(|patch| patch.span).sum::<f64>();
     let mut frames = vec![patches[0][0]];
     let mut weights = vec![patches[0].weights[0]];
     let mut knots = vec![0.0; 4];
+    let mut at = 0.0;
     for (index, patch) in patches.iter().enumerate() {
         let scale = weights.last().copied().unwrap_or(1.0) / patch.weights[0];
         for k in 1..4 {
             frames.push(patch[k]);
             weights.push(patch.weights[k] * scale);
         }
-        let end = (index + 1) as f64 / patches.len() as f64;
-        knots.extend(std::iter::repeat_n(end, if index + 1 == patches.len() { 4 } else { 3 }));
+        at += patch.span;
+        let last = index + 1 == patches.len();
+        let end = if last || !(total > 0.0) { if last { 1.0 } else { (index + 1) as f64 / patches.len() as f64 } } else { at / total };
+        knots.extend(std::iter::repeat_n(end, if last { 4 } else { 3 }));
     }
     (frames, weights, knots)
 }

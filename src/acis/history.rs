@@ -1142,6 +1142,12 @@ fn sweep_history_geometry(
                 scale: value.scale_factor,
                 bank: value.bank,
                 surface: surface || !closed,
+                // The profile is stored placed; its drawn plane is the
+                // record's source frame.
+                profile_axes: Some([
+                    [value.sweep_entity_transform[0], value.sweep_entity_transform[1], value.sweep_entity_transform[2]],
+                    [value.sweep_entity_transform[4], value.sweep_entity_transform[5], value.sweep_entity_transform[6]],
+                ]),
             },
         });
     }
@@ -1173,6 +1179,7 @@ fn sweep_history_geometry(
             scale: value.scale_factor,
             bank: value.bank,
             surface: surface || !closed,
+            profile_axes: None,
         },
     })
 }
@@ -1343,6 +1350,7 @@ fn rebuild_spatial_sweep(value: &SolidHistorySweep) -> Option<Result<Body, Histo
         scale: value.scale_factor,
         bank: value.bank,
         surface: true,
+        profile_axes: None,
     };
     Some(finish(brep::sweep_spatial_polyline(&points, closed, path.borrowed(), options), value.base.transform))
 }
