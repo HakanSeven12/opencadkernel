@@ -668,6 +668,13 @@ fn split_face_in_place(
                 }
             }
         }
+        // An island lies inside the face all the way round. One reaching
+        // out of it crosses the boundary — at corners the landings passed
+        // over — and cut as an island it copied a piece of the face over
+        // a neighbour that already had it.
+        if (0..32).any(|index| inside(period * index as f64 / 32.0) == Some(false)) {
+            return None;
+        }
         let start_parameter = (0..16)
             .map(|index| period * index as f64 / 16.0)
             .find(|parameter| strictly_inside(*parameter) == Some(true))?;
