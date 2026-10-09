@@ -626,10 +626,9 @@ fn plane_cylinder(plane: &Plane, cylinder: &Cylinder, tolerance: f64) -> Meeting
 /// A plane and a cone.
 ///
 /// Handled exactly where the section is a circle — the plane square to the
-/// axis — or a pair of generators through the apex. The slanted sections are
-/// ellipses, parabolas and hyperbolas; the last two have no representation in
-/// [`Curve3`] yet, so rather than return two of the three the whole slanted
-/// case says [`Meeting::Unknown`].
+/// axis — or an ellipse, the plane cutting every generator of one nappe.
+/// Parabolas and hyperbolas have no representation in [`Curve3`] yet, and
+/// say [`Meeting::Unknown`].
 fn plane_cone(plane: &Plane, cone: &Cone, tolerance: f64) -> Meeting {
     let (Some(normal), Some(axis)) = (plane.normal(), cone.base.normal()) else {
         return Meeting::Unknown;
@@ -656,7 +655,73 @@ fn plane_cone(plane: &Plane, cone: &Cone, tolerance: f64) -> Meeting {
         }
         return circle_on(centre, axis, radius, tolerance);
     }
-    Meeting::Unknown
+    slanted_cone_ellipse(plane, cone, normal, axis, tolerance).unwrap_or(Meeting::Unknown)
+}
+
+/// The ellipse a slanted plane cuts from a cone, or `None` for a parabola or
+/// hyperbola. Points `q` from the apex lie on the cone where
+/// `|q|² = (1 + tan²α)(q·axis)²`; written in the plane's own coordinates
+/// that is a conic, an ellipse when its quadratic part is definite.
+fn slanted_cone_ellipse(
+    plane: &Plane,
+    cone: &Cone,
+    normal: Vec3,
+    axis: Vec3,
+    tolerance: f64,
+) -> Option<Meeting> {
+    let slope = cone.half_angle.tan();
+    if !slope.is_finite() || slope.abs() <= f64::EPSILON {
+        return None;
+    }
+    let apex = Vec3::from(cone.base.origin) + axis * (cone.radius / slope);
+    let normal = normal.normalize()?;
+    let first = Vec3::from(plane.x_axis).normalize()?;
+    let first = (first - normal * first.dot(normal)).normalize()?;
+    let second = normal.cross(first);
+    let k = 1.0 + slope * slope;
+    let offset = Vec3::from(plane.origin) - apex;
+    let (a1, a2, c0) = (first.dot(axis), second.dot(axis), offset.dot(axis));
+    let quadratic = [[1.0 - k * a1 * a1, -k * a1 * a2], [-k * a1 * a2, 1.0 - k * a2 * a2]];
+    let linear = [offset.dot(first) - k * c0 * a1, offset.dot(second) - k * c0 * a2];
+    let constant = offset.dot(offset) - k * c0 * c0;
+    let det = quadratic[0][0] * quadratic[1][1] - quadratic[0][1] * quadratic[1][0];
+    if det <= 1e-12 {
+        return None;
+    }
+    // Centre where the gradient vanishes, and the value the conic takes there.
+    let centre = [
+        -(linear[0] * quadratic[1][1] - linear[1] * quadratic[0][1]) / det,
+        -(quadratic[0][0] * linear[1] - quadratic[1][0] * linear[0]) / det,
+    ];
+    let level = constant + linear[0] * centre[0] + linear[1] * centre[1];
+    let trace = quadratic[0][0] + quadratic[1][1];
+    let spread = ((quadratic[0][0] - quadratic[1][1]).powi(2)
+        + 4.0 * quadratic[0][1] * quadratic[0][1])
+        .sqrt();
+    let (large, small) = (0.5 * (trace + spread), 0.5 * (trace - spread));
+    let point = Vec3::from(plane.origin) + first * centre[0] + second * centre[1];
+    let (minor, major) = ((-level / large).sqrt(), (-level / small).sqrt());
+    if !(minor.is_finite() && major.is_finite()) || minor <= tolerance {
+        // Through the apex: the section closes to it.
+        return (level.abs() <= tolerance * tolerance.max(1.0)).then(|| {
+            Meeting::Points(vec![point.to_array()])
+        });
+    }
+    // The major axis runs along the eigenvector of the smaller eigenvalue.
+    let along = if quadratic[0][1].abs() > f64::EPSILON {
+        [quadratic[0][1], small - quadratic[0][0]]
+    } else if quadratic[0][0] <= quadratic[1][1] {
+        [1.0, 0.0]
+    } else {
+        [0.0, 1.0]
+    };
+    let direction = (first * along[0] + second * along[1]).normalize()?;
+    let frame = Plane::orthonormal(point.to_array(), direction.to_array(), normal.to_array())?;
+    Some(Meeting::Curves(vec![Curve3::Ellipse(Ellipse3 {
+        plane: frame,
+        major_radius: major,
+        minor_radius: minor,
+    })]))
 }
 
 /// Two cylinders. Coaxial and parallel-axis cases only; crossing axes give a

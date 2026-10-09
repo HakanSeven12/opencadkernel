@@ -46,6 +46,30 @@ pub fn analytic_mass_properties(body: &Body) -> Option<MassProperties> {
         .or_else(|| cylinder_properties(body))
 }
 
+/// Mass properties of any closed body: exact where
+/// [`analytic_mass_properties`] knows the shape, otherwise integrated over a
+/// mesh fine enough that the answer holds to a few parts in a hundred
+/// thousand. `None` when the body cannot be meshed whole.
+pub fn mass_properties(body: &Body) -> Option<MassProperties> {
+    if let Some(properties) = analytic_mass_properties(body) {
+        return Some(properties);
+    }
+    let points: Vec<[f64; 3]> = body.vertices.iter().map(|(_, vertex)| vertex.point).collect();
+    let size = super::bounds::around_points(&points)
+        .map(|bounds| Vec3::from(bounds.min).distance(Vec3::from(bounds.max)))
+        .filter(|size| *size > 0.0)
+        .unwrap_or(1.0);
+    // Finest first; a face too fine to triangulate whole at one setting
+    // still has its properties at a coarser one.
+    [(0.02, 1e-6), (0.05, 1e-5), (0.2, 1e-4)].into_iter().find_map(|(angle, chord)| {
+        let mesh = super::mesh::tessellate(
+            body,
+            super::mesh::TessellationTolerance::new(angle, size * chord),
+        );
+        mesh.missing_faces.is_empty().then(|| mesh.mesh.inertial_properties()).flatten()
+    })
+}
+
 fn cylindrical_sector_properties(body: &Body) -> Option<MassProperties> {
     let mut cylinders = Vec::new();
     for face_key in body.face_keys() {

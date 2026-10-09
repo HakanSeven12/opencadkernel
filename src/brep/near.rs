@@ -13,18 +13,19 @@ use super::topology::{Body, FaceKey};
 use crate::space::Vec3;
 use std::collections::HashMap;
 
-/// A body's faces as triangles, with how far its mesh strays from its
-/// surfaces.
+/// A body's faces as triangles, with how far each face's mesh strays from
+/// its surface. Per face: a plane beside a coarse spline is held to its own
+/// exact mesh, not to the spline's.
 pub(super) struct FaceSoups {
     by_face: HashMap<FaceKey, Vec<[Vec3; 3]>>,
-    deviation: f64,
+    deviation: HashMap<FaceKey, f64>,
 }
 
 impl FaceSoups {
     pub(super) fn of(body: &Body, tolerance: f64) -> Self {
         let mesh = tessellate(body, TessellationTolerance::new(0.1, tolerance.max(1e-9)));
         let mut by_face: HashMap<FaceKey, Vec<[Vec3; 3]>> = HashMap::new();
-        let mut deviation = 0.0_f64;
+        let mut deviation: HashMap<FaceKey, f64> = HashMap::new();
         for (triangle, face) in mesh.mesh.triangles.iter().zip(&mesh.triangle_faces) {
             let corners = triangle.map(|index| Vec3::from(mesh.mesh.positions[index]));
             if let Some(surface) = body
@@ -35,7 +36,8 @@ impl FaceSoups {
                 let centre = (corners[0] + corners[1] + corners[2]) * (1.0 / 3.0);
                 let gap = surface.distance_to(centre.to_array()).abs();
                 if gap.is_finite() {
-                    deviation = deviation.max(gap);
+                    let worst = deviation.entry(*face).or_default();
+                    *worst = worst.max(gap);
                 }
             }
             by_face.entry(*face).or_default().push(corners);
@@ -67,7 +69,9 @@ pub(super) fn apart(
     };
     // A centroid sample can miss the worst of a patch's bulge; twice the
     // measured deviation covers it.
-    let margin = 2.0 * (one.deviation + other.deviation) + tolerance;
+    let deviation =
+        |soups: &FaceSoups, face: FaceKey| soups.deviation.get(&face).copied().unwrap_or(0.0);
+    let margin = 2.0 * (deviation(one, face) + deviation(other, other_face)) + tolerance;
     let boxes = |triangles: &[[Vec3; 3]]| -> Vec<(Vec3, Vec3)> {
         triangles
             .iter()
@@ -75,25 +79,12 @@ pub(super) fn apart(
             .collect()
     };
     let (first_boxes, second_boxes) = (boxes(first), boxes(second));
-    // Sweep along x: each triangle of the second set meets only the first
-    // set's triangles whose x ranges come within the margin.
-    let mut order: Vec<usize> = (0..first.len()).collect();
-    order.sort_by(|a, b| first_boxes[*a].0.x.total_cmp(&first_boxes[*b].0.x));
+    // Each triangle of the second set meets only the first set's triangles
+    // whose boxes come within the margin.
+    let mut grid = super::march::TriangleGrid::new(&first_boxes);
     for (index, triangle) in second.iter().enumerate() {
         let (low, high) = second_boxes[index];
-        for &candidate in &order {
-            let (candidate_low, candidate_high) = first_boxes[candidate];
-            if candidate_low.x > high.x + margin {
-                break;
-            }
-            if candidate_high.x < low.x - margin
-                || candidate_low.y > high.y + margin
-                || candidate_high.y < low.y - margin
-                || candidate_low.z > high.z + margin
-                || candidate_high.z < low.z - margin
-            {
-                continue;
-            }
+        for candidate in grid.near(low, high, margin) {
             if triangle_distance(&first[candidate], triangle) <= margin {
                 return false;
             }

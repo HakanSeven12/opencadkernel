@@ -150,6 +150,18 @@ fn cast(
             std::slice::from_ref(curve)
         };
         for piece in pieces {
+            // A straight piece the ray runs along reports no crossing, and
+            // its neighbours' ends a hair either side of the ray then decide
+            // the count by which side of the hair they were put.
+            if let Curve::Line(line) = piece {
+                let along = Vec2::from(line.end) - Vec2::from(line.start);
+                let offset = Vec2::from(line.start) - Vec2::from(point);
+                if along.cross(Vec2::from(direction)).abs() <= 1e-12 * along.length()
+                    && offset.cross(Vec2::from(direction)).abs() <= tolerance.linear()
+                {
+                    return None;
+                }
+            }
             for crossing in intersect(&ray, piece, tolerance) {
                 let at_end = crossing.t_b <= 1e-6 || crossing.t_b >= 1.0 - 1e-6;
                 let tangent = Vec2::from(piece.tangent_at(crossing.t_b));

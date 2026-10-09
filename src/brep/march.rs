@@ -28,7 +28,7 @@ pub(super) fn traced(
     other: &Surface,
     second: &[[Vec3; 3]],
     known: &mut Vec<Vec<Vec3>>,
-    bodies: (Vec3, Vec3),
+    [common, around]: [(Vec3, Vec3); 2],
     tolerance: f64,
 ) -> Option<Vec<Curve3>> {
     // Near enough that the meshes could hide a meeting, yet not crossing:
@@ -42,8 +42,7 @@ pub(super) fn traced(
     // than as pieces ending inside the faces of the other body, which no cut
     // of those faces could use (a sphere cut by a cylinder off its axis).
     shared_bounds(first, second)?;
-    let reach = bodies;
-    let size = reach.0.distance(reach.1).max(tolerance);
+    let size = common.0.distance(common.1).max(tolerance);
     let mut walks: Vec<Walk> = Vec::new();
     for seed in seeds {
         // ponytail: a seed this near a traced curve is taken as on it; two
@@ -62,7 +61,19 @@ pub(super) fn traced(
         if covered(start) {
             continue;
         }
-        walks.push(walk(one, other, start, reach, size, tolerance)?);
+        // Walked over either body, a meeting that comes back round closes —
+        // a plane across a spline wall, all the way round it, which pieces
+        // ending inside the wall could never divide. One that does not is
+        // kept to where both bodies are, as far as anything can meet.
+        // ponytail: spline walls only; closing a plane's loop round a torus
+        // over-cut fillets that the clipped pieces divided fine.
+        let spline = matches!(one, Surface::Nurbs(_)) || matches!(other, Surface::Nurbs(_));
+        let reach = if spline { around } else { common };
+        let mut traced = walk(one, other, start, reach, size, tolerance)?;
+        if !traced.closed {
+            traced.points = within(&traced.points, traced.start, common);
+        }
+        walks.push(traced);
     }
     known.extend(walks.iter().map(|walk| walk.points.clone()));
     walks
@@ -123,35 +134,129 @@ fn evened(one: &Surface, other: &Surface, points: &[Vec3], tolerance: f64) -> Ve
 struct Walk {
     points: Vec<Vec3>,
     closed: bool,
+    /// Where in `points` the walk set out from.
+    start: usize,
+}
+
+/// The run of `points` through `start` inside `reach`, and one point past it
+/// at either end, so the run still crosses out.
+fn within(points: &[Vec3], start: usize, reach: (Vec3, Vec3)) -> Vec<Vec3> {
+    let inside = |p: Vec3| {
+        p.x >= reach.0.x
+            && p.y >= reach.0.y
+            && p.z >= reach.0.z
+            && p.x <= reach.1.x
+            && p.y <= reach.1.y
+            && p.z <= reach.1.z
+    };
+    let start = start.min(points.len().saturating_sub(1));
+    let mut low = start;
+    while low > 0 && inside(points[low]) {
+        low -= 1;
+    }
+    let mut high = start;
+    while high + 1 < points.len() && inside(points[high]) {
+        high += 1;
+    }
+    points[low..=high].to_vec()
 }
 
 /// One point of every place the two triangle sets cross.
 fn crossing_points(first: &[[Vec3; 3]], second: &[[Vec3; 3]]) -> Vec<Vec3> {
     let first_bounds: Vec<_> = first.iter().map(triangle_bounds).collect();
-    let mut order: Vec<usize> = (0..first.len()).collect();
-    order.sort_by(|a, b| first_bounds[*a].0.x.total_cmp(&first_bounds[*b].0.x));
+    let mut grid = TriangleGrid::new(&first_bounds);
     let mut out = Vec::new();
     for triangle in second {
         let (low, high) = triangle_bounds(triangle);
-        for &index in &order {
-            let (other_low, other_high) = first_bounds[index];
-            if other_low.x > high.x {
-                break;
-            }
-            if other_high.x < low.x
-                || other_low.y > high.y
-                || other_high.y < low.y
-                || other_low.z > high.z
-                || other_high.z < low.z
-            {
-                continue;
-            }
+        for index in grid.near(low, high, 0.0) {
             if let Some(point) = triangle_crossing(&first[index], triangle) {
                 out.push(point);
             }
         }
     }
     out
+}
+
+/// A set of triangle boxes in a grid of cells about twice their typical
+/// size, so a box meets only the few near it. Two fine meshes of large spline
+/// faces are tens of thousands of triangles each, and every pair of them was
+/// most of a boolean's time.
+pub(super) struct TriangleGrid<'a> {
+    bounds: &'a [(Vec3, Vec3)],
+    origin: Vec3,
+    cell: f64,
+    cells: std::collections::HashMap<(i64, i64, i64), Vec<usize>>,
+    seen: Vec<usize>,
+    query: usize,
+}
+
+impl<'a> TriangleGrid<'a> {
+    pub(super) fn new(bounds: &'a [(Vec3, Vec3)]) -> Self {
+        let origin = bounds.first().map_or(Vec3::new(0.0, 0.0, 0.0), |(low, _)| *low);
+        let typical = bounds
+            .iter()
+            .map(|(low, high)| (high.x - low.x).max(high.y - low.y).max(high.z - low.z))
+            .sum::<f64>()
+            / bounds.len().max(1) as f64;
+        let mut grid = Self {
+            bounds,
+            origin,
+            cell: (typical * 2.0).max(f64::MIN_POSITIVE),
+            cells: Default::default(),
+            seen: vec![usize::MAX; bounds.len()],
+            query: 0,
+        };
+        for (index, (low, high)) in bounds.iter().enumerate() {
+            for key in grid.keys(*low, *high) {
+                grid.cells.entry(key).or_default().push(index);
+            }
+        }
+        grid
+    }
+
+    fn keys(&self, low: Vec3, high: Vec3) -> impl Iterator<Item = (i64, i64, i64)> {
+        let at = |value: f64, from: f64| ((value - from) / self.cell).floor() as i64;
+        let (x0, x1) = (at(low.x, self.origin.x), at(high.x, self.origin.x));
+        let (y0, y1) = (at(low.y, self.origin.y), at(high.y, self.origin.y));
+        let (z0, z1) = (at(low.z, self.origin.z), at(high.z, self.origin.z));
+        (x0..=x1).flat_map(move |x| (y0..=y1).flat_map(move |y| (z0..=z1).map(move |z| (x, y, z))))
+    }
+
+    /// The triangles whose boxes come within `margin` of `low..high`, each
+    /// once.
+    pub(super) fn near(&mut self, low: Vec3, high: Vec3, margin: f64) -> Vec<usize> {
+        let grow = Vec3::new(margin, margin, margin);
+        let (low, high) = (low - grow, high + grow);
+        self.query += 1;
+        // A box far bigger than the cells would walk a great many of them;
+        // it is tried against every triangle instead.
+        let span = (high.x - low.x).max(high.y - low.y).max(high.z - low.z);
+        let candidates: Vec<usize> = if span > self.cell * 64.0 {
+            (0..self.bounds.len()).collect()
+        } else {
+            self.keys(low, high)
+                .flat_map(|key| self.cells.get(&key).into_iter().flatten().copied())
+                .collect()
+        };
+        let mut out = Vec::new();
+        for index in candidates {
+            if self.seen[index] == self.query {
+                continue;
+            }
+            self.seen[index] = self.query;
+            let (other_low, other_high) = self.bounds[index];
+            if other_low.x <= high.x
+                && other_high.x >= low.x
+                && other_low.y <= high.y
+                && other_high.y >= low.y
+                && other_low.z <= high.z
+                && other_high.z >= low.z
+            {
+                out.push(index);
+            }
+        }
+        out
+    }
 }
 
 fn triangle_bounds(t: &[Vec3; 3]) -> (Vec3, Vec3) {
@@ -238,6 +343,23 @@ fn heading(one: &Surface, other: &Surface, point: Vec3) -> Option<Vec3> {
     (along.length() > GRAZING).then(|| along.normalize()).flatten()
 }
 
+/// Whether `point` sits on the edge of a bounded spline surface's domain.
+fn at_domain_edge(surface: &Surface, point: Vec3) -> bool {
+    let Surface::Nurbs(nurbs) = surface else {
+        return false;
+    };
+    let Some((u, v)) = surface.parameters_at(point.to_array()) else {
+        return false;
+    };
+    let ((u0, u1), (v0, v1)) = nurbs.domain();
+    let [closed_u, closed_v] = nurbs.periodicity();
+    let near = |value: f64, low: f64, high: f64| {
+        let slack = (high - low).abs() * 1e-7;
+        (value - low).abs() <= slack || (high - value).abs() <= slack
+    };
+    (!closed_u && near(u, u0, u1)) || (!closed_v && near(v, v0, v1))
+}
+
 /// `point` pulled onto both surfaces at once: each step moves it to the
 /// nearest point of the line where the two surfaces' tangent planes meet.
 fn settle(one: &Surface, other: &Surface, mut point: Vec3, tolerance: f64) -> Option<Vec3> {
@@ -297,6 +419,11 @@ fn walk(
             let Some((next, mut ahead)) = settled else {
                 step *= 0.5;
                 if step < shortest {
+                    // A spline surface ends: the meeting ends with it.
+                    if at_domain_edge(one, point) || at_domain_edge(other, point) {
+                        left = true;
+                        break;
+                    }
                     return None;
                 }
                 continue;
@@ -338,7 +465,7 @@ fn walk(
                     points.pop();
                 }
                 points.push(start);
-                return Some(Walk { points, closed: true });
+                return Some(Walk { points, closed: true, start: 0 });
             }
             if !inside(point) {
                 left = true;
@@ -354,7 +481,8 @@ fn walk(
     }
     let [ahead, behind] = halves;
     let mut points: Vec<Vec3> = behind.into_iter().rev().collect();
+    let at = points.len();
     points.push(start);
     points.extend(ahead);
-    Some(Walk { points, closed: false })
+    Some(Walk { points, closed: false, start: at })
 }
