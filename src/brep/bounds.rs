@@ -143,6 +143,24 @@ pub fn face_bounds(body: &Body, face: FaceKey) -> Option<Aabb> {
             }
         }
     }
+    // A cone face running up to its apex ends there in a loop with no edge,
+    // so the edges alone leave the point out — and the box with it misses
+    // every face the cone's tip reaches.
+    if let Surface::Cone(cone) = surface {
+        let singular = node
+            .loops
+            .iter()
+            .any(|ring| body.loops.get(*ring).is_some_and(|ring| ring.coedges.is_empty()));
+        let height = cone.radius / cone.half_angle.tan();
+        if singular && height.is_finite() {
+            let normal = cone.base.normal()?;
+            let apex = std::array::from_fn(|axis| cone.base.origin[axis] + normal[axis] * height);
+            match &mut bounds {
+                Some(box_) => box_.absorb(apex),
+                None => bounds = Some(Aabb::at(apex)),
+            }
+        }
+    }
     bounds
 }
 

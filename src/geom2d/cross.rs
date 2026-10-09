@@ -59,7 +59,30 @@ pub struct Crossing {
 }
 
 /// Every point where `a` and `b` cross, ordered along `a`.
+///
+/// Solved in a translation-only frame near the two curves (see
+/// [`super::frame`]): the closed forms survive survey coordinates, but the
+/// converged path for splines does not — at 1e6 its Newton steps lose the
+/// digits the tolerance test needs and crossings drop out. A translation
+/// leaves every curve parameter as it was, so only the points move back.
 pub fn intersect(a: &Curve, b: &Curve, tolerance: Tolerance) -> Vec<Crossing> {
+    let anchors = [a.point_at(0.0), b.point_at(0.0)].map(|p| [p[0], p[1], 0.0]);
+    let origin = super::Frame::around(anchors.iter()).origin();
+    if origin[0].abs().max(origin[1].abs()) < 1e3 {
+        return intersect_local(a, b, tolerance);
+    }
+    let shift = super::Transform::translation([-origin[0], -origin[1]]);
+    let (Some(local_a), Some(local_b)) = (a.transformed(&shift), b.transformed(&shift)) else {
+        return intersect_local(a, b, tolerance);
+    };
+    let mut crossings = intersect_local(&local_a, &local_b, tolerance);
+    for crossing in &mut crossings {
+        crossing.point = [crossing.point[0] + origin[0], crossing.point[1] + origin[1]];
+    }
+    crossings
+}
+
+fn intersect_local(a: &Curve, b: &Curve, tolerance: Tolerance) -> Vec<Crossing> {
     let mut crossings: Vec<Crossing> = candidates(a, b, tolerance)
         .into_iter()
         .filter_map(|point| {
@@ -156,12 +179,28 @@ fn candidates(a: &Curve, b: &Curve, tolerance: Tolerance) -> Vec<[f64; 2]> {
         (_, Ellipse(_)) if round(a) => candidates(b, a, tolerance),
 
         // A polyline is lines and arcs, all of which are answered exactly
-        // above. Take it apart rather than approximating it whole.
-        (Polyline(_), _) => a
-            .segments()
-            .iter()
-            .flat_map(|piece| candidates(piece, b, tolerance))
-            .collect(),
+        // above. Take it apart rather than approximating it whole — but only
+        // the pieces near `b`: every pair of straight pieces meets somewhere
+        // on their extensions, and two long chains handed each other's every
+        // piece made a boolean between filleted parts take minutes.
+        (Polyline(_), _) => {
+            let near = super::bounds::analytic_curve_bounds(std::slice::from_ref(b));
+            let reach = tolerance.linear();
+            a.segments()
+                .iter()
+                .filter(|piece| {
+                    let (Some((low, high)), Some((from, to))) =
+                        (near, super::bounds::analytic_curve_bounds(std::slice::from_ref(*piece)))
+                    else {
+                        return true;
+                    };
+                    (0..2).all(|axis| {
+                        from[axis] <= high[axis] + reach && to[axis] >= low[axis] - reach
+                    })
+                })
+                .flat_map(|piece| candidates(piece, b, tolerance))
+                .collect()
+        }
         (_, Polyline(_)) => candidates(b, a, tolerance),
 
         // An ellipse or a NURBS curve against something else curved. No closed

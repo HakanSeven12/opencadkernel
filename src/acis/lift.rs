@@ -196,7 +196,6 @@ fn lift_face(
     shell: crate::brep::ShellKey,
 ) -> Option<()> {
     let surface_record = resolve(document, source.surface())?;
-    let reversed_v = analytic_surface_reversed(surface_record);
     let surface = match surface_of(document, body, seen, loss, source.surface()) {
         Some(surface) => surface,
         // Still counted as lost: the patch only stands in for the surface.
@@ -204,7 +203,9 @@ fn lift_face(
     };
     let face = body.faces.insert(Face {
         surface,
-        forward: ((source.sense() == Sense::Forward) != reversed_v) != cone_points_inward(surface_record),
+        // A reversed `v` only turns the parameters, not the normal: the
+        // pcurves read below take it up.
+        forward: (source.sense() == Sense::Forward) != points_inward(surface_record),
         loops: Vec::new(),
         owner: shell,
         provenance: clean(record),
@@ -237,7 +238,12 @@ fn lift_face(
                 note_broken(loss, record);
                 break;
             };
-            let pcurve = read_pcurve(document, source_coedge.pcurve(), reversed_v, body.surfaces.get(surface));
+            let pcurve = read_pcurve(
+                document,
+                source_coedge.pcurve(),
+                surface_record,
+                body.surfaces.get(surface),
+            );
             if let Some(edge) = edge_of(
                 document,
                 body,
@@ -389,6 +395,21 @@ fn edge_of(
             }
             (low, high)
         }
+        // A whole circle or ellipse: one vertex, one turn, and the vertex
+        // fixes where the turn starts. The stored range only says which turn
+        // â€” negated on a reversed edge â€” and ACIS before 7.0 writes none at
+        // all, which read as zero collapsed the circle to a point.
+        Some(shape @ (Curve3::Circle(_) | Curve3::Ellipse(_))) if !apart => {
+            let near = if edge_forward { stored_low } else { -stored_high };
+            let low = periodic_near(shape.parameter_at(ends.0), near, TAU);
+            (low, low + TAU)
+        }
+        Some(shape @ Curve3::Nurbs(nurbs))
+            if !apart && nurbs.periodicity() && stored_high - stored_low <= 1e-12 =>
+        {
+            let low = shape.parameter_at(ends.0);
+            (low, low + (nurbs.domain().1 - nurbs.domain().0))
+        }
         _ => (stored_low, stored_high),
     };
     let key = body.edges.insert(Edge {
@@ -483,9 +504,8 @@ fn partner_surface_curve(
     let owner_loop = SatLoop::from_record(resolve(document, partner.owner_loop())?)?;
     let face = SatFace::from_record(resolve(document, owner_loop.face())?)?;
     let surface_record = resolve(document, face.surface())?;
-    let reversed_v = analytic_surface_reversed(surface_record);
     let surface = read_surface(document, surface_record)?;
-    let pcurve = read_pcurve(document, partner.pcurve(), reversed_v, Some(&surface))?;
+    let pcurve = read_pcurve(document, partner.pcurve(), surface_record, Some(&surface))?;
     surface_curve(&surface, &pcurve)
 }
 
@@ -558,7 +578,7 @@ fn read_curve(document: &SatDocument, record: &SatRecord) -> Option<Curve3> {
 /// pcurve is taken when it fits; one covering more than its edge (a whole
 /// ellipse under an arc) is cut down. One drawn in another surface's
 /// parameters gives `None`, and the edge's curve is used instead. The two
-/// need not run at the same speed ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â a seam's pcurve is linear where its
+/// need not run at the same speed ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â a seam's pcurve is linear where its
 /// circle is not.
 fn pcurve_on_edge(
     body: &Body,
@@ -657,10 +677,20 @@ fn pcurve_on_edge(
 fn read_pcurve(
     document: &SatDocument,
     pointer: SatPointer,
-    reversed_v: bool,
+    surface_record: &SatRecord,
     surface: Option<&Surface>,
 ) -> Option<Curve2> {
     let source = SatPCurve::from_record(resolve(document, pointer)?)?;
+    let reversed_v = analytic_surface_reversed(surface_record);
+    // A plane's parameters run along its stored u derivative, which need not
+    // be unit; the kernel's plane is.
+    let scale = SatPlaneSurface::from_record(surface_record)
+        .map(|plane| {
+            let (x, y, z) = plane.u_direction();
+            Vec3::new(x, y, z).length()
+        })
+        .filter(|length| length.is_finite() && *length > 0.0)
+        .unwrap_or(1.0);
     let (degree, knots, controls) = source.bspline_in(document)?;
     let mut points = Vec::with_capacity(controls.len());
     let mut weights = Vec::with_capacity(controls.len());
@@ -669,7 +699,7 @@ fn read_pcurve(
         if !weight.is_finite() || weight <= 0.0 {
             return None;
         }
-        let mut point = [control[0] / weight, control[1] / weight];
+        let mut point = [control[0] / weight * scale, control[1] / weight * scale];
         if reversed_v {
             point[1] = -point[1];
         }
@@ -689,10 +719,12 @@ fn analytic_surface_reversed(record: &SatRecord) -> bool {
 }
 
 /// A cone record with a negative cosine has its normal towards the axis (the
-/// inner wall of a swept bend, for example). The kernel's cones and
-/// cylinders always face away from the axis, so the face turns instead.
-fn cone_points_inward(record: &SatRecord) -> bool {
+/// inner wall of a swept bend, for example), and a sphere with a negative
+/// radius towards its centre. The kernel's cones, cylinders and spheres
+/// always face outward, so the face turns instead.
+fn points_inward(record: &SatRecord) -> bool {
     SatConeSurface::from_record(record).is_some_and(|cone| cone.cos_half_angle() < 0.0)
+        || SatSphereSurface::from_record(record).is_some_and(|sphere| sphere.radius() < 0.0)
 }
 
 fn surface_of(
@@ -722,7 +754,7 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
         let (nx, ny, nz) = plane.normal();
         let (ux, uy, uz) = plane.u_direction();
         // The u direction is stored, so the frame comes from the file rather
-        // than being invented ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â which is why the kernel's Plane takes axes.
+        // than being invented ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â which is why the kernel's Plane takes axes.
         return Some(Surface::Plane(Plane::orthonormal(
             [x, y, z],
             [ux, uy, uz],
@@ -734,13 +766,11 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
         let (ax, ay, az) = cone.axis();
         let (mx, my, mz) = cone.major_axis();
         // The radius is the length of the major axis, not the `radius`
-        // token ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â reading the token instead turns a disc into a ring.
+        // token ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â reading the token instead turns a disc into a ring.
         let radius = Vec3::new(mx, my, mz).length();
         let base = Plane::orthonormal([cx, cy, cz], [mx, my, mz], [ax, ay, az])?;
         // Only the ratio shapes the cone; a negative cosine flips the normal,
-        // which `cone_points_inward` carries on the face.
-        let (sine, cosine) = (cone.sin_half_angle(), cone.cos_half_angle());
-        let (sine, cosine) = if cosine < 0.0 { (-sine, -cosine) } else { (sine, cosine) };
+        // which `points_inward` carries on the face.
         let (sine, cosine) = (cone.sin_half_angle(), cone.cos_half_angle());
         let (sine, cosine) = if cosine < 0.0 { (-sine, -cosine) } else { (sine, cosine) };
         let ratio = cone.ratio();
@@ -776,7 +806,7 @@ fn read_surface(document: &SatDocument, record: &SatRecord) -> Option<Surface> {
         let (px, py, pz) = sphere.pole();
         return Some(Surface::Sphere(Sphere {
             frame: Plane::orthonormal([cx, cy, cz], [ux, uy, uz], [px, py, pz])?,
-            radius: sphere.radius(),
+            radius: sphere.radius().abs(),
         }));
     }
     if let Some(torus) = SatTorusSurface::from_record(record) {
@@ -906,8 +936,8 @@ fn interpolate_grid(
     )
 }
 
-/// A stand-in for a surface the kernel cannot evaluate ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â a vertex blend
-/// saves no fitted spline, only its boundary ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â filled over the face's own
+/// A stand-in for a surface the kernel cannot evaluate ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â a vertex blend
+/// saves no fitted spline, only its boundary ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â filled over the face's own
 /// outer loop: the loop seen along its mean normal, and each point inside
 /// it the mean-value blend of the loop's points. It meets the face's edges
 /// exactly and is smooth between them, which is what drawing the face
@@ -1114,7 +1144,7 @@ fn clean(record: &SatRecord) -> Provenance {
     match index_of(record) {
         Some(index) => Provenance::Clean(SourceRef::new(index)),
         // A record with no usable index cannot be written back as itself, so
-        // it is treated as something this kernel made up ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â which forces a
+        // it is treated as something this kernel made up ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â which forces a
         // rebuild rather than a copy of a record it cannot find.
         None => Provenance::Synthesized,
     }

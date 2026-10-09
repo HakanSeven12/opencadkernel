@@ -37,11 +37,13 @@ pub fn slice_by_plane(body: &Body, plane: Plane) -> Result<Option<PlaneSlice>, S
         return Ok(None);
     }
 
+    // An edge more than two faces share — two parts of one solid touching
+    // along it — still closes the solid as long as its uses pair up.
     let closed = body
         .edges
         .iter()
         .filter(|(_, edge)| !edge.coedges.is_empty())
-        .all(|(_, edge)| edge.coedges.len() == 2);
+        .all(|(_, edge)| edge.coedges.len() % 2 == 0);
     if closed {
         split_solid(body, plane, frame, tolerance)
     } else {
@@ -93,7 +95,7 @@ pub fn slice_by_surface(body: &Body, cutter: &Body) -> Result<Option<PlaneSlice>
         .edges
         .iter()
         .filter(|(_, edge)| !edge.coedges.is_empty())
-        .all(|(_, edge)| edge.coedges.len() == 2);
+        .all(|(_, edge)| edge.coedges.len() % 2 == 0);
     if !closed {
         return Ok(Some(PlaneSlice {
             negative: copy_faces(&divided, &negative_faces)?,

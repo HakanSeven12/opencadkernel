@@ -215,6 +215,16 @@ impl Body {
         }
     }
 
+    /// The next coedge round `coedge`'s edge, as ACIS chains partners: the
+    /// other side for a manifold edge, and for a non-manifold one the next of
+    /// its coedges, the last pointing back to the first. `None` when the
+    /// edge has only this coedge.
+    pub fn radial_next(&self, coedge: CoedgeKey) -> Option<CoedgeKey> {
+        let edge = self.edges.get(self.coedges.get(coedge)?.edge)?;
+        let at = edge.coedges.iter().position(|c| *c == coedge)?;
+        (edge.coedges.len() >= 2).then(|| edge.coedges[(at + 1) % edge.coedges.len()])
+    }
+
     /// The vertices a coedge runs from and to, in the loop's own direction.
     pub fn coedge_vertices(&self, coedge: CoedgeKey) -> Option<(VertexKey, VertexKey)> {
         let coedge = self.coedges.get(coedge)?;

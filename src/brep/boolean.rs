@@ -28,7 +28,7 @@ use super::geometry::{Curve3, Line3, Surface};
 use super::imprint::{imprint, Snag};
 use super::pcurve;
 use super::topology::{Body, CoedgeKey, EdgeKey, Face, FaceKey, Lump, Shell, VertexKey};
-use super::Provenance;
+use super::{Placement, Provenance};
 use crate::geom2d::Curve;
 use crate::space::Vec3;
 use std::collections::{HashMap, VecDeque};
@@ -50,7 +50,28 @@ pub enum Operation {
 /// along the way, which is why they are taken by value — an imprinted copy is
 /// not the body the caller handed over, and returning it silently would be
 /// worse than asking for ownership.
-pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+pub fn combine(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+    // Far from the origin — survey coordinates — every intersection loses
+    // the digits the offset takes. Worked about the pair's own centre and
+    // moved back, they keep them.
+    let centre = super::body_bounds(&a).zip(super::body_bounds(&b)).and_then(|(one, other)| {
+        let low = Vec3::from(std::array::from_fn(|axis| one.min[axis].min(other.min[axis])));
+        let high = Vec3::from(std::array::from_fn(|axis| one.max[axis].max(other.max[axis])));
+        let centre = (low + high) * 0.5;
+        (centre.length() > (high - low).length()).then_some(centre)
+    });
+    let moved = centre.and_then(|centre| {
+        let there = Placement::at((-centre).to_array());
+        Some((super::transform(&a, &there)?, super::transform(&b, &there)?, centre))
+    });
+    let Some((a, b, centre)) = moved else {
+        return combine_here(a, b, how, tolerance);
+    };
+    let result = combine_here(a, b, how, tolerance)?;
+    super::transform(&result, &Placement::at(centre.to_array())).ok_or(Snag::CutRefused)
+}
+
+fn combine_here(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
     let (divided_a, divided_b) = (divided_sphere(&a, &b, tolerance), divided_sphere(&b, &a, tolerance));
     if let Some(divided) = divided_a {
         a = divided;
@@ -136,7 +157,7 @@ pub fn combine(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Resu
 /// neighbours, such as the side of a box and of the prism pulled from its
 /// top, become one face, and straight edges left in line become one edge.
 /// A body that would not validate afterwards is left as it was.
-fn merge_coplanar_faces(body: &mut Body, tolerance: f64) {
+pub(super) fn merge_coplanar_faces(body: &mut Body, tolerance: f64) {
     let mut merged = body.clone();
     let mut changed = false;
     loop {
@@ -599,10 +620,21 @@ fn keeps_shared_wall(
 /// "boundary" for reasons that have nothing to do with which side the face is
 /// on.
 pub(super) fn face_side(body: &Body, other: &Body, face: FaceKey, tolerance: f64) -> Containment {
-    match interior_point(body, face, tolerance) {
+    let side = match interior_point(body, face, tolerance) {
         Some(point) => contains_point(other, point, tolerance),
         None => Containment::Unknown,
+    };
+    if side != Containment::OnBoundary {
+        return side;
     }
+    // The point found may sit on a cut the other body made across the face —
+    // a strip's middle on the curve dividing it from the next. Another point
+    // of the face, clear of the other body's boundary, settles which side
+    // it is; a face lying on that boundary throughout has none.
+    let clear =
+        |point: [f64; 3]| contains_point(other, point, tolerance) != Containment::OnBoundary;
+    interior_point_where(body, face, tolerance, &clear)
+        .map_or(side, |point| contains_point(other, point, tolerance))
 }
 
 /// A point strictly inside a face, in space.
@@ -613,6 +645,16 @@ pub(super) fn face_side(body: &Body, other: &Body, face: FaceKey, tolerance: f64
 /// concave one, so it is checked rather than assumed, and the midpoints
 /// between it and each boundary point are tried after it.
 pub(super) fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Option<[f64; 3]> {
+    interior_point_where(body, face, tolerance, &|_| true)
+}
+
+/// [`interior_point`], among the points `accept` takes.
+fn interior_point_where(
+    body: &Body,
+    face: FaceKey,
+    tolerance: f64,
+    accept: &dyn Fn([f64; 3]) -> bool,
+) -> Option<[f64; 3]> {
     let node = body.faces.get(face)?;
     let surface = body.surfaces.get(node.surface)?;
     if let Surface::Sphere(sphere) = surface {
@@ -640,6 +682,9 @@ pub(super) fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Opti
         return whole_face_point(body, face, surface, tolerance);
     }
     let boundary = pcurve::face_boundary(body, face, tolerance)?;
+    // Up to a cone's apex, too: a cap's rim alone puts every sample on it.
+    let boundary = pcurve::apex_closed(surface, &boundary, crate::geom2d::Tolerance::new(tolerance))
+        .unwrap_or(boundary);
     let samples: Vec<[f64; 2]> = boundary
         .iter()
         .flat_map(|curve| {
@@ -659,12 +704,17 @@ pub(super) fn interior_point(body: &Body, face: FaceKey, tolerance: f64) -> Opti
         let on_edge = boundary
             .iter()
             .any(|edge| crate::geom2d::distance_to(edge, candidate) <= tolerance);
+        // Asked of the surface, not of the plane: a band's rims and a cone's
+        // apex line are no closed polygon, and a plain polygon test over them
+        // could put a point of one half of a cut band into the other.
         (!on_edge
-            && crate::geom2d::contains(
+            && pcurve::contains_parameter(
+                surface,
                 &boundary,
                 candidate,
                 crate::geom2d::Tolerance::new(tolerance),
-            ))
+            )
+            && accept(surface.point_at(candidate[0], candidate[1])))
         .then_some(candidate)
     };
     let chosen = usable(centre).or_else(|| {
@@ -796,7 +846,7 @@ pub(super) fn copy_face(
     copy_face_with_tolerance(result, source, face, shell, flip, tolerance)
 }
 
-fn copy_face_with_tolerance(result: &mut Body, source: &Body, face: FaceKey, shell: super::ShellKey, flip: bool, tolerance: f64) -> Result<(), Snag> {
+pub(super) fn copy_face_with_tolerance(result: &mut Body, source: &Body, face: FaceKey, shell: super::ShellKey, flip: bool, tolerance: f64) -> Result<(), Snag> {
     let node = source.faces.get(face).ok_or(Snag::CutRefused)?;
     let surface = source
         .surfaces
@@ -857,7 +907,8 @@ fn copy_face_with_tolerance(result: &mut Body, source: &Body, face: FaceKey, she
             let here = Vec3::from(curve.tangent_at(
                 0.5 * (source_edge.start_parameter + source_edge.end_parameter),
             ));
-            let edge = match find_edge(result, start, end, middle, tolerance) {
+            let span = (source_edge.start_parameter, source_edge.end_parameter);
+            let edge = match find_edge(result, start, end, middle, (&curve, span), tolerance) {
                 Some(existing) => existing,
                 None => {
                     let curve = result.curves.insert(curve);
@@ -944,6 +995,7 @@ fn find_edge(
     start: super::topology::VertexKey,
     end: super::topology::VertexKey,
     middle: [f64; 3],
+    (curve, span): (&super::Curve3, (f64, f64)),
     tolerance: f64,
 ) -> Option<super::topology::EdgeKey> {
     result
@@ -952,21 +1004,39 @@ fn find_edge(
         .find(|(key, edge)| {
             let ends_match = (edge.start == start && edge.end == end)
                 || (edge.start == end && edge.end == start);
-            ends_match
-                && result
-                    .edge_endpoints(*key)
-                    .is_some()
-                    .then(|| {
-                        result.curves.get(edge.curve).map(|curve| {
-                            curve.point_at(
-                                0.5 * (edge.start_parameter + edge.end_parameter),
-                            )
-                        })
+            // One stretch of a spline between two corners is one edge,
+            // though each solid's cut ended it a fit apart along the spline.
+            // A closed spline has two stretches between the same corners;
+            // the spans tell them apart.
+            let within = |value: f64, (from, to): (f64, f64)| {
+                value >= from.min(to) && value <= from.max(to)
+            };
+            let same_spline = start != end
+                && matches!(curve, super::Curve3::Nurbs(_))
+                && result.curves.get(edge.curve) == Some(curve)
+                && within(0.5 * (span.0 + span.1), (edge.start_parameter, edge.end_parameter))
+                && within(0.5 * (edge.start_parameter + edge.end_parameter), span);
+            let same_middle = result
+                .edge_endpoints(*key)
+                .is_some()
+                .then(|| {
+                    result.curves.get(edge.curve).map(|curve| {
+                        curve.point_at(0.5 * (edge.start_parameter + edge.end_parameter))
                     })
-                    .flatten()
-                    .is_some_and(|point| {
-                        Vec3::from(point).distance(Vec3::from(middle)) <= tolerance
-                    })
+                })
+                .flatten()
+                .is_some_and(|point| Vec3::from(point).distance(Vec3::from(middle)) <= tolerance);
+            // A closed edge has no middle to compare: the same loop written
+            // as two different curves starts its parameters anywhere round
+            // it. It is the same edge where the one passes through the
+            // other's middle.
+            let same_loop = start == end
+                && edge.start == edge.end
+                && result.curves.get(edge.curve).is_some_and(|existing| {
+                    let on = existing.point_at(existing.parameter_at(middle));
+                    Vec3::from(on).distance(Vec3::from(middle)) <= tolerance
+                });
+            ends_match && (same_spline || same_middle || same_loop)
         })
         .map(|(key, _)| key)
 }

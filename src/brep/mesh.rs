@@ -908,13 +908,25 @@ fn emit_points(mesh: &mut Mesh, a: [f64; 3], b: [f64; 3], c: [f64; 3]) {
     mesh.triangles.push([base, base + 1, base + 2]);
 }
 
+/// A planar face with no inside to draw: two boundary curves a file's fit
+/// apart — a spline lying along the arc it was fitted to — cross and recross
+/// each other, so no triangulation holds, and there is nothing to show.
+fn hairline_face(body: &Body, face: FaceKey) -> bool {
+    super::split::planar_measure(body, face).is_some_and(|(area, perimeter)| {
+        let half = 0.5 * perimeter;
+        area.abs() <= 1e-3 * half * half
+    })
+}
+
 /// Tessellates faces and edges from one shared sample schedule.
 pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
     let schedules = body_edge_schedules(body, tolerance);
     let mut out = BodyMesh::default();
     for face_key in body.face_keys() {
         let max_angle = face_chordal_angle(body, face_key, tolerance.angle, tolerance.chordal);
-        match scheduled_face(body, face_key, max_angle, tolerance.linear, &schedules) {
+        match scheduled_face(body, face_key, max_angle, tolerance.linear, &schedules)
+            .or_else(|| finer_face(body, face_key, max_angle, tolerance.linear))
+        {
             Some(mesh) => {
                 if let Some(cone) = analytic_cone_face(body, face_key, &mesh) {
                     out.analytic_cones.push(cone);
@@ -937,6 +949,7 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
                     }
                 }
             }
+            None if hairline_face(body, face_key) => {}
             None => out.missing_faces.push(face_key),
         }
     }
@@ -2060,6 +2073,12 @@ fn scheduled_loop(
         uses.remove(0);
         uses.pop();
     }
+    // A loop that was nothing but a slit — one edge run there and back —
+    // cancels to nothing and bounds no area. It is skipped, not failed: a
+    // `None` here would take the whole face with it.
+    if uses.is_empty() {
+        return Some(Vec::new());
+    }
     let mut pieces = Vec::with_capacity(uses.len());
     for coedge_key in uses {
         let coedge = body.coedges.get(coedge_key)?;
@@ -3166,7 +3185,27 @@ fn scheduled_singular_band(
             return None;
         }
     }
-    if singular_loops != 1 {
+    // A face cut from a whole cone may reach the apex along its seam
+    // instead: the seam runs there and back, which the loop drops as a slit,
+    // and what is left is the rim alone, as with an apex loop.
+    let apex_seam = || -> Option<bool> {
+        let apex = surface.point_at(0.0, cone.radius / cone.half_angle.tan());
+        let ring = body.loops.get(boundary_loop?)?;
+        Some(ring.coedges.iter().any(|coedge| {
+            let Some(edge) = body.coedges.get(*coedge).and_then(|c| body.edges.get(c.edge))
+            else {
+                return false;
+            };
+            edge.coedges.len() == 2
+                && edge.coedges.iter().all(|c| ring.coedges.contains(c))
+                && [edge.start, edge.end].iter().any(|vertex| {
+                    body.vertices
+                        .get(*vertex)
+                        .is_some_and(|vertex| distance3(vertex.point, apex) <= tolerance * 10.0)
+                })
+        }))
+    };
+    if singular_loops > 1 || (singular_loops == 0 && apex_seam() != Some(true)) {
         return None;
     }
     let varying = 0;
@@ -3174,7 +3213,10 @@ fn scheduled_singular_band(
     let period = periods(surface)[varying]?;
     let mut rim = scheduled_loop(body, boundary_loop?, surface, schedules, tolerance)?;
     let traversal = rim.last()?.parameters[varying] - rim.first()?.parameters[varying];
-    if traversal.abs() < period * (1.0 - 1e-9) || traversal.abs() > period * (1.0 + 1e-9) {
+    // A turn to within where an edge's end parameter puts its corner: an
+    // exact curve's end read back off its vertex is a few ulps of the
+    // radius out, which is more than 1e-9 of a turn on a small cone.
+    if (traversal.abs() - period).abs() > period * 1e-6 {
         return None;
     }
     let increasing = traversal > 0.0;
@@ -3250,7 +3292,7 @@ fn scheduled_winding_band(
     tolerance: f64,
 ) -> Option<BoundaryBand> {
     let node = body.faces.get(face)?;
-    if node.loops.len() != 2 {
+    if node.loops.len() < 2 {
         return None;
     }
     let rings: Vec<Vec<BoundaryPoint>> = node
@@ -3266,22 +3308,30 @@ fn scheduled_winding_band(
         let Some(period) = surface_periods[varying] else {
             continue;
         };
-        if surface_periods[1 - varying].is_some()
-            || rings
-                .iter()
-                .any(|ring| !is_monotonic_periodic_rim(ring, varying, period))
+        if surface_periods[1 - varying].is_some() {
+            continue;
+        }
+        // Two rims winding round once each, and anything else a hole between
+        // them that winds round not at all.
+        let traversal = |ring: &[BoundaryPoint]| {
+            ring.last().unwrap().parameters[varying] - ring.first().unwrap().parameters[varying]
+        };
+        let (rims, holes): (Vec<_>, Vec<_>) = rings
+            .iter()
+            .cloned()
+            .partition(|ring| traversal(ring).abs() >= period * 0.5);
+        if rims.len() != 2
+            || rims.iter().any(|ring| !is_monotonic_periodic_rim(ring, varying, period))
         {
             continue;
         }
-        let traversals = [0, 1].map(|index| {
-            rings[index].last().unwrap().parameters[varying]
-                - rings[index].first().unwrap().parameters[varying]
-        });
+        let traversals = [0, 1].map(|index| traversal(&rims[index]));
         if traversals[0].is_sign_positive() == traversals[1].is_sign_positive() {
             continue;
         }
-        let mut rims = rings.clone();
-        fit_periodic_band(surface, &mut rims, &mut [], varying, period)?;
+        let mut rims = rims;
+        let mut holes = holes;
+        fit_periodic_band(surface, &mut rims, &mut holes, varying, period)?;
         let first_is_low = separated_rim_order(&rims[0], &rims[1], varying)?;
         let (low, high) = if first_is_low {
             (rims.remove(0), rims.remove(0))
@@ -3291,7 +3341,7 @@ fn scheduled_winding_band(
         return Some(BoundaryBand {
             low,
             high,
-            holes: Vec::new(),
+            holes,
             varying,
             strip: true,
             structured: false,
@@ -3313,7 +3363,9 @@ fn is_monotonic_periodic_rim(rim: &[BoundaryPoint], varying: usize, period: f64)
         .iter()
         .map(|point| point.parameters[varying].abs())
         .fold(period.max(1.0), f64::max);
-    let epsilon = f64::EPSILON * 128.0 * scale;
+    // A rim stepping straight across at one value meets the next curve a
+    // rounding off that value: two curves evaluated at one corner.
+    let epsilon = (f64::EPSILON * 128.0 * scale).max(period * 1e-9);
     rim.windows(2).all(|pair| {
         let delta = pair[1].parameters[varying] - pair[0].parameters[varying];
         if increasing {
@@ -3403,13 +3455,21 @@ fn parameter_seam(
     ) {
         return None;
     }
-    let mut parameters = [0.0; 2];
-    parameters[fixed_axis] = fixed;
-    parameters[varying_axis] = to.parameters[varying_axis];
-    points.push(BoundaryPoint {
-        parameters,
-        position: surface.point_at(parameters[0], parameters[1]),
-    });
+    // The rims may end a rounding apart across the seam. Leaning the seam
+    // from one end to the other keeps it straight; holding it at the mean
+    // value would notch the ring there and leave a sliver to triangulate.
+    let (low, high) = (from.parameters[varying_axis], to.parameters[varying_axis]);
+    for point in &mut points {
+        let unit = if high != low {
+            (point.parameters[varying_axis] - low) / (high - low)
+        } else {
+            0.0
+        };
+        let (start, end) = (from.parameters[fixed_axis], to.parameters[fixed_axis]);
+        point.parameters[fixed_axis] = start + (end - start) * unit;
+        point.position = surface.point_at(point.parameters[0], point.parameters[1]);
+    }
+    points.push(to.clone());
     Some(points)
 }
 
@@ -3519,7 +3579,18 @@ fn rotate_periodic_rim(
     period: f64,
 ) -> Option<()> {
     let scale = seam.abs().max((seam + period).abs()).max(1.0);
-    let epsilon = f64::EPSILON * 128.0 * scale;
+    // As loose as `is_monotonic_periodic_rim`: a corner two curves place a
+    // rounding apart is on the seam from either side.
+    let epsilon = (f64::EPSILON * 128.0 * scale).max(period * 1e-9);
+    // Rotated round rather than sorted: a rim may step straight across the
+    // band at one value (a notch cut into a tube's end), and sorting by that
+    // value would scramble or merge the step's two ends.
+    if rim.last()?.parameters[varying] < rim.first()?.parameters[varying] {
+        rim.reverse();
+    }
+    if rim.len() > 1 {
+        rim.pop();
+    }
     for point in rim.iter_mut() {
         let mut value = seam + (point.parameters[varying] - seam).rem_euclid(period);
         if (value - seam - period).abs() <= epsilon {
@@ -3527,13 +3598,16 @@ fn rotate_periodic_rim(
         }
         point.parameters[varying] = value;
     }
-    rim.sort_by(|a, b| a.parameters[varying].total_cmp(&b.parameters[varying]));
+    if let Some(wrap) = (1..rim.len()).find(|index| {
+        rim[*index].parameters[varying] < rim[index - 1].parameters[varying] - period * 0.5
+    }) {
+        rim.rotate_left(wrap);
+    }
     rim.dedup_by(|a, b| {
-        let scale = a.parameters[varying]
-            .abs()
-            .max(b.parameters[varying].abs())
-            .max(1.0);
-        (a.parameters[varying] - b.parameters[varying]).abs() <= f64::EPSILON * 128.0 * scale
+        (0..2).all(|axis| {
+            let scale = a.parameters[axis].abs().max(b.parameters[axis].abs()).max(1.0);
+            (a.parameters[axis] - b.parameters[axis]).abs() <= f64::EPSILON * 128.0 * scale
+        })
     });
     // Both rims must start on the seam itself: one whose samples straddle
     // it would otherwise start a step past it, and the seam joining the two
@@ -3760,6 +3834,35 @@ pub fn face(body: &Body, face: FaceKey, max_angle: f64, tolerance: f64) -> Optio
         .filter_map(|edge| Some((edge, shared_edge_samples(body, edge, max_angle, tolerance)?)))
         .collect();
     scheduled_face(body, face, max_angle, tolerance, &schedules)
+        .or_else(|| finer_face(body, face, max_angle, tolerance))
+}
+
+/// A face whose boundary, sampled as its neighbours need, crosses itself:
+/// two of its curves run so close that their chords cross although the
+/// curves do not (a spline beside the arc it leaves at a shallow angle).
+/// Its own edges sampled finer then; the seam with the neighbours can open
+/// by at most the tolerance, which a hole the size of the face cannot beat.
+fn finer_face(body: &Body, face: FaceKey, max_angle: f64, tolerance: f64) -> Option<Mesh> {
+    let node = body.faces.get(face)?;
+    for factor in [0.1, 0.01] {
+        let schedules: HashMap<EdgeKey, Vec<super::place::EdgeSample>> = node
+            .loops
+            .iter()
+            .filter_map(|ring| body.loops.get(*ring))
+            .flat_map(|ring| ring.coedges.iter())
+            .filter_map(|coedge| body.coedges.get(*coedge))
+            .filter_map(|coedge| {
+                Some((
+                    coedge.edge,
+                    shared_edge_samples(body, coedge.edge, max_angle * factor, tolerance * factor)?,
+                ))
+            })
+            .collect();
+        if let Some(mesh) = scheduled_face(body, face, max_angle, tolerance, &schedules) {
+            return Some(mesh);
+        }
+    }
+    None
 }
 
 fn fill_scheduled_band(
@@ -4492,7 +4595,14 @@ fn seed_surface_grid(
     }
     let mut inserted = 0;
     for (fixed_axis, values) in [u_values, v_values].into_iter().enumerate() {
+        // A knot a rounding away from the boundary (a seam the rims put at
+        // 0.4999999999 beside a knot at 0.5) would only cut slivers.
+        let [low, high] = bounds[fixed_axis];
+        let near = (high - low) * 1e-6;
         for fixed in values.iter().skip(1).take(values.len().saturating_sub(2)) {
+            if *fixed - low <= near || high - *fixed <= near {
+                continue;
+            }
             for interval in line_intervals(rings, fixed_axis, *fixed) {
                 let span = interval[1] - interval[0];
                 let inset = span * 1e-9;

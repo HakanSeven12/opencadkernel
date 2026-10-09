@@ -67,6 +67,14 @@ pub fn planar_face_profile(body: &Body, key: FaceKey) -> Option<PlanarFaceProfil
         }
         loops.push(curves);
     }
+    // A face's loops come in no order; the one enclosing the rest is the
+    // one enclosing the most.
+    let area =
+        |ring: &Vec<Curve>| ring.iter().map(|curve| curve.enclosed_area()).sum::<f64>().abs();
+    let outer = (0..loops.len()).max_by(|a, b| area(&loops[*a]).total_cmp(&area(&loops[*b])));
+    if let Some(outer) = outer {
+        loops.swap(0, outer);
+    }
     let normal = Vec3::from(plane.normal()?);
     Some(PlanarFaceProfile {
         plane: *plane,
@@ -110,7 +118,8 @@ pub fn presspull_face(
     }
     let profile = planar_face_profile(body, key)?;
     match mode {
-        PresspullMode::Extrude => presspull_region(body, &profile, distance),
+        PresspullMode::Extrude => glued_pull(body, key, &profile, distance)
+            .or_else(|| presspull_region(body, &profile, distance)),
         PresspullMode::Offset => {
             // Working near the edited face avoids cancellation in intersections
             // of unit-sized solids located far from the world origin.
@@ -120,6 +129,118 @@ pub fn presspull_face(
             super::transform(&edited, &Placement::at(origin.to_array()))
         }
     }
+}
+
+/// A whole face pulled out of a body lying wholly behind it: the face gives
+/// way to the prism's walls and top, joined along its own edges. A union
+/// reached the same through each wall meeting its own extension — tangent
+/// all along the rim, where tracing the meeting gives out (a spline wall
+/// pulled up). `None` where the body reaches past the face's plane and the
+/// prism might run into it.
+fn glued_pull(
+    body: &Body,
+    key: FaceKey,
+    region: &PlanarFaceProfile,
+    distance: f64,
+) -> Option<Body> {
+    if distance <= 0.0 {
+        return None;
+    }
+    let normal = Vec3::from(region.outward).normalize()?;
+    let origin = Vec3::from(region.plane.origin);
+    let mut local = super::transform(body, &Placement::at((-origin).to_array()))?;
+    let tolerance = super::operation_tolerance(&[&local]);
+    // Behind the plane by every edge and every curved face's box.
+    let behind = |point: [f64; 3]| Vec3::from(point).dot(normal) <= tolerance;
+    let edges_behind = local.edges.iter().all(|(_, edge)| {
+        local.curves.get(edge.curve).is_some_and(|curve| {
+            (0..=16).all(|step| {
+                let t = step as f64 / 16.0;
+                behind(curve.point_at(edge.start_parameter * (1.0 - t) + edge.end_parameter * t))
+            })
+        })
+    });
+    let fit = tolerance.max(local.worst_vertex_gap() * 2.0);
+    let faces_behind = local.face_keys().all(|face| {
+        match local.faces.get(face).and_then(|node| local.surfaces.get(node.surface)) {
+            Some(Surface::Plane(_)) => true,
+            // Round the face's normal, a cylinder or cone is furthest out
+            // at its rims, which are edges and already behind.
+            Some(Surface::Cylinder(super::geometry::Cylinder { base, .. }))
+            | Some(Surface::Cone(super::geometry::Cone { base, .. })) => base
+                .normal()
+                .is_some_and(|axis| Vec3::from(axis).dot(normal).abs() >= 1.0 - 1e-9),
+            // A spline lies within its control net, which a fitted wall
+            // reaches past its edges by no more than the fit.
+            Some(Surface::Nurbs(spline)) => spline
+                .control_points()
+                .iter()
+                .flatten()
+                .all(|point| Vec3::from(*point).dot(normal) <= fit),
+            _ => super::face_bounds(&local, face).is_some_and(|bounds| {
+                (0..8).all(|bits| {
+                    behind(std::array::from_fn(|axis| match bits >> axis & 1 {
+                        0 => bounds.min[axis],
+                        _ => bounds.max[axis],
+                    }))
+                })
+            }),
+        }
+    });
+    if !edges_behind || !faces_behind {
+        return None;
+    }
+    let mut plane = region.plane;
+    plane.origin = [0.0; 3];
+    let loops = region
+        .loops
+        .iter()
+        .map(|ring| split_closed_curves(ring))
+        .collect::<Vec<_>>();
+    let mut tool = super::extrude_region(plane, &loops, (normal * distance).to_array())?;
+    // The prism's base runs its curves in pieces; the face's own edges are
+    // cut at the same corners so the two meet edge for edge.
+    super::imprint::align_edge_vertices(&tool, &mut local, tolerance);
+    super::imprint::align_edge_vertices(&local, &mut tool, tolerance);
+    let on_base = |face: FaceKey| {
+        tool.face_coedges(face).iter().all(|coedge| {
+            tool.coedge_vertices(*coedge)
+                .and_then(|(from, _)| tool.vertices.get(from))
+                .is_some_and(|vertex| Vec3::from(vertex.point).dot(normal).abs() <= tolerance)
+        })
+    };
+    let mut result = Body::new();
+    let lump = result.lumps.insert(super::Lump {
+        shells: Vec::new(),
+        provenance: super::Provenance::Synthesized,
+    });
+    let shell = result.shells.insert(super::Shell {
+        faces: Vec::new(),
+        owner: lump,
+        provenance: super::Provenance::Synthesized,
+    });
+    result.lumps.get_mut(lump)?.shells = vec![shell];
+    result.roots = vec![lump];
+    // Joined to within the body's own fit: a file's corners sit a fit off
+    // their curves, and the prism's base starts where the curves do.
+    let glue = fit;
+    let copy = |result: &mut Body, source: &Body, face: FaceKey| {
+        super::boolean::copy_face_with_tolerance(result, source, face, shell, false, glue).ok()
+    };
+    for face in local.face_keys().filter(|face| *face != key) {
+        copy(&mut result, &local, face)?;
+    }
+    for face in tool.face_keys().filter(|face| !on_base(*face)) {
+        copy(&mut result, &tool, face)?;
+    }
+    super::boolean::orient_shell(&mut result).ok()?;
+    if result.edges.iter().any(|(_, edge)| edge.coedges.len() != 2)
+        || !result.validate().is_empty()
+    {
+        return None;
+    }
+    super::boolean::merge_coplanar_faces(&mut result, tolerance);
+    super::transform(&result, &Placement::at(origin.to_array()))
 }
 
 /// Adds an outward bounded-region extrusion, or removes an inward extrusion.
@@ -636,9 +757,58 @@ fn closed_curve_order(curves: &[Curve], tolerance: f64) -> Option<Vec<(usize, bo
     })
 }
 
+/// A spline that is exactly a circle or an arc of one, as that: a loop
+/// running clockwise is read off a face as a spline (an arc only turns
+/// counter-clockwise), and extruded as one its wall became a spline sheet
+/// that no closed form meets.
+fn circular_piece(curve: &Curve) -> Option<Curve> {
+    let Curve::Nurbs(_) = curve else {
+        return None;
+    };
+    let at = |t: f64| Vec3::new(curve.point_at(t)[0], curve.point_at(t)[1], 0.0);
+    let (a, b, c) = (at(0.0), at(1.0 / 3.0), at(2.0 / 3.0));
+    // The centre is where the perpendicular bisectors of ab and bc meet.
+    let (ab, bc) = (b - a, c - b);
+    let det = 2.0 * (ab.x * bc.y - ab.y * bc.x);
+    if det.abs() <= f64::EPSILON * ab.length() * bc.length() {
+        return None;
+    }
+    let (ka, kb) = (ab.dot(a + b), bc.dot(b + c));
+    let centre = Vec3::new((ka * bc.y - kb * ab.y) / det, (kb * ab.x - ka * bc.x) / det, 0.0);
+    let radius = a.distance(centre);
+    let round = (0..=32).all(|step| {
+        (at(step as f64 / 32.0).distance(centre) - radius).abs() <= radius * 1e-9
+    });
+    if !round {
+        return None;
+    }
+    let angle = |p: Vec3| (p.y - centre.y).atan2(p.x - centre.x);
+    let end = at(1.0);
+    if end.distance(a) <= radius * 1e-9 {
+        return Some(Curve::Circle(crate::geom2d::Circle {
+            centre: [centre.x, centre.y],
+            radius,
+        }));
+    }
+    // Which way it turns: the arc from start to end counter-clockwise
+    // passes through the middle, or the curve runs the other way.
+    let (start, end, middle) = (angle(a), angle(end), angle(at(0.5)));
+    let turning = (middle - start).rem_euclid(TAU) < (end - start).rem_euclid(TAU);
+    let (from, to) = if turning { (start, end) } else { (end, start) };
+    Some(Curve::Arc(Arc {
+        centre: [centre.x, centre.y],
+        radius,
+        start_angle: from,
+        end_angle: from + (to - from).rem_euclid(TAU),
+    }))
+}
+
 /// Splits complete conics into exact bounded pieces for extrusion builders.
 pub fn extrusion_profile_pieces(ring: &[Curve]) -> Vec<Curve> {
     ring.iter()
+        .map(|curve| circular_piece(curve).unwrap_or_else(|| curve.clone()))
+        .collect::<Vec<_>>()
+        .iter()
         .flat_map(|curve| match curve {
             Curve::Circle(circle) => (0..4)
                 .map(|i| {
