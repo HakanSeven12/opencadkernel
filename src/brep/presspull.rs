@@ -125,10 +125,122 @@ pub fn presspull_face(
             // of unit-sized solids located far from the world origin.
             let origin = Vec3::from(profile.plane.origin);
             let local = super::transform(body, &Placement::at((-origin).to_array()))?;
-            let edited = offset_local(&local, key, distance)?;
-            super::transform(&edited, &Placement::at(origin.to_array()))
+            let edited = offset_local(&local, key, distance)
+                .and_then(|edited| super::transform(&edited, &Placement::at(origin.to_array())));
+            edited
+                .or_else(|| upright_offset(body, key, &profile, distance))
+                .or_else(|| convex_offset(body, key, &profile, distance))
         }
     }
+}
+
+/// An offset of a convex face whose every neighbour is a plane: the slab
+/// between the face and where it moves to, on the face's side of each
+/// neighbour's plane, is what the edit takes away or adds — each neighbour
+/// running on along its own plane, and dropping out where the others close
+/// over it. Taken away, the slab reaches a little past the face and its
+/// neighbours, so none of it lies on the body's own faces.
+fn convex_offset(
+    body: &Body,
+    key: FaceKey,
+    profile: &PlanarFaceProfile,
+    distance: f64,
+) -> Option<Body> {
+    if profile.loops.len() != 1 {
+        return None;
+    }
+    let tolerance = super::operation_tolerance(&[body]);
+    let normal = Vec3::from(profile.outward);
+    let corners = |face: FaceKey| -> Option<Vec<Vec3>> {
+        body.face_coedges(face)
+            .into_iter()
+            .map(|coedge| {
+                let (start, _) = body.coedge_vertices(coedge)?;
+                Some(Vec3::from(body.vertices.get(start)?.point))
+            })
+            .collect()
+    };
+    let own = corners(key)?;
+    let mut sides: Vec<(Vec3, Vec3, bool)> = Vec::new();
+    for coedge in body.face_coedges(key) {
+        let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
+        let neighbour = edge.coedges.iter().find_map(|other| {
+            let face = body.loops.get(body.coedges.get(*other)?.owner)?.owner;
+            (face != key).then_some(face)
+        })?;
+        let node = body.faces.get(neighbour)?;
+        let Surface::Plane(plane) = body.surfaces.get(node.surface)? else {
+            return None;
+        };
+        let outward = Vec3::from(plane.normal()?) * if node.forward { 1.0 } else { -1.0 };
+        let origin = Vec3::from(plane.origin);
+        // The slab keeps to the side of each neighbour's plane the face is on:
+        // behind a neighbour it meets at a convex edge, in front of one at a
+        // concave edge, a step's riser. A face not wholly on one side is not
+        // convex there, and the slab would cut into it.
+        let behind = |normal: Vec3| {
+            own.iter().all(|point| (*point - origin).dot(normal) <= tolerance)
+        };
+        let convex = behind(outward);
+        let side = if convex {
+            outward
+        } else if behind(-outward) {
+            -outward
+        } else {
+            return None;
+        };
+        sides.push((origin, side, convex));
+    }
+    let lift = tolerance * 1e3;
+    let at = |height: f64| Vec3::from(profile.plane.origin) + normal * height;
+    let (low, high) = if distance < 0.0 { (distance, lift) } else { (-lift, distance) };
+    // The end the slab starts from first: it always bounds it, where the far
+    // end may not once the neighbours close over the face.
+    let start = if distance < 0.0 { (at(high), normal) } else { (at(low), -normal) };
+    let end = if distance < 0.0 { (at(low), -normal) } else { (at(high), normal) };
+    let mut planes = vec![start, end];
+    // Past a convex edge is outside the body; past a concave one is the
+    // neighbour's own material, so the slab stops on its plane there.
+    for (origin, side, convex) in sides {
+        let grown = if distance < 0.0 && convex { origin + side * lift } else { origin };
+        planes.push((grown, side));
+    }
+    let slab = super::blend::bounded_by(&planes, tolerance)?;
+    let how = if distance < 0.0 { Operation::Difference } else { Operation::Union };
+    let edited = super::combine(body.clone(), slab, how, tolerance).ok()?;
+    (!edited.roots.is_empty() && edited.validate().is_empty()).then_some(edited)
+}
+
+/// An offset among walls that all stand square to the face is the same edit
+/// as the extrusion: each wall runs on along its own surface either way. It
+/// is taken only where the volume moved is exactly the face's area over the
+/// distance — where the extrusion reached nothing else on its way.
+fn upright_offset(
+    body: &Body,
+    key: FaceKey,
+    profile: &PlanarFaceProfile,
+    distance: f64,
+) -> Option<Body> {
+    let normal = Vec3::from(profile.outward);
+    for coedge in body.face_coedges(key) {
+        let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
+        let upright = match adjacent_surface(body, edge, key)? {
+            Surface::Plane(plane) => Vec3::from(plane.normal()?).dot(normal).abs() <= 1e-9,
+            Surface::Cylinder(cylinder) => {
+                Vec3::from(cylinder.base.normal()?).dot(normal).abs() >= 1.0 - 1e-9
+            }
+            _ => false,
+        };
+        if !upright {
+            return None;
+        }
+    }
+    let tolerance = super::operation_tolerance(&[body]);
+    let area = boundary_area(&super::pcurve::face_boundary(body, key, tolerance)?).abs();
+    let result = presspull_face(body, key, distance, PresspullMode::Extrude)?;
+    let volume = |body: &Body| super::mass_properties(body).map(|mass| mass.volume);
+    let moved = volume(&result)? - volume(body)?;
+    ((moved - area * distance).abs() <= 1e-3 * (area * distance).abs()).then_some(result)
 }
 
 /// A whole face pulled out of a body lying wholly behind it: the face gives
@@ -262,23 +374,22 @@ pub fn presspull_region(body: &Body, region: &PlanarFaceProfile, distance: f64) 
         .iter()
         .map(|ring| split_closed_curves(ring))
         .collect::<Vec<_>>();
-    let tool = super::extrude_region(plane, &loops, (normal * distance).to_array())?;
-    let tolerance = super::operation_tolerance(&[&local, &tool])
-        .max(f64::EPSILON * origin.length().max(1.0) * 64.0);
-    let edited = super::combine(
-        local,
-        tool,
-        if distance > 0.0 {
-            Operation::Union
-        } else {
-            Operation::Difference
-        },
-        tolerance,
-    )
-    .ok()?;
-    if edited.roots.is_empty() || !edited.validate().is_empty() {
-        return None;
-    }
+    let floor = f64::EPSILON * origin.length().max(1.0) * 64.0;
+    let attempt = |lift: f64| -> Option<Body> {
+        let mut plane = plane;
+        plane.origin = (normal * lift).to_array();
+        let tool = super::extrude_region(plane, &loops, (normal * (distance - lift)).to_array())?;
+        let tolerance = super::operation_tolerance(&[&local, &tool]).max(floor);
+        let how = if distance > 0.0 { Operation::Union } else { Operation::Difference };
+        let edited = super::combine(local.clone(), tool, how, tolerance).ok()?;
+        (!edited.roots.is_empty() && edited.validate().is_empty()).then_some(edited)
+    };
+    // A pushed face whose tool on its own plane reads as one face on both
+    // bodies' sides goes again with the tool started a little outside it:
+    // outside the face is outside the body. (Sunk under a pulled face the
+    // same way, the tool's sides leave slivers along the walls.)
+    let lift = super::operation_tolerance(&[&local]).max(floor) * 1e3;
+    let edited = attempt(0.0).or_else(|| (distance < 0.0).then(|| attempt(lift)).flatten())?;
     super::transform(&edited, &Placement::at(origin.to_array()))
 }
 

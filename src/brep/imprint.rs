@@ -192,8 +192,9 @@ pub fn imprint(a: &mut Body, b: &mut Body, tolerance: f64) -> Result<Imprint, Sn
             + cut_along(b, &curves, &beside_a, only.map(|sets| &sets[1]), tolerance)?;
         cuts += made;
         // Stitching needs matching edge partitions on both bodies.
-        align_edge_vertices(a, b, tolerance);
-        align_edge_vertices(b, a, tolerance);
+        // A round that cut nothing is the last: corners may settle then.
+        align_corners(a, b, tolerance, made == 0);
+        align_corners(b, a, tolerance, made == 0);
         if made == 0 {
             break;
         }
@@ -232,10 +233,230 @@ pub fn imprint(a: &mut Body, b: &mut Body, tolerance: f64) -> Result<Imprint, Sn
     // other one of the two; the other body's corner settles which.
     snap_cut_vertices(a, b, tolerance, reach);
     snap_cut_vertices(b, a, tolerance, reach);
+    separate_pinched_loops(a, tolerance);
+    separate_pinched_loops(b, tolerance);
+    collapse_lenses(a, tolerance);
+    collapse_lenses(b, tolerance);
     Ok(Imprint {
         cuts,
         meetings: count,
     })
+}
+
+/// A face whose one loop passes a corner twice, with no edge between the two
+/// passes, is two regions touching at that point: cuts crossing where two
+/// faces of the other body meet tangentially, a fillet running into its
+/// wall. The two lobes may lie on opposite sides of the other body, and one
+/// face has only one side; each lobe becomes a face of its own.
+fn separate_pinched_loops(body: &mut Body, tolerance: f64) {
+    let mut pending: Vec<FaceKey> = body.face_keys().collect();
+    while let Some(face) = pending.pop() {
+        let Some(node) = body.faces.get(face).cloned() else {
+            continue;
+        };
+        let [ring] = node.loops[..] else {
+            continue;
+        };
+        let Some(coedges) = body.loops.get(ring).map(|ring| ring.coedges.clone()) else {
+            continue;
+        };
+        let starts: Option<Vec<VertexKey>> = coedges
+            .iter()
+            .map(|coedge| body.coedge_vertices(*coedge).map(|(start, _)| start))
+            .collect();
+        let Some(starts) = starts else {
+            continue;
+        };
+        // A loop using an edge twice — a seam, a bridge to a hole — comes
+        // back through its corners by that edge, not round a second region.
+        let edges: HashSet<_> =
+            coedges.iter().filter_map(|coedge| body.coedges.get(*coedge)).map(|c| c.edge).collect();
+        if edges.len() != coedges.len() {
+            continue;
+        }
+        // Each corner passed twice is a place the loop may come apart;
+        // the first where both parts are regions of their own is taken.
+        let pairs: Vec<(usize, usize)> = (0..starts.len())
+            .flat_map(|first| (first + 1..starts.len()).map(move |second| (first, second)))
+            .filter(|(first, second)| starts[*first] == starts[*second])
+            .collect();
+        for (first, second) in pairs {
+            let pair = (first, second);
+            let Some(other) = split_lobe(body, face, &node, ring, &coedges, pair, tolerance) else {
+                continue;
+            };
+            pending.push(face);
+            pending.push(other);
+            break;
+        }
+    }
+}
+
+/// [`separate_pinched_loops`] at one corner the loop passes twice: the
+/// stretch between the two passes becomes a face of its own, or nothing
+/// changes and `None` comes back where the two parts are not both regions.
+fn split_lobe(
+    body: &mut Body,
+    face: FaceKey,
+    node: &Face,
+    ring: LoopKey,
+    coedges: &[CoedgeKey],
+    (first, second): (usize, usize),
+    tolerance: f64,
+) -> Option<FaceKey> {
+    let lobe: Vec<CoedgeKey> = coedges[first..second].to_vec();
+    let rest: Vec<CoedgeKey> =
+        coedges[second..].iter().chain(&coedges[..first]).copied().collect();
+    let owner = node.owner;
+    body.shells.get(owner)?;
+    let other = body.faces.insert(Face {
+        loops: Vec::new(),
+        provenance: Provenance::Synthesized,
+        ..node.clone()
+    });
+    let other_ring = body.loops.insert(Loop {
+        coedges: lobe.clone(),
+        owner: other,
+        provenance: Provenance::Synthesized,
+    });
+    for coedge in &lobe {
+        if let Some(coedge) = body.coedges.get_mut(*coedge) {
+            coedge.owner = other_ring;
+        }
+    }
+    if let Some(face) = body.faces.get_mut(other) {
+        face.loops = vec![other_ring];
+    }
+    if let Some(ring) = body.loops.get_mut(ring) {
+        ring.coedges = rest.clone();
+    }
+    // On a closed surface a lobe may run round it rather than round a
+    // region; then the loop was one region after all. A lobe wound the
+    // other way is a hole the loop dips into, not a second region.
+    let area = |face: FaceKey| {
+        super::pcurve::face_boundary_parts(body, face, tolerance).map_or(0.0, |parts| {
+            parts.iter().map(|(_, part)| part.enclosed_area()).sum::<f64>()
+        })
+    };
+    let closes = |face: FaceKey| {
+        let Some(surface) = body.faces.get(face).and_then(|f| body.surfaces.get(f.surface))
+        else {
+            return false;
+        };
+        let gap = super::pcurve::periods(surface)
+            .iter()
+            .flatten()
+            .fold(tolerance, |gap, period| gap.max(period * 1e-3));
+        super::pcurve::face_boundary_parts(body, face, tolerance).is_some_and(|parts| {
+            let (Some((_, head)), Some((_, tail))) = (parts.first(), parts.last()) else {
+                return false;
+            };
+            let (from, to) = (head.point_at(0.0), tail.point_at(1.0));
+            (from[0] - to[0]).hypot(from[1] - to[1]) <= gap
+        })
+    };
+    if !(closes(face) && closes(other) && area(face) * area(other) > 0.0) {
+        for coedge in &lobe {
+            if let Some(coedge) = body.coedges.get_mut(*coedge) {
+                coedge.owner = ring;
+            }
+        }
+        if let Some(ring) = body.loops.get_mut(ring) {
+            ring.coedges = coedges.to_vec();
+        }
+        body.loops.remove(other_ring);
+        body.faces.remove(other);
+        return None;
+    }
+    if let Some(shell) = body.shells.get_mut(owner) {
+        shell.faces.push(other);
+    }
+    if let Some(node) = body.faces.get_mut(face) {
+        node.provenance.soil();
+    }
+    Some(other)
+}
+
+/// A face bounded by two edges a tolerance apart all along — a chord and the
+/// arc it cuts off a hair from a corner, two curves through one point — has
+/// no inside to classify. It goes, and the two edges become one, joining
+/// the faces either side of it.
+fn collapse_lenses(body: &mut Body, tolerance: f64) {
+    let faces: Vec<FaceKey> = body.face_keys().collect();
+    for face in faces {
+        let Some(node) = body.faces.get(face) else {
+            continue;
+        };
+        let [ring] = node.loops[..] else {
+            continue;
+        };
+        let shell = node.owner;
+        let Some(&[first, second]) = body.loops.get(ring).map(|ring| &ring.coedges[..]) else {
+            continue;
+        };
+        let (Some(one), Some(other)) = (body.coedges.get(first), body.coedges.get(second)) else {
+            continue;
+        };
+        let (keep, drop) = (one.edge, other.edge);
+        let (Some(kept), Some(dropped)) = (body.edges.get(keep), body.edges.get(drop)) else {
+            continue;
+        };
+        let ends = |edge: &Edge| [edge.start, edge.end];
+        let same_ends = ends(kept) == ends(dropped)
+            || ends(kept) == [dropped.end, dropped.start];
+        if keep == drop || !same_ends || kept.coedges.len() != 2 || dropped.coedges.len() != 2 {
+            continue;
+        }
+        // A lens wide enough to hold a point is a face like any other, and
+        // the other body has its edges too.
+        if super::boolean::interior_point(body, face, tolerance).is_some() {
+            continue;
+        }
+        let (Some(along), Some(beside)) =
+            (body.curves.get(kept.curve), body.curves.get(dropped.curve))
+        else {
+            continue;
+        };
+        let close = (0..=8).all(|step| {
+            let t = dropped.start_parameter
+                + (dropped.end_parameter - dropped.start_parameter) * step as f64 / 8.0;
+            let point = beside.point_at(t);
+            Vec3::from(along.point_at(along.parameter_at(point))).distance(Vec3::from(point))
+                <= tolerance
+        });
+        if !close {
+            continue;
+        }
+        // The use of each edge outside the lens.
+        let outer = |edge: &Edge, inner: CoedgeKey| {
+            edge.coedges.iter().copied().find(|coedge| *coedge != inner)
+        };
+        let (Some(stays), Some(moves)) = (outer(kept, first), outer(dropped, second)) else {
+            continue;
+        };
+        let start = kept.start;
+        let Some((from, _)) = body.coedge_vertices(moves) else {
+            continue;
+        };
+        if let Some(coedge) = body.coedges.get_mut(moves) {
+            coedge.edge = keep;
+            coedge.forward = from == start;
+            coedge.pcurve = None;
+            coedge.provenance.soil();
+        }
+        if let Some(edge) = body.edges.get_mut(keep) {
+            edge.coedges = vec![stays, moves];
+            edge.provenance.soil();
+        }
+        body.edges.remove(drop);
+        body.coedges.remove(first);
+        body.coedges.remove(second);
+        body.loops.remove(ring);
+        body.faces.remove(face);
+        if let Some(shell) = body.shells.get_mut(shell) {
+            shell.faces.retain(|other| *other != face);
+        }
+    }
 }
 
 /// The corners on a spline edge: the only ones a fit can have put off.
@@ -411,13 +632,19 @@ fn fuse_cut_vertices(body: &mut Body, tolerance: f64, reach: f64) {
 }
 
 pub(super) fn align_edge_vertices(source: &Body, target: &mut Body, tolerance: f64) {
+    align_corners(source, target, tolerance, true);
+}
+
+/// [`align_edge_vertices`]; a corner ending a spline moves onto a point only
+/// once `settled`, with no cut left to land on where the spline ends.
+fn align_corners(source: &Body, target: &mut Body, tolerance: f64, settled: bool) {
     let points: Vec<[f64; 3]> = source.vertices.iter().map(|(_, vertex)| vertex.point).collect();
     // Each point is offered only to the edges whose box holds it: the
     // nearest-point search on a spline is the costly part, and every vertex
     // against every edge made it most of a boolean between filleted parts.
     let mut boxes: Vec<(super::topology::EdgeKey, Option<Aabb>)> =
         target.edge_keys().map(|key| (key, edge_box(target, key, tolerance))).collect();
-    for point in points {
+    for &point in &points {
         let edges: Vec<super::topology::EdgeKey> = boxes
             .iter()
             .filter(|(_, bounds)| bounds.is_none_or(|bounds| bounds.holds(point)))
@@ -467,6 +694,35 @@ pub(super) fn align_edge_vertices(source: &Body, target: &mut Body, tolerance: f
                 continue;
             }
             let across = (parameter - edge.start_parameter) / span;
+            // A point at one of the edge's corners is that corner already: it
+            // moves onto the point, where a split would leave a hairline edge
+            // and a second corner beside it. Unless the other body has a
+            // corner of its own there as well, and that hairline edge too;
+            // or the corner ends a spline while cuts are still to come, which
+            // must land where that fit ends.
+            let corner = [edge.start, edge.end].into_iter().find(|corner| {
+                let near = |other: &[f64; 3]| {
+                    target.vertices.get(*corner).is_some_and(|corner| {
+                        Vec3::from(corner.point).distance(Vec3::from(*other)) <= tolerance
+                    })
+                };
+                near(&point)
+                    && !points.iter().any(|other| *other != point && near(other))
+                    && (settled
+                        || !target.edges.iter().any(|(_, other)| {
+                            (other.start == *corner || other.end == *corner)
+                                && matches!(
+                                    target.curves.get(other.curve),
+                                    Some(Curve3::Nurbs(_))
+                                )
+                        }))
+            });
+            if let Some(corner) = corner {
+                if let Some(corner) = target.vertices.get_mut(corner) {
+                    corner.point = point;
+                }
+                continue;
+            }
             if !(1e-9..=1.0 - 1e-9).contains(&across)
                 || Vec3::from(curve.point_at(parameter)).distance(Vec3::from(point)) > tolerance
             {
@@ -1586,10 +1842,13 @@ mod tests {
     }
 
     #[test]
-    fn a_pair_with_no_closed_form_is_refused() {
+    fn a_pair_whose_meshes_never_cross_is_left_uncut() {
         let mut a = cuboid([0.0; 3], [10.0, 10.0, 10.0]).unwrap();
         let mut b = cuboid([5.0; 3], [10.0, 10.0, 10.0]).unwrap();
-        // Turn one of B's faces into a torus, which no pair here can meet.
+        // Turn one of B's faces into a torus, which no pair here has a closed
+        // form for and whose face, still bounded by the box's edges, meets
+        // nothing of A's: it only comes near, so it is left as it is while
+        // the planes either side still cut.
         let face = b.face_keys().next().unwrap();
         let surface = b.faces.get(face).unwrap().surface;
         *b.surfaces.get_mut(surface).unwrap() =
@@ -1598,7 +1857,7 @@ mod tests {
                 major_radius: 4.0,
                 minor_radius: 1.0,
             });
-        assert_eq!(imprint(&mut a, &mut b, TOL), Err(Snag::NoClosedForm));
+        assert!(imprint(&mut a, &mut b, TOL).is_ok_and(|report| report.cuts > 0));
     }
 
     #[test]
