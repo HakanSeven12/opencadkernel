@@ -2521,6 +2521,10 @@ pub fn revolve(
         return None;
     }
 
+    // An axis outside the profile's plane turns it into rotational spline surfaces.
+    if super::sweep_path::axis_off_plane(&plane, pivot, axis) {
+        return super::sweep_path::revolve_off_plane(plane, profile, pivot, axis, angle, false);
+    }
     let turn = Turn::new(&plane, profile, pivot, axis, angle)?;
     let stations: Vec<Station> = corners.iter().map(|uv| turn.station(&plane, *uv)).collect();
 
@@ -2597,6 +2601,10 @@ pub fn revolve_surface(
         return None;
     }
     let is_closed = corners.len() == profile.len();
+    // An axis outside the profile's plane turns it into rotational spline surfaces.
+    if super::sweep_path::axis_off_plane(&plane, pivot, axis) {
+        return super::sweep_path::revolve_off_plane(plane, profile, pivot, axis, angle, true);
+    }
     let turn = Turn::new(&plane, profile, pivot, axis, angle)?;
     let stations = corners
         .iter()

@@ -3106,3 +3106,41 @@ mod tests {
         assert_eq!(sweep_corner_refusal(path(), options), Some(SweepRefusal::Twist));
     }
 }
+
+/// Whether an axis through `pivot` leaves the profile's plane: such a turn
+/// sweeps surfaces no analytic kind describes.
+pub(crate) fn axis_off_plane(plane: &Plane, pivot: [f64; 3], axis: [f64; 3]) -> bool {
+    let (Some(normal), Some(direction)) = (plane.normal(), Vec3::from(axis).normalize()) else { return false };
+    direction.dot(Vec3::from(normal)).abs() > 1e-9 || plane.distance_to(pivot).is_some_and(|d| d.abs() > 1e-9)
+}
+
+/// A planar profile turned about an axis outside its plane. Each profile
+/// curve sweeps one exact rational surface of revolution (the profile
+/// curve across, quarter-turn rational arcs round), as the reference
+/// builds its rotational spline surfaces; a whole turn closes on itself and
+/// a solid's partial turn is capped by the profile at both ends.
+pub fn revolve_off_plane(plane: Plane, profile: &[Curve], pivot: [f64; 3], axis: [f64; 3], angle: f64, sheet: bool) -> Option<Body> {
+    let mut direction = Vec3::from(axis).normalize()?;
+    let mut angle = angle;
+    if angle < 0.0 {
+        direction = -direction;
+        angle = -angle;
+    }
+    if !angle.is_finite() || angle <= 1e-12 || angle > TAU + 1e-9 {
+        return None;
+    }
+    let closed = (TAU - angle).abs() <= 1e-9;
+    let wires = prepare_wires(&[profile.to_vec()])?;
+    if !sheet && !wires[0].closed {
+        return None;
+    }
+    let first = Frame { origin: Vec3::from(plane.origin), x: Vec3::from(plane.x_axis), y: Vec3::from(plane.y_axis) };
+    let mut patches = Vec::new();
+    turning_patches(first, Vec3::from(pivot), direction, angle.min(TAU), &mut patches);
+    if closed {
+        let start = patches.first()?[0];
+        patches.last_mut()?[3] = start;
+    }
+    let outward = if sheet { true } else { regular_transport(&wires, &patches)? };
+    build_body_in_runs(&wires, &patches, &[patches.len()], sheet, closed, outward, false, None)
+}
