@@ -59,14 +59,15 @@ pub fn mass_properties(body: &Body) -> Option<MassProperties> {
         .map(|bounds| Vec3::from(bounds.min).distance(Vec3::from(bounds.max)))
         .filter(|size| *size > 0.0)
         .unwrap_or(1.0);
-    let mesh = super::mesh::tessellate(
-        body,
-        super::mesh::TessellationTolerance::new(0.02, size * 1e-6),
-    );
-    if !mesh.missing_faces.is_empty() {
-        return None;
-    }
-    mesh.mesh.inertial_properties()
+    // Finest first; a face too fine to triangulate whole at one setting
+    // still has its properties at a coarser one.
+    [(0.02, 1e-6), (0.05, 1e-5), (0.2, 1e-4)].into_iter().find_map(|(angle, chord)| {
+        let mesh = super::mesh::tessellate(
+            body,
+            super::mesh::TessellationTolerance::new(angle, size * chord),
+        );
+        mesh.missing_faces.is_empty().then(|| mesh.mesh.inertial_properties()).flatten()
+    })
 }
 
 fn cylindrical_sector_properties(body: &Body) -> Option<MassProperties> {
