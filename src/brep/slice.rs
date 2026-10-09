@@ -4,7 +4,7 @@
 //! they can prepare every requested split before replacing any document
 //! entity, so a failed cut never makes the source disappear.
 
-use super::topology::{Body, FaceKey, Lump, Shell};
+use super::topology::{Body, EdgeKey, FaceKey, Lump, Shell};
 use super::{body_bounds, combine, imprint, operation_tolerance, Containment, Operation, Placement, Provenance, Snag};
 use crate::space::{Plane, Vec3};
 
@@ -45,7 +45,10 @@ pub fn slice_by_plane(body: &Body, plane: Plane) -> Result<Option<PlaneSlice>, S
         .filter(|(_, edge)| !edge.coedges.is_empty())
         .all(|(_, edge)| edge.coedges.len() % 2 == 0);
     if closed {
+        // The two half-space booleans first; where they refuse, the body's
+        // own cut faces sorted by side and capped by its section.
         split_solid(body, plane, frame, tolerance)
+            .or_else(|snag| split_capped(body, plane, frame, tolerance).map_err(|_| snag))
     } else {
         split_sheet(body, plane, frame, tolerance)
     }
@@ -233,6 +236,222 @@ fn split_solid(
         return Ok(None);
     }
     Ok(Some(PlaneSlice { negative, positive }))
+}
+
+/// Splits a solid by cutting its faces with the plane, sorting them by side
+/// and closing each side with caps along the section the cut left: the
+/// edges between a face on one side and a face on the other.
+fn split_capped(
+    body: &Body,
+    plane: Plane,
+    frame: FrameBounds,
+    tolerance: f64,
+) -> Result<Option<PlaneSlice>, Snag> {
+    let (_, mut cutter) = half_boxes(plane, frame, tolerance)?;
+    let mut divided = body.clone();
+    let report = imprint(&mut divided, &mut cutter, tolerance)?;
+    if report.cuts == 0 {
+        return Ok(None);
+    }
+    let mut sides = std::collections::HashMap::new();
+    for face in divided.face_keys() {
+        sides.insert(face, face_side(&divided, face, plane, tolerance)?);
+    }
+    let side_of = |coedge| -> Option<i8> {
+        let owner = divided.loops.get(divided.coedges.get(coedge)?.owner)?.owner;
+        sides.get(&owner).copied()
+    };
+    // Each section edge, with the way each side's face runs along it.
+    let mut section = Vec::new();
+    for (key, edge) in divided.edges.iter() {
+        let [one, other] = edge.coedges[..] else {
+            continue;
+        };
+        let (first, second) = (side_of(one), side_of(other));
+        let (negative, positive) = match (first, second) {
+            (Some(-1), Some(1)) => (one, other),
+            (Some(1), Some(-1)) => (other, one),
+            _ => continue,
+        };
+        let sense = |coedge| divided.coedges.get(coedge).map(|coedge| coedge.forward);
+        let (negative, positive) = (sense(negative), sense(positive));
+        section.push((
+            key,
+            negative.ok_or(Snag::CutRefused)?,
+            positive.ok_or(Snag::CutRefused)?,
+        ));
+    }
+    if section.is_empty() {
+        return Ok(None);
+    }
+    let normal = Vec3::from(plane.normal().ok_or(Snag::CutRefused)?);
+    let surface = divided.surfaces.insert(super::Surface::Plane(plane));
+    let shell = divided.faces.iter().next().ok_or(Snag::CutRefused)?.1.owner;
+    let mut caps = [Vec::new(), Vec::new()];
+    for (index, outward) in [normal, -normal].into_iter().enumerate() {
+        // Each cap runs its edges against the face on its side.
+        let uses: Vec<(EdgeKey, bool)> = section
+            .iter()
+            .map(|(key, negative, positive)| {
+                (*key, !if index == 0 { *negative } else { *positive })
+            })
+            .collect();
+        for rings in cap_regions(&divided, &uses, plane, outward)? {
+            let face = divided.faces.insert(super::topology::Face {
+                surface,
+                forward: index == 0,
+                loops: Vec::new(),
+                owner: shell,
+                provenance: Provenance::Synthesized,
+            });
+            let mut loops = Vec::new();
+            for ring in rings {
+                let loop_key = divided.loops.insert(super::topology::Loop {
+                    coedges: Vec::new(),
+                    owner: face,
+                    provenance: Provenance::Synthesized,
+                });
+                let mut coedges = Vec::new();
+                for (edge, forward) in ring {
+                    let coedge = divided.coedges.insert(super::topology::Coedge {
+                        edge,
+                        forward,
+                        pcurve: None,
+                        owner: loop_key,
+                        provenance: Provenance::Synthesized,
+                    });
+                    divided.edges.get_mut(edge).ok_or(Snag::CutRefused)?.coedges.push(coedge);
+                    coedges.push(coedge);
+                }
+                divided.loops.get_mut(loop_key).ok_or(Snag::CutRefused)?.coedges = coedges;
+                loops.push(loop_key);
+            }
+            divided.faces.get_mut(face).ok_or(Snag::CutRefused)?.loops = loops;
+            caps[index].push(face);
+        }
+    }
+    let mut negative: Vec<FaceKey> =
+        sides.iter().filter(|(_, side)| **side == -1).map(|(face, _)| *face).collect();
+    let mut positive: Vec<FaceKey> =
+        sides.iter().filter(|(_, side)| **side == 1).map(|(face, _)| *face).collect();
+    negative.extend(&caps[0]);
+    positive.extend(&caps[1]);
+    let [negative, positive] = [negative, positive].map(|faces| copy_faces(&divided, &faces));
+    let (negative, positive) = (negative?, positive?);
+    // Each side closed on its own, edge by edge.
+    if [&negative, &positive]
+        .iter()
+        .any(|half| half.edges.iter().any(|(_, edge)| edge.coedges.len() != 2))
+    {
+        return Err(Snag::CutRefused);
+    }
+    Ok(Some(PlaneSlice { negative, positive }))
+}
+
+/// The regions a cap covers: section edges, each with the sense the cap runs
+/// it, chained into rings and sorted into outer rings — turning round
+/// `outward` — each with the hole rings inside it.
+fn cap_regions(
+    body: &Body,
+    uses: &[(EdgeKey, bool)],
+    plane: Plane,
+    outward: Vec3,
+) -> Result<Vec<Vec<Vec<(EdgeKey, bool)>>>, Snag> {
+    let ends = |(edge, forward): (EdgeKey, bool)| {
+        let node = body.edges.get(edge)?;
+        Some(if forward { (node.start, node.end) } else { (node.end, node.start) })
+    };
+    let mut left: Vec<(EdgeKey, bool)> = uses.to_vec();
+    let mut rings = Vec::new();
+    while let Some(first) = left.pop() {
+        let (begin, mut at) = ends(first).ok_or(Snag::CutRefused)?;
+        let mut ring = vec![first];
+        while at != begin {
+            let next = left
+                .iter()
+                .position(|candidate| ends(*candidate).is_some_and(|(from, _)| from == at))
+                .ok_or(Snag::CutRefused)?;
+            let next = left.swap_remove(next);
+            at = ends(next).ok_or(Snag::CutRefused)?.1;
+            ring.push(next);
+        }
+        rings.push(ring);
+    }
+    // Each ring as a polygon in the plane, turning round `outward`.
+    let axes = (Vec3::from(plane.x_axis), Vec3::from(plane.y_axis));
+    let facing = Vec3::from(plane.normal().ok_or(Snag::CutRefused)?).dot(outward).signum();
+    let polygon = |ring: &[(EdgeKey, bool)]| -> Option<Vec<[f64; 2]>> {
+        let mut points = Vec::new();
+        for (edge, forward) in ring {
+            let node = body.edges.get(*edge)?;
+            let curve = body.curves.get(node.curve)?;
+            for step in 0..16 {
+                let t = step as f64 / 16.0;
+                let t = if *forward { t } else { 1.0 - t };
+                let point = Vec3::from(curve.point_at(
+                    node.start_parameter + (node.end_parameter - node.start_parameter) * t,
+                ));
+                points.push([point.dot(axes.0), point.dot(axes.1) * facing]);
+            }
+        }
+        Some(points)
+    };
+    let area = |points: &[[f64; 2]]| {
+        (0..points.len())
+            .map(|index| {
+                let (a, b) = (points[index], points[(index + 1) % points.len()]);
+                a[0] * b[1] - b[0] * a[1]
+            })
+            .sum::<f64>()
+            * 0.5
+    };
+    let inside = |point: [f64; 2], polygon: &[[f64; 2]]| {
+        let mut inside = false;
+        for index in 0..polygon.len() {
+            let (a, b) = (polygon[index], polygon[(index + 1) % polygon.len()]);
+            if (a[1] > point[1]) != (b[1] > point[1])
+                && point[0] < a[0] + (point[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0])
+            {
+                inside = !inside;
+            }
+        }
+        inside
+    };
+    let shapes: Vec<(Vec<[f64; 2]>, f64)> = rings
+        .iter()
+        .map(|ring| {
+            let points = polygon(ring).ok_or(Snag::CutRefused)?;
+            let signed = area(&points);
+            Ok((points, signed))
+        })
+        .collect::<Result<_, Snag>>()?;
+    let mut regions: Vec<Vec<Vec<(EdgeKey, bool)>>> = Vec::new();
+    let mut outer_of = Vec::new();
+    for (index, (_, signed)) in shapes.iter().enumerate() {
+        if *signed > 0.0 {
+            outer_of.push(Some(regions.len()));
+            regions.push(vec![rings[index].clone()]);
+        } else {
+            outer_of.push(None);
+        }
+    }
+    for (index, (points, signed)) in shapes.iter().enumerate() {
+        if *signed > 0.0 {
+            continue;
+        }
+        // A hole goes with the smallest outer ring round it.
+        let owner = shapes
+            .iter()
+            .enumerate()
+            .filter(|(other, (outline, area))| {
+                *area > 0.0 && *other != index && inside(points[0], outline)
+            })
+            .min_by(|x, y| x.1 .1.total_cmp(&y.1 .1))
+            .and_then(|(other, _)| outer_of[other])
+            .ok_or(Snag::CutRefused)?;
+        regions[owner].push(rings[index].clone());
+    }
+    Ok(regions)
 }
 
 fn split_sheet(
