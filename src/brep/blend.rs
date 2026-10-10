@@ -672,7 +672,11 @@ fn blend_by_cut(body: &Body, selected: &[EdgeKey], section: Section) -> Option<B
         .collect::<Option<_>>()?;
     let mut result = body.clone();
     for (start, end) in ends {
+        // A straight one: an arc may join the same two corners.
         let edge = result.edges.iter().find_map(|(key, edge)| {
+            if !matches!(result.curves.get(edge.curve)?, Curve3::Line(_)) {
+                return None;
+            }
             let a = Vec3::from(result.vertices.get(edge.start)?.point);
             let b = Vec3::from(result.vertices.get(edge.end)?.point);
             let near = |p: Vec3, q: Vec3| p.distance(q) <= tolerance * 10.0;
