@@ -769,12 +769,12 @@ fn align_corners(source: &Body, target: &mut Body, tolerance: f64, settled: bool
     // Each point is offered only to the edges whose box holds it: the
     // nearest-point search on a spline is the costly part, and every vertex
     // against every edge made it most of a boolean between filleted parts.
-    let mut boxes: Vec<(super::topology::EdgeKey, Option<Aabb>)> =
-        target.edge_keys().map(|key| (key, edge_box(target, key, tolerance))).collect();
+    let mut boxes: Vec<(super::topology::EdgeKey, Option<EdgeReach>)> =
+        target.edge_keys().map(|key| (key, edge_reach(target, key, tolerance))).collect();
     for &point in &points {
         let edges: Vec<super::topology::EdgeKey> = boxes
             .iter()
-            .filter(|(_, bounds)| bounds.is_none_or(|bounds| bounds.holds(point)))
+            .filter(|(_, reach)| reach.as_ref().is_none_or(|reach| reach.holds(point)))
             .map(|(key, _)| *key)
             .collect();
         for key in edges {
@@ -827,27 +827,44 @@ fn align_corners(source: &Body, target: &mut Body, tolerance: f64, settled: bool
             // corner of its own there as well, and that hairline edge too;
             // or the corner ends a spline while cuts are still to come, which
             // must land where that fit ends.
+            let near = |corner: super::topology::VertexKey, other: &[f64; 3]| {
+                target.vertices.get(corner).is_some_and(|corner| {
+                    Vec3::from(corner.point).distance(Vec3::from(*other)) <= tolerance
+                })
+            };
             let corner = [edge.start, edge.end].into_iter().find(|corner| {
-                let near = |other: &[f64; 3]| {
-                    target.vertices.get(*corner).is_some_and(|corner| {
-                        Vec3::from(corner.point).distance(Vec3::from(*other)) <= tolerance
-                    })
-                };
-                near(&point)
-                    && !points.iter().any(|other| *other != point && near(other))
-                    && (settled
-                        || !target.edges.iter().any(|(_, other)| {
-                            (other.start == *corner || other.end == *corner)
-                                && matches!(
-                                    target.curves.get(other.curve),
-                                    Some(Curve3::Nurbs(_))
-                                )
-                        }))
+                near(*corner, &point)
+                    && !points.iter().any(|other| *other != point && near(*corner, other))
             });
             if let Some(corner) = corner {
-                if let Some(corner) = target.vertices.get_mut(corner) {
-                    corner.point = point;
+                let spline_end = !settled
+                    && target.edges.iter().any(|(_, other)| {
+                        (other.start == corner || other.end == corner)
+                            && matches!(target.curves.get(other.curve), Some(Curve3::Nurbs(_)))
+                    });
+                if !spline_end {
+                    if let Some(corner) = target.vertices.get_mut(corner) {
+                        corner.point = point;
+                    }
+                    continue;
                 }
+            }
+            // A point a corner of this edge already answers — the point
+            // that corner is nearest — needs no other, a spline's end apart.
+            // Splitting beside it anyway gave the other body a corner to
+            // split beside in turn: the two traded hairline edges round
+            // after round, doubling their corners each time.
+            let answered = corner.is_none()
+                && [edge.start, edge.end].into_iter().any(|end| {
+                    target.vertices.get(end).is_some_and(|vertex| {
+                        let gap = Vec3::from(vertex.point).distance(Vec3::from(point));
+                        gap <= tolerance
+                            && points.iter().all(|other| {
+                                Vec3::from(vertex.point).distance(Vec3::from(*other)) >= gap
+                            })
+                    })
+                });
+            if answered {
                 continue;
             }
             if !(1e-9..=1.0 - 1e-9).contains(&across)
@@ -856,23 +873,52 @@ fn align_corners(source: &Body, target: &mut Body, tolerance: f64, settled: bool
                 continue;
             }
             if let Some((_, far)) = split_edge(target, key, parameter) {
-                boxes.push((far, edge_box(target, far, tolerance)));
+                boxes.push((far, edge_reach(target, far, tolerance)));
             }
         }
     }
 }
 
-/// A box round an edge from samples along it, grown by a tenth of its size
-/// for what bulges between them, and by the tolerance.
-fn edge_box(body: &Body, key: super::topology::EdgeKey, tolerance: f64) -> Option<Aabb> {
+/// Where an edge runs, to pass over points nowhere near it before the
+/// nearest-point search: a box from samples along it, grown by a tenth of
+/// its size for what bulges between them, and the chain of those samples
+/// with how far the edge strays from it.
+struct EdgeReach {
+    bounds: Aabb,
+    chain: Vec<Vec3>,
+    slack: f64,
+}
+
+impl EdgeReach {
+    fn holds(&self, point: [f64; 3]) -> bool {
+        let point = Vec3::from(point);
+        self.bounds.holds(point.to_array())
+            && self
+                .chain
+                .windows(2)
+                .any(|pair| point.distance_to_segment(pair[0], pair[1]) <= self.slack)
+    }
+}
+
+/// The [`EdgeReach`] of an edge. Its straying is read off halfway between
+/// samples and taken four times over, with a thousandth of its size, so a
+/// point a tolerance from the edge is never passed over.
+fn edge_reach(body: &Body, key: super::topology::EdgeKey, tolerance: f64) -> Option<EdgeReach> {
     let edge = body.edges.get(key)?;
     let curve = body.curves.get(edge.curve)?;
     let span = edge.end_parameter - edge.start_parameter;
-    let bounds = Aabb::around(
-        (0..=16).map(|step| curve.point_at(edge.start_parameter + span * step as f64 / 16.0)),
-    )?;
+    let at = |step: f64| Vec3::from(curve.point_at(edge.start_parameter + span * step / 16.0));
+    let chain: Vec<Vec3> = (0..=16).map(|step| at(f64::from(step))).collect();
+    let bounds = Aabb::around(chain.iter().map(|point| point.to_array()))?;
     let size = Vec3::from(bounds.min).distance(Vec3::from(bounds.max));
-    Some(bounds.grown(size * 0.1 + tolerance))
+    let bow = (0..16)
+        .map(|step: usize| at(step as f64 + 0.5).distance_to_segment(chain[step], chain[step + 1]))
+        .fold(0.0, f64::max);
+    Some(EdgeReach {
+        bounds: bounds.grown(size * 0.1 + tolerance),
+        chain,
+        slack: bow * 4.0 + size * 1e-3 + tolerance,
+    })
 }
 
 /// Whether two curves trace the same points: one circle, or one line.
