@@ -194,15 +194,26 @@ fn combine_here(
 /// top, become one face, and straight edges left in line become one edge.
 /// A body that would not validate afterwards is left as it was.
 pub(super) fn merge_coplanar_faces(body: &mut Body, tolerance: f64) {
+    merge_coplanar(body, tolerance, false);
+}
+
+/// [`merge_coplanar_faces`] along curved edges too: a fill put back into a
+/// rounded corner leaves its end in a piece of the end wall, cut off along
+/// the round's arc.
+pub(super) fn merge_coplanar_pieces(body: &mut Body, tolerance: f64) {
+    merge_coplanar(body, tolerance, true);
+}
+
+fn merge_coplanar(body: &mut Body, tolerance: f64, curved: bool) {
     let mut merged = body.clone();
     let mut changed = false;
     loop {
         let next = merged
             .edges
             .keys()
-            .find(|edge| coplanar_split(&merged, *edge, tolerance).is_some());
+            .find(|edge| coplanar_split(&merged, *edge, tolerance, curved).is_some());
         let Some(edge) = next else { break };
-        if join_faces(&mut merged, edge, tolerance).is_none() {
+        if join_faces(&mut merged, edge, tolerance, curved).is_none() {
             return;
         }
         changed = true;
@@ -228,9 +239,15 @@ fn owner_face(body: &Body, coedge: CoedgeKey) -> Option<FaceKey> {
 
 /// The two faces a straight edge splits one plane into, when it is the only
 /// edge they share and neither carries parameter-space curves.
-fn coplanar_split(body: &Body, key: EdgeKey, tolerance: f64) -> Option<[FaceKey; 2]> {
+fn coplanar_split(
+    body: &Body,
+    key: EdgeKey,
+    tolerance: f64,
+    curved: bool,
+) -> Option<[FaceKey; 2]> {
     let edge = body.edges.get(key)?;
-    if edge.coedges.len() != 2 || !matches!(body.curves.get(edge.curve)?, Curve3::Line(_)) {
+    let straight = matches!(body.curves.get(edge.curve)?, Curve3::Line(_));
+    if edge.coedges.len() != 2 || !(straight || curved) {
         return None;
     }
     let faces = [owner_face(body, edge.coedges[0])?, owner_face(body, edge.coedges[1])?];
@@ -268,8 +285,8 @@ fn coplanar_split(body: &Body, key: EdgeKey, tolerance: f64) -> Option<[FaceKey;
 }
 
 /// Splices the second face's loop into the first's across their edge.
-fn join_faces(body: &mut Body, key: EdgeKey, tolerance: f64) -> Option<()> {
-    let [keep, gone] = coplanar_split(body, key, tolerance)?;
+fn join_faces(body: &mut Body, key: EdgeKey, tolerance: f64, curved: bool) -> Option<()> {
+    let [keep, gone] = coplanar_split(body, key, tolerance, curved)?;
     let edge = body.edges.remove(key)?;
     let (kept_use, gone_use) = if owner_face(body, edge.coedges[0])? == keep {
         (edge.coedges[0], edge.coedges[1])
