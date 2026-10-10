@@ -147,6 +147,7 @@ fn offset_face(
     edited
         .or_else(|| upright_offset(body, key, profile, distance))
         .or_else(|| convex_offset(body, key, profile, distance))
+        .or_else(|| region_offset(body, key, profile, distance))
         .or_else(|| fillets.then(|| filleted_offset(body, key, profile, distance)).flatten())
 }
 
@@ -448,6 +449,334 @@ fn convex_offset(
     let how = if distance < 0.0 { Operation::Difference } else { Operation::Union };
     let edited = super::combine(body.clone(), slab, how, tolerance).ok()?;
     (!edited.roots.is_empty() && edited.validate().is_empty()).then_some(edited)
+}
+
+/// A face moved along its normal by the region between where it was and
+/// where it goes, added to the body or cut from it: the old face, the face
+/// at its new height, and each neighbour's surface carried on between them,
+/// its sides running along where it meets the next neighbour. Unlike moving
+/// the face's corners along the body's own edges, a corner four or more
+/// faces share is left to the boolean, which trims whatever else meets it.
+fn region_offset(
+    body: &Body,
+    key: FaceKey,
+    profile: &PlanarFaceProfile,
+    distance: f64,
+) -> Option<Body> {
+    let tolerance = super::operation_tolerance(&[body]);
+    let normal = Vec3::from(profile.outward).normalize()?;
+    let node = body.faces.get(key)?;
+    let Surface::Plane(base) = body.surfaces.get(node.surface)? else {
+        return None;
+    };
+    let mut moved = *base;
+    moved.origin = (Vec3::from(base.origin) + normal * distance).to_array();
+    let pull = distance > 0.0;
+    let mut region = Body::new();
+    let lump = region.lumps.insert(super::Lump {
+        shells: Vec::new(),
+        provenance: super::Provenance::Synthesized,
+    });
+    let shell = region.shells.insert(super::Shell {
+        faces: Vec::new(),
+        owner: lump,
+        provenance: super::Provenance::Synthesized,
+    });
+    region.lumps.get_mut(lump)?.shells = vec![shell];
+    region.roots = vec![lump];
+    let mut corners: HashMap<super::VertexKey, super::VertexKey> = HashMap::new();
+    let mut old_rings = Vec::new();
+    let mut new_rings = Vec::new();
+    for ring in &node.loops {
+        // Each use in the loop's direction: the edge, which way, its first
+        // corner and the neighbour across it.
+        let mut pieces = Vec::new();
+        for coedge in &body.loops.get(*ring)?.coedges {
+            let use_ = body.coedges.get(*coedge)?;
+            let edge = body.edges.get(use_.edge)?;
+            let from = if use_.forward { edge.start } else { edge.end };
+            let across = edge.coedges.iter().find_map(|other| {
+                let face = body.loops.get(body.coedges.get(*other)?.owner)?.owner;
+                (face != key).then_some(face)
+            })?;
+            let neighbour = body.faces.get(across)?;
+            pieces.push((use_.edge, use_.forward, from, neighbour.surface, neighbour.forward));
+        }
+        let count = pieces.len();
+        // Neighbours on one surface run on into each other: one side between
+        // them, no corner.
+        let same = |a: usize, b: usize| -> Option<bool> {
+            let (one, other) = (pieces[a].3, pieces[b].3);
+            Some(
+                one == other
+                    || matches!(
+                        super::intersect_surfaces(
+                            body.surfaces.get(one)?,
+                            body.surfaces.get(other)?,
+                            tolerance,
+                        ),
+                        Meeting::Coincident
+                    ),
+            )
+        };
+        let mut starts = Vec::new();
+        for k in 0..count {
+            if !same((k + count - 1) % count, k)? {
+                starts.push(k);
+            }
+        }
+        let mut old_uses = Vec::with_capacity(count);
+        for (edge_key, forward, ..) in &pieces {
+            let edge = body.edges.get(*edge_key)?;
+            let curve = region.curves.insert(body.curves.get(edge.curve)?.clone());
+            let mut corner = |vertex: super::VertexKey| -> Option<super::VertexKey> {
+                if let Some(known) = corners.get(&vertex) {
+                    return Some(*known);
+                }
+                let point = body.vertices.get(vertex)?.point;
+                let made = region.vertices.insert(super::Vertex {
+                    point,
+                    provenance: super::Provenance::Synthesized,
+                });
+                corners.insert(vertex, made);
+                Some(made)
+            };
+            let (start, end) = (corner(edge.start)?, corner(edge.end)?);
+            let copy = region.edges.insert(super::Edge {
+                curve,
+                start_parameter: edge.start_parameter,
+                end_parameter: edge.end_parameter,
+                start,
+                end,
+                coedges: Vec::new(),
+                provenance: super::Provenance::Synthesized,
+            });
+            old_uses.push((copy, *forward));
+        }
+        // Where each corner goes: along the curve its two neighbours meet
+        // in, to the moved plane.
+        let mut rails = Vec::with_capacity(starts.len());
+        for &k in &starts {
+            let before = body.surfaces.get(pieces[(k + count - 1) % count].3)?;
+            let after = body.surfaces.get(pieces[k].3)?;
+            let point = body.vertices.get(pieces[k].2)?.point;
+            let Meeting::Curves(curves) = super::intersect_surfaces(before, after, tolerance)
+            else {
+                return None;
+            };
+            let gap = |curve: &Curve3| {
+                let on = curve.point_at(curve.parameter_at(point));
+                Vec3::from(on).distance(Vec3::from(point))
+            };
+            let rail = curves
+                .into_iter()
+                .filter(|curve| gap(curve) <= tolerance * 10.0)
+                .min_by(|a, b| gap(a).total_cmp(&gap(b)))?;
+            let from = rail.parameter_at(point);
+            let to = plane_curve_parameters(&moved, &rail)?
+                .into_iter()
+                .filter(|t| t.is_finite())
+                .min_by(|a, b| (a - from).abs().total_cmp(&(b - from).abs()))?;
+            let reached = rail.point_at(to);
+            let towards = Vec3::from(reached) - Vec3::from(point);
+            if towards.dot(normal) * distance <= 0.0 {
+                return None;
+            }
+            let start = *corners.get(&pieces[k].2)?;
+            let end = region.vertices.insert(super::Vertex {
+                point: reached,
+                provenance: super::Provenance::Synthesized,
+            });
+            let (edge, forward) = span_edge(&mut region, rail, start, end, towards)?;
+            rails.push((edge, forward, end));
+        }
+        // Each run of neighbours on one surface carried on to where it meets
+        // the moved plane, beside its old edges.
+        let runs: Vec<(usize, usize)> = if starts.is_empty() {
+            vec![(0, count)]
+        } else {
+            (0..starts.len())
+                .map(|index| {
+                    let first = starts[index];
+                    let next = starts[(index + 1) % starts.len()];
+                    (first, (next + count - first - 1) % count + 1)
+                })
+                .collect()
+        };
+        let mut new_uses = Vec::with_capacity(runs.len());
+        for (index, &(first, length)) in runs.iter().enumerate() {
+            let (edge_key, forward, from, surface_key, sense) = pieces[first];
+            let edge = body.edges.get(edge_key)?;
+            let old = body.curves.get(edge.curve)?;
+            let surface = body.surfaces.get(surface_key)?;
+            let Meeting::Curves(curves) =
+                super::intersect_surfaces(&Surface::Plane(moved), surface, tolerance)
+            else {
+                return None;
+            };
+            let at = if forward { edge.start_parameter } else { edge.end_parameter };
+            let corner = Vec3::from(body.vertices.get(from)?.point);
+            let middle = Vec3::from(old.point_at(0.5 * (edge.start_parameter + edge.end_parameter)))
+                + normal * distance;
+            let away = |curve: &Curve3| {
+                let on = curve.point_at(curve.parameter_at(middle.to_array()));
+                Vec3::from(on).distance(middle)
+            };
+            let section = curves.into_iter().min_by(|a, b| away(a).total_cmp(&away(b)))?;
+            let heading = Vec3::from(old.tangent_at(at)) * if forward { 1.0 } else { -1.0 };
+            let (start, end) = if starts.is_empty() {
+                let point = section.point_at(
+                    section.parameter_at((corner + normal * distance).to_array()),
+                );
+                let only = region.vertices.insert(super::Vertex {
+                    point,
+                    provenance: super::Provenance::Synthesized,
+                });
+                (only, only)
+            } else {
+                (rails[index].2, rails[(index + 1) % rails.len()].2)
+            };
+            let new = span_edge(&mut region, section, start, end, heading)?;
+            new_uses.push(new);
+            let olds: Vec<(EdgeKey, bool)> =
+                (0..length).map(|step| old_uses[(first + step) % count]).collect();
+            let backwards = |uses: &[(EdgeKey, bool)]| -> Vec<(EdgeKey, bool)> {
+                uses.iter().rev().map(|(edge, forward)| (*edge, !*forward)).collect()
+            };
+            let rings = if starts.is_empty() {
+                if pull {
+                    vec![olds, vec![(new.0, !new.1)]]
+                } else {
+                    vec![backwards(&olds), vec![new]]
+                }
+            } else {
+                let here = rails[index];
+                let next = rails[(index + 1) % rails.len()];
+                let mut ring = Vec::with_capacity(length + 3);
+                if pull {
+                    ring.extend(olds);
+                    ring.extend([(next.0, next.1), (new.0, !new.1), (here.0, !here.1)]);
+                } else {
+                    ring.extend(backwards(&olds));
+                    ring.extend([(here.0, here.1), new, (next.0, !next.1)]);
+                }
+                vec![ring]
+            };
+            let side = region.surfaces.insert(surface.clone());
+            add_face(&mut region, shell, side, sense, rings)?;
+        }
+        let backwards = |uses: &[(EdgeKey, bool)]| -> Vec<(EdgeKey, bool)> {
+            uses.iter().rev().map(|(edge, forward)| (*edge, !*forward)).collect()
+        };
+        if pull {
+            old_rings.push(backwards(&old_uses));
+            new_rings.push(new_uses);
+        } else {
+            old_rings.push(old_uses);
+            new_rings.push(backwards(&new_uses));
+        }
+    }
+    let old_surface = region.surfaces.insert(Surface::Plane(*base));
+    let new_surface = region.surfaces.insert(Surface::Plane(moved));
+    add_face(&mut region, shell, old_surface, node.forward != pull, old_rings)?;
+    let top = add_face(&mut region, shell, new_surface, node.forward == pull, new_rings)?;
+    // The moved face winds as the old one did, or the walls crossed over
+    // on the way and the region turned inside out.
+    let area = |body: &Body, face| {
+        Some(boundary_area(&super::pcurve::face_boundary(body, face, tolerance)?))
+    };
+    let (before, after) = (area(body, key)?, area(&region, top)?);
+    let turned = if pull { after } else { -after };
+    let flat = after.abs() <= tolerance * tolerance;
+    if before * turned <= 0.0 || flat || !region.validate().is_empty() {
+        return None;
+    }
+    let how = if pull { Operation::Union } else { Operation::Difference };
+    let edited = super::combine(body.clone(), region, how, tolerance).ok()?;
+    (!edited.roots.is_empty() && edited.validate().is_empty()).then_some(edited)
+}
+
+/// An edge along `curve` from `start` to `end` the way `heading` points at
+/// the start, and whether that runs with the edge.
+fn span_edge(
+    body: &mut Body,
+    curve: Curve3,
+    start: super::VertexKey,
+    end: super::VertexKey,
+    heading: Vec3,
+) -> Option<(EdgeKey, bool)> {
+    let (a, b) = (body.vertices.get(start)?.point, body.vertices.get(end)?.point);
+    let from = curve.parameter_at(a);
+    let mut to = curve.parameter_at(b);
+    let up = Vec3::from(curve.tangent_at(from)).dot(heading) >= 0.0;
+    if let Curve3::Circle(_) | Curve3::Ellipse(_) = curve {
+        // Round the closed curve the way it heads, a whole turn back to a
+        // start it ends at.
+        if up {
+            to = from + (to - from).rem_euclid(TAU);
+            if to - from <= 1e-12 {
+                to += TAU;
+            }
+        } else {
+            to = from - (from - to).rem_euclid(TAU);
+            if from - to <= 1e-12 {
+                to -= TAU;
+            }
+        }
+    } else if (to > from) != up {
+        return None;
+    }
+    let curve = body.curves.insert(curve);
+    let (low, high, first, last) =
+        if to >= from { (from, to, start, end) } else { (to, from, end, start) };
+    let edge = body.edges.insert(super::Edge {
+        curve,
+        start_parameter: low,
+        end_parameter: high,
+        start: first,
+        end: last,
+        coedges: Vec::new(),
+        provenance: super::Provenance::Synthesized,
+    });
+    Some((edge, to >= from))
+}
+
+/// A face of `surface` bounded by `rings`, each a run of edge uses.
+fn add_face(
+    body: &mut Body,
+    shell: super::ShellKey,
+    surface: super::SurfaceKey,
+    forward: bool,
+    rings: Vec<Vec<(EdgeKey, bool)>>,
+) -> Option<FaceKey> {
+    let face = body.faces.insert(super::Face {
+        surface,
+        forward,
+        loops: Vec::new(),
+        owner: shell,
+        provenance: super::Provenance::Synthesized,
+    });
+    for uses in rings {
+        let ring = body.loops.insert(super::Loop {
+            coedges: Vec::new(),
+            owner: face,
+            provenance: super::Provenance::Synthesized,
+        });
+        for (edge, forward) in uses {
+            let coedge = body.coedges.insert(super::Coedge {
+                edge,
+                forward,
+                pcurve: None,
+                owner: ring,
+                provenance: super::Provenance::Synthesized,
+            });
+            body.edges.get_mut(edge)?.coedges.push(coedge);
+            body.loops.get_mut(ring)?.coedges.push(coedge);
+        }
+        body.faces.get_mut(face)?.loops.push(ring);
+    }
+    body.shells.get_mut(shell)?.faces.push(face);
+    Some(face)
 }
 
 /// An offset among walls that all stand square to the face is the same edit
@@ -1627,5 +1956,32 @@ mod tests {
             intersect_planar_regions(&[left, separate], 1e-9).unwrap(),
             PlanarIntersection::Disjoint
         ));
+    }
+
+    #[test]
+    fn a_face_moved_by_its_region_matches_the_convex_slab() {
+        // A pyramid's side meets the other sides at the apex, six faces at
+        // one corner: moving its corners along the body's edges cannot, the
+        // region carried on between its neighbours can, and lands where the
+        // slab of the neighbours' planes does.
+        let pyramid = crate::brep::make::pyramid([0.0; 3], 3.0, 4.0, 6).unwrap();
+        let side = pyramid
+            .face_keys()
+            .find(|face| {
+                let node = pyramid.faces.get(*face).unwrap();
+                let Some(Surface::Plane(plane)) = pyramid.surfaces.get(node.surface) else {
+                    return false;
+                };
+                plane.normal().is_some_and(|normal| normal[2].abs() < 0.99)
+            })
+            .unwrap();
+        let profile = planar_face_profile(&pyramid, side).unwrap();
+        let volume = |body: &Body| crate::brep::mass_properties(body).unwrap().volume;
+        for distance in [0.3, -0.3] {
+            let region = region_offset(&pyramid, side, &profile, distance).unwrap();
+            let slab = convex_offset(&pyramid, side, &profile, distance).unwrap();
+            assert!(region.validate().is_empty());
+            assert!((volume(&region) - volume(&slab)).abs() < 1e-9 * volume(&slab));
+        }
     }
 }
