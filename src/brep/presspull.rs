@@ -121,8 +121,8 @@ pub fn presspull_face(
     let profile = planar_face_profile(body, key)?;
     match mode {
         PresspullMode::Extrude => glued_pull(body, key, &profile, distance)
-            .or_else(|| presspull_region(body, &profile, distance))
-            .or_else(|| glued_clear_pull(body, key, &profile, distance)),
+            .or_else(|| glued_clear_pull(body, key, &profile, distance))
+            .or_else(|| presspull_region(body, &profile, distance)),
         PresspullMode::Offset => {
             // Working near the edited face avoids cancellation in intersections
             // of unit-sized solids located far from the world origin.
