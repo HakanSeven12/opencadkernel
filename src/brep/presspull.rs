@@ -148,6 +148,7 @@ fn offset_face(
         .or_else(|| upright_offset(body, key, profile, distance))
         .or_else(|| convex_offset(body, key, profile, distance))
         .or_else(|| region_offset(body, key, profile, distance))
+        .or_else(|| sliced_offset(body, key, profile, distance))
         .or_else(|| fillets.then(|| filleted_offset(body, key, profile, distance)).flatten())
 }
 
@@ -853,6 +854,50 @@ fn sliced_push(
     .then_some(kept)
 }
 
+/// A face offset into the body by slicing it off at the moved plane, where
+/// all the slice takes away is the face, its plane and the neighbours
+/// running down to it: those neighbours trimmed short is the offset, however
+/// they lean. Anything else in the slab — a step, a far wall — means the
+/// slice is cutting more than the face's own neighbourhood.
+fn sliced_offset(
+    body: &Body,
+    key: FaceKey,
+    region: &PlanarFaceProfile,
+    distance: f64,
+) -> Option<Body> {
+    if distance >= 0.0 {
+        return None;
+    }
+    let normal = Vec3::from(region.outward).normalize()?;
+    let origin = Vec3::from(region.plane.origin) + normal * distance;
+    let plane = Plane::orthonormal(origin.to_array(), region.plane.x_axis, normal.to_array())?;
+    let cut = super::slice_by_plane(body, plane).ok()??;
+    let tolerance = super::operation_tolerance(&[body]);
+    let mut near = vec![key];
+    for ring in &body.faces.get(key)?.loops {
+        for coedge in &body.loops.get(*ring)?.coedges {
+            for other in &body.edges.get(body.coedges.get(*coedge)?.edge)?.coedges {
+                near.push(body.loops.get(body.coedges.get(*other)?.owner)?.owner);
+            }
+        }
+    }
+    let removed = &cut.positive;
+    let slack = tolerance * 10.0;
+    for face in removed.face_keys() {
+        let point = super::boolean::interior_point(removed, face, tolerance)?;
+        let on_plane = plane.distance_to(point)?.abs() <= slack;
+        let on_near = near.iter().any(|f| {
+            super::classify::face_distance(body, *f, point, tolerance)
+                .is_some_and(|gap| gap <= slack)
+        });
+        if !on_plane && !on_near {
+            return None;
+        }
+    }
+    let kept = cut.negative;
+    (!kept.roots.is_empty() && kept.validate().is_empty()).then_some(kept)
+}
+
 /// A whole face pulled out of a body lying wholly behind it: the face gives
 /// way to the prism's walls and top, joined along its own edges. A union
 /// reached the same through each wall meeting its own extension — tangent
@@ -925,13 +970,24 @@ fn glued(
     let fit = tolerance.max(local.worst_vertex_gap() * 2.0);
     let faces_behind = local.face_keys().all(|face| {
         match local.faces.get(face).and_then(|node| local.surfaces.get(node.surface)) {
-            Some(Surface::Plane(_)) => true,
-            // Round the face's normal, a cylinder or cone is furthest out
-            // at its rims, which are edges and already behind.
-            Some(Surface::Cylinder(super::geometry::Cylinder { base, .. }))
-            | Some(Surface::Cone(super::geometry::Cone { base, .. })) => base
-                .normal()
-                .is_some_and(|axis| Vec3::from(axis).dot(normal).abs() >= 1.0 - 1e-9),
+            // Ruled by straight lines, each running from edge to edge of
+            // the face: how far out a ruling reaches is linear along it, so
+            // the face is furthest out on its edges, already behind.
+            Some(Surface::Plane(_) | Surface::Cylinder(_)) => true,
+            // A cone's rulings may run to its apex instead, which no edge
+            // marks: behind as well, unless the axis is square to the face
+            // and the rims are furthest out whatever the apex does.
+            Some(Surface::Cone(cone)) => cone.base.normal().is_some_and(|axis| {
+                let axis = Vec3::from(axis);
+                axis.dot(normal).abs() >= 1.0 - 1e-9 || {
+                    let slope = cone.half_angle.tan();
+                    slope.abs() <= f64::EPSILON
+                        || behind(
+                            (Vec3::from(cone.base.origin) + axis * (cone.radius / slope))
+                                .to_array(),
+                        )
+                }
+            }),
             // A spline lies within its control net, which a fitted wall
             // reaches past its edges by no more than the fit.
             Some(Surface::Nurbs(spline)) => spline
@@ -1610,6 +1666,22 @@ fn split_closed_curves(ring: &[Curve]) -> Vec<Curve> {
     extrusion_profile_pieces(ring)
 }
 
+/// Whether a face's boundary runs into itself anywhere but where one piece
+/// hands over to the next: a neighbour cut short past a notch in it, its
+/// corners slid along their edges straight through the notch's sides.
+fn crosses_itself(boundary: &[Curve], tolerance: f64) -> bool {
+    let ends = |curve: &Curve| [curve.point_at(0.0), curve.point_at(1.0)];
+    let near = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= tolerance;
+    boundary.iter().enumerate().any(|(index, one)| {
+        boundary[index + 1..].iter().any(|other| {
+            crate::geom2d::intersect(one, other, Tolerance::new(tolerance)).iter().any(|hit| {
+                !(ends(one).iter().any(|end| near(*end, hit.point))
+                    && ends(other).iter().any(|end| near(*end, hit.point)))
+            })
+        })
+    })
+}
+
 fn offset_local(body: &Body, key: FaceKey, distance: f64) -> Option<Body> {
     let profile = planar_face_profile(body, key)?;
     let normal = Vec3::from(profile.outward);
@@ -1752,7 +1824,10 @@ fn offset_local(body: &Body, key: FaceKey, distance: f64) -> Option<Body> {
             let after = super::pcurve::face_boundary(&result, face, tolerance)?;
             let old_area = boundary_area(&before);
             let new_area = boundary_area(&after);
-            if old_area * new_area <= 0.0 || new_area.abs() <= tolerance * tolerance {
+            if old_area * new_area <= 0.0
+                || new_area.abs() <= tolerance * tolerance
+                || crosses_itself(&after, tolerance)
+            {
                 return None;
             }
         }
@@ -1956,6 +2031,33 @@ mod tests {
             intersect_planar_regions(&[left, separate], 1e-9).unwrap(),
             PlanarIntersection::Disjoint
         ));
+    }
+
+    #[test]
+    fn an_elbows_end_pushed_in_is_the_elbow_cut_short() {
+        // A quarter torus: its end's only neighbour is the tube, which no
+        // prism runs along; moved in, the end trims the tube where it lands.
+        let plane = Plane::orthonormal([0.0; 3], [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]).unwrap();
+        let half = |start_angle: f64| {
+            let end_angle = start_angle + std::f64::consts::PI;
+            Curve::Arc(Arc { centre: [5.0, 0.0], radius: 1.0, start_angle, end_angle })
+        };
+        let ring = [half(0.0), half(std::f64::consts::PI)];
+        let elbow = crate::brep::revolve(plane, &ring, [0.0; 3], [0.0, 0.0, 1.0], FRAC_PI_2)
+            .unwrap();
+        let end = elbow
+            .face_keys()
+            .find(|face| {
+                planar_face_profile(&elbow, *face)
+                    .is_some_and(|profile| profile.outward[1] < -0.99)
+            })
+            .unwrap();
+        let short = presspull_face(&elbow, end, -0.5, PresspullMode::Offset).unwrap();
+        assert!(short.validate().is_empty());
+        let lowest = short.vertices.iter().map(|(_, v)| v.point[1]).fold(f64::INFINITY, f64::min);
+        assert!((lowest - 0.5).abs() < 1e-6, "{lowest}");
+        let volume = |body: &Body| crate::brep::mass_properties(body).unwrap().volume;
+        assert!(volume(&short) < volume(&elbow));
     }
 
     #[test]
