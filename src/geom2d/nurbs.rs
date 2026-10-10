@@ -252,16 +252,8 @@ impl NurbsCurve {
         let point = Vec2::from(point);
         let distance_at = |t: f64| Vec2::from(self.point_at(t)).distance_squared(point);
 
-        let mut best = 0.0;
-        let mut best_distance = f64::INFINITY;
-        for i in 0..=coarse {
-            let t = i as f64 / coarse as f64;
-            let d = distance_at(t);
-            if d < best_distance {
-                best_distance = d;
-                best = t;
-            }
-        }
+        let samples: Vec<f64> =
+            (0..=coarse).map(|i| distance_at(i as f64 / coarse as f64)).collect();
 
         // Narrow within the neighbouring samples. Bisection on the bracket
         // rather than Newton: it needs no derivative and cannot diverge where
@@ -285,17 +277,41 @@ impl NurbsCurve {
             }
             best.clamp(0.0, 1.0)
         };
-        let found = narrow((best - step).max(0.0), (best + step).min(1.0));
-        // A closed curve's two ends are one sample, and the nearer one won
-        // only the tie: a point just before the end would be narrowed
-        // against the start and pinned there.
-        if (best == 0.0 || best == 1.0) && self.is_closed() {
-            let other = if best == 0.0 { narrow(1.0 - step, 1.0) } else { narrow(0.0, step) };
-            if distance_at(other) < distance_at(found) {
-                return other;
+        // Every sample nearer than both its neighbours starts a narrowing,
+        // the nearest few of them: where the curve comes back past itself,
+        // the nearest sample may lie on the other pass, and narrowing round
+        // it alone settled on that pass. A closed curve's two ends are one
+        // sample, neighbours across the seam.
+        let closed = self.is_closed();
+        let around = |i: usize, back: bool| -> f64 {
+            match (back, i) {
+                (true, 0) if closed => samples[coarse - 1],
+                (true, 0) => f64::INFINITY,
+                (true, _) => samples[i - 1],
+                (false, i) if i == coarse && closed => samples[1],
+                (false, i) if i == coarse => f64::INFINITY,
+                (false, _) => samples[i + 1],
             }
-        }
-        found
+        };
+        let mut minima: Vec<usize> = (0..=coarse)
+            .filter(|&i| samples[i] <= around(i, true) && samples[i] <= around(i, false))
+            .collect();
+        minima.sort_by(|a, b| samples[*a].total_cmp(&samples[*b]));
+        minima.truncate(4);
+        let brackets = minima.into_iter().flat_map(|i| {
+            let t = i as f64 * step;
+            let mut brackets = vec![((t - step).max(0.0), (t + step).min(1.0))];
+            if closed && i == 0 {
+                brackets.push((1.0 - step, 1.0));
+            } else if closed && i == coarse {
+                brackets.push((0.0, step));
+            }
+            brackets
+        });
+        brackets
+            .map(|(low, high)| narrow(low, high))
+            .min_by(|a, b| distance_at(*a).total_cmp(&distance_at(*b)))
+            .unwrap_or(0.0)
     }
 
     /// Samples the curve, giving every knot span at least `per_span` pieces.
@@ -971,6 +987,24 @@ mod tests {
             Some(vec![1.0, weight, 1.0]),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_hairpin_projects_each_point_onto_its_own_pass() {
+        // The two passes run a tenth apart, closer than the samples along
+        // either: the nearest sample to a point is often on the other pass.
+        let hairpin = NurbsCurve::new(
+            3,
+            vec![[0.0, 0.0], [10.0, 0.0], [10.0, 0.1], [0.0, 0.1]],
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        for step in 1..200 {
+            let point = hairpin.point_at(step as f64 / 200.0);
+            let back = hairpin.point_at(hairpin.parameter_at(point));
+            assert!(close(back, point, 1e-9), "{step}: {point:?} -> {back:?}");
+        }
     }
 
     #[test]
