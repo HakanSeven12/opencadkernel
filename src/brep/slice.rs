@@ -515,6 +515,14 @@ fn face_side(body: &Body, face: FaceKey, plane: Plane, tolerance: f64) -> Result
             high = high.max(distance);
         }
     }
+    // Edged all round by the section — a strip of a torus between the two
+    // curves a plane leaves on it — the edges say nothing; the face's own
+    // inside does. One lying in the plane itself goes with the negative side.
+    if high <= tolerance && low >= -tolerance {
+        let inside = super::boolean::interior_point(body, face, tolerance)
+            .and_then(|point| plane.distance_to(point));
+        return Ok(if inside.is_some_and(|distance| distance > tolerance) { 1 } else { -1 });
+    }
     if high <= tolerance {
         Ok(-1)
     } else if low >= -tolerance {
