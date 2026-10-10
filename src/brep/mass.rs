@@ -48,8 +48,9 @@ pub fn analytic_mass_properties(body: &Body) -> Option<MassProperties> {
 
 /// Mass properties of any closed body: exact where
 /// [`analytic_mass_properties`] knows the shape, otherwise integrated over a
-/// mesh fine enough that the answer holds to a few parts in a hundred
-/// thousand. `None` when the body cannot be meshed whole.
+/// mesh. An inscribed mesh falls short of a curved face by the square of its
+/// step, so two meshes a halving apart extrapolate to the surface itself, to
+/// a few parts in ten million. `None` when the body cannot be meshed whole.
 pub fn mass_properties(body: &Body) -> Option<MassProperties> {
     if let Some(properties) = analytic_mass_properties(body) {
         return Some(properties);
@@ -59,15 +60,67 @@ pub fn mass_properties(body: &Body) -> Option<MassProperties> {
         .map(|bounds| Vec3::from(bounds.min).distance(Vec3::from(bounds.max)))
         .filter(|size| *size > 0.0)
         .unwrap_or(1.0);
-    // Finest first; a face too fine to triangulate whole at one setting
-    // still has its properties at a coarser one.
-    [(0.02, 1e-6), (0.05, 1e-5), (0.2, 1e-4)].into_iter().find_map(|(angle, chord)| {
+    // The chord bound shrinks with the square of the angle, as the sag of a
+    // step does, so both meshes are fined down by the same rule.
+    let meshed = |angle: f64| {
+        let chord = size * 1e-5 * (angle / 0.05).powi(2);
         let mesh = super::mesh::tessellate(
             body,
-            super::mesh::TessellationTolerance::new(angle, size * chord),
+            super::mesh::TessellationTolerance::new(angle, chord),
         );
         mesh.missing_faces.is_empty().then(|| mesh.mesh.inertial_properties()).flatten()
-    })
+    };
+    let fine = meshed(0.05).or_else(|| meshed(0.2))?;
+    // A face too fine to triangulate whole at the finer step still has its
+    // properties at the coarser one.
+    Some(meshed(0.1).and_then(|coarse| extrapolated(&fine, &coarse)).unwrap_or(fine))
+}
+
+/// Properties from a mesh and one twice as coarse, each integral carried on
+/// past the finer by a third of what the halving changed.
+fn extrapolated(fine: &MassProperties, coarse: &MassProperties) -> Option<MassProperties> {
+    let mix = |fine: f64, coarse: f64| fine + (fine - coarse) / 3.0;
+    let volume = mix(fine.volume, coarse.volume);
+    if !volume.is_finite() || volume <= 0.0 {
+        return None;
+    }
+    let centroid: [f64; 3] = std::array::from_fn(|axis| {
+        mix(fine.volume * fine.centroid[axis], coarse.volume * coarse.centroid[axis]) / volume
+    });
+    // About the origin, where each entry is an integral of its own.
+    let tensor = |properties: &MassProperties| {
+        let [xx, yy, zz] = properties.moment_of_inertia;
+        let [xy, yz, zx] = properties.product_of_inertia;
+        [[xx, xy, zx], [xy, yy, yz], [zx, yz, zz]]
+    };
+    let (fine_tensor, coarse_tensor) = (tensor(fine), tensor(coarse));
+    let origin: [[f64; 3]; 3] = std::array::from_fn(|row| {
+        std::array::from_fn(|column| mix(fine_tensor[row][column], coarse_tensor[row][column]))
+    });
+    let c2 = centroid.iter().map(|value| value * value).sum::<f64>();
+    let central: [[f64; 3]; 3] = std::array::from_fn(|row| {
+        std::array::from_fn(|column| {
+            let diagonal = if row == column { c2 } else { 0.0 };
+            origin[row][column] - volume * (diagonal - centroid[row] * centroid[column])
+        })
+    });
+    let (principal_moments, principal_directions) = super::mesh::principal_axes(central);
+    let moment_of_inertia = [origin[0][0], origin[1][1], origin[2][2]];
+    let properties = MassProperties {
+        volume,
+        centroid,
+        moment_of_inertia,
+        principal_directions,
+        principal_moments,
+        product_of_inertia: [origin[0][1], origin[1][2], origin[2][0]],
+        radii_of_gyration: moment_of_inertia.map(|moment| (moment.max(0.0) / volume).sqrt()),
+    };
+    centroid
+        .iter()
+        .chain(&properties.moment_of_inertia)
+        .chain(&properties.principal_moments)
+        .all(|value| value.is_finite())
+        .then_some(properties)
 }
 
 fn cylindrical_sector_properties(body: &Body) -> Option<MassProperties> {

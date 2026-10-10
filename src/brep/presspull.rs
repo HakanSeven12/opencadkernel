@@ -122,6 +122,7 @@ pub fn presspull_face(
     match mode {
         PresspullMode::Extrude => glued_pull(body, key, &profile, distance)
             .or_else(|| glued_clear_pull(body, key, &profile, distance))
+            .or_else(|| sliced_push(body, key, &profile, distance))
             .or_else(|| presspull_region(body, &profile, distance)),
         PresspullMode::Offset => offset_face(body, key, &profile, distance, true),
     }
@@ -467,6 +468,18 @@ fn upright_offset(
             Surface::Cylinder(cylinder) => {
                 Vec3::from(cylinder.base.normal()?).dot(normal).abs() >= 1.0 - 1e-9
             }
+            // A spline wall stands square where its normal does, all along
+            // the edge.
+            wall @ Surface::Nurbs(_) => {
+                let curve = body.curves.get(edge.curve)?;
+                (0..=8).all(|step| {
+                    let t = step as f64 / 8.0;
+                    let at = edge.start_parameter * (1.0 - t) + edge.end_parameter * t;
+                    wall.parameters_at(curve.point_at(at))
+                        .and_then(|(u, v)| wall.normal_at(u, v))
+                        .is_some_and(|across| Vec3::from(across).dot(normal).abs() <= 1e-6)
+                })
+            }
             _ => false,
         };
         if !upright {
@@ -479,6 +492,36 @@ fn upright_offset(
     let volume = |body: &Body| super::mass_properties(body).map(|mass| mass.volume);
     let moved = volume(&result)? - volume(body)?;
     ((moved - area * distance).abs() <= 1e-3 * (area * distance).abs()).then_some(result)
+}
+
+/// A whole face pushed in among walls standing square to it is the body cut
+/// across at the new depth, the part behind the cut kept: no boolean has to
+/// run a wall of the prism along a wall of the body, which a spline wall
+/// refuses. Taken only where what is cut off is the face's area over the
+/// distance — the walls run straight in that far and nothing else of the
+/// body lies there.
+fn sliced_push(
+    body: &Body,
+    key: FaceKey,
+    region: &PlanarFaceProfile,
+    distance: f64,
+) -> Option<Body> {
+    if distance >= 0.0 {
+        return None;
+    }
+    let normal = Vec3::from(region.outward).normalize()?;
+    let origin = Vec3::from(region.plane.origin) + normal * distance;
+    let plane = Plane::orthonormal(origin.to_array(), region.plane.x_axis, normal.to_array())?;
+    let cut = super::slice_by_plane(body, plane).ok()??;
+    let tolerance = super::operation_tolerance(&[body]);
+    let area = boundary_area(&super::pcurve::face_boundary(body, key, tolerance)?).abs();
+    let removed = super::mass_properties(&cut.positive)?.volume;
+    let expected = area * distance.abs();
+    let kept = cut.negative;
+    ((removed - expected).abs() <= 1e-4 * expected
+        && !kept.roots.is_empty()
+        && kept.validate().is_empty())
+    .then_some(kept)
 }
 
 /// A whole face pulled out of a body lying wholly behind it: the face gives

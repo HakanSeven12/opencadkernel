@@ -586,22 +586,24 @@ fn split_face_in_place(
     let inside = |parameter: f64| {
         let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
         Some(periodic_points([u, v], periods).into_iter().any(|point| {
-            pcurve::contains_parameter(
+            pcurve::contains_parameter_facing(
                 &surface,
                 &original_boundary,
                 point,
                 Tolerance::new(tolerance),
+                node.forward,
             )
         }))
     };
     let strictly_inside = |parameter: f64| {
         let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
         Some(periodic_points([u, v], periods).into_iter().any(|point| {
-            pcurve::contains_parameter(
+            pcurve::contains_parameter_facing(
                 &surface,
                 &original_boundary,
                 point,
                 Tolerance::new(tolerance),
+                node.forward,
             ) && original_boundary
                 .iter()
                 .all(|edge| distance_to(edge, point) > tolerance)
@@ -1049,7 +1051,25 @@ fn split_face_in_place(
     let span = end_parameter - start_parameter;
     let imaged = on_image(start_parameter + span * 0.5)?
         && (on_image(start_parameter + span * 0.25)? || on_image(start_parameter + span * 0.75)?);
-    if imaged || along(start_parameter, end_parameter) {
+    // A stretch cut before is an edge of the body already, between the same
+    // two corners: a cutter touching the boundary where it was cut finds
+    // those corners again and would peel the same sliver off for ever.
+    let cut_already = || {
+        let ends = [start_parameter, end_parameter, start_parameter + span * 0.5]
+            .map(|at| Vec3::from(cutter.point_at(at)));
+        body.edges.iter().any(|(_, edge)| {
+            body.curves.get(edge.curve).is_some_and(|curve| curve == cutter)
+                && [edge.start_parameter, edge.end_parameter].iter().all(|at| {
+                    let point = Vec3::from(cutter.point_at(*at));
+                    point.distance(ends[0]) <= tolerance || point.distance(ends[1]) <= tolerance
+                })
+                && Vec3::from(cutter.point_at(0.5 * (edge.start_parameter + edge.end_parameter)))
+                    .distance(ends[2])
+                    <= tolerance
+        })
+    };
+    let traced = matches!(cutter, Curve3::Nurbs(spline) if spline.degree() > 1);
+    if imaged || along(start_parameter, end_parameter) || (traced && cut_already()) {
         return None;
     }
 
@@ -1323,7 +1343,8 @@ fn split_face_in_place(
             (start[0] - end[0]).hypot(start[1] - end[1]) > turn * 0.5
         };
         let inside = |boundary: &[crate::geom2d::Curve], point: [f64; 2]| {
-            pcurve::contains_parameter(&surface, boundary, point, Tolerance::new(tolerance))
+            let tolerance = Tolerance::new(tolerance);
+            pcurve::contains_parameter_facing(&surface, boundary, point, tolerance, node.forward)
         };
         // Cut off a hole, the cap between the cut and the hole's edge winds
         // against the hole, and the rest still winds with it: that rest keeps
