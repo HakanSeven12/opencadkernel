@@ -1,7 +1,7 @@
 //! Building a body from nothing.
 //!
 //! Two purposes. A modeller needs primitives to start from, and a kernel
-//! needs a solid it built itself to test against — one lifted from a file
+//! needs a solid it built itself to test against ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â one lifted from a file
 //! tests the reader as much as the topology, and when it fails there is no
 //! saying which.
 //!
@@ -10,13 +10,14 @@
 //! inconsistent body is a builder that will.
 
 use super::arena::Key;
-use super::geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
-use super::nurbs_builder::RationalCurve2;
+use super::geometry::{
+    Circle3, Cone, Curve3, Cylinder, Ellipse3, EllipticCone, Line3, Sphere, Surface, Torus,
+};
 use super::topology::{
     Body, Coedge, CoedgeKey, Edge, EdgeKey, Face, Loop, Lump, Shell, Vertex, VertexKey,
 };
 use super::Provenance;
-use crate::geom2d::{Arc, Curve as Curve2, Ellipse, EllipseArc, Line as Line2};
+use crate::geom2d::{Arc, Curve as Curve2, Line as Line2};
 use crate::space::{Plane, Vec3};
 use std::collections::{HashMap, VecDeque};
 use std::f64::consts::{FRAC_PI_2, PI, TAU};
@@ -24,7 +25,7 @@ use std::f64::consts::{FRAC_PI_2, PI, TAU};
 /// A rectangular box with one corner at `origin` and the opposite at
 /// `origin + size`.
 ///
-/// Six planar faces, twelve edges, eight vertices — and every edge shared by
+/// Six planar faces, twelve edges, eight vertices ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â and every edge shared by
 /// exactly two faces that run it opposite ways, which is what makes the
 /// result a solid rather than six unrelated rectangles.
 ///
@@ -112,15 +113,15 @@ pub fn cuboid(origin: [f64; 3], size: [f64; 3]) -> Option<Body> {
     });
 
     // Each face as the four corners of its outer loop, listed
-    // counter-clockwise seen from outside the box — material on the left of
+    // counter-clockwise seen from outside the box ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â material on the left of
     // the way round, as ACIS and every other builder here have it. That
     // ordering is also what makes every edge come out traversed once each way.
     const FACES: [[usize; 4]; 6] = [
-        [0, 4, 6, 2], // −x
+        [0, 4, 6, 2], // -x
         [1, 3, 7, 5], // +x
-        [0, 1, 5, 4], // −y
+        [0, 1, 5, 4], // -y
         [2, 6, 7, 3], // +y
-        [0, 2, 3, 1], // −z
+        [0, 2, 3, 1], // -z
         [4, 5, 7, 6], // +z
     ];
     for ring in FACES {
@@ -409,7 +410,7 @@ pub fn faceted_solid(vertices: &[[f64; 3]], faces: &[Vec<usize>]) -> Option<Body
 
 /// A right circular cylinder standing on `base`, `height` tall.
 ///
-/// Three faces — the two discs and the wall — and the smallest topology that
+/// Three faces ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the two discs and the wall ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â and the smallest topology that
 /// describes them: two circular edges, one seam running between them, and two
 /// vertices where the seam meets each rim.
 ///
@@ -490,7 +491,7 @@ pub fn cylinder(base: [f64; 3], radius: f64, height: f64) -> Option<Body> {
         provenance: Provenance::Synthesized,
     });
 
-    // The bottom disc faces down, so its own plane — which faces up — is the
+    // The bottom disc faces down, so its own plane ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â which faces up ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â is the
     // wrong way round and the face says so rather than a second plane being
     // made for it.
     let bottom = disc(&mut body, shell, bottom_plane, rim_low, false)?;
@@ -563,7 +564,7 @@ fn disc(
     let coedge = body.coedges.insert(Coedge {
         edge: rim,
         // A cap's loop runs counter-clockwise seen from outside it, which for
-        // the one facing down is clockwise seen from above — the rim
+        // the one facing down is clockwise seen from above ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the rim
         // traversed backwards. So the sense follows the face's own, and the
         // wall takes the opposite of each: that is what makes a rim one
         // shared edge instead of two coincident ones.
@@ -581,13 +582,13 @@ fn disc(
 
 /// A sphere of `radius` about `centre`.
 ///
-/// One face, as ACIS models it. A sphere has no edges of its own — it is
-/// closed in both directions — so what bounds the face is a seam: a single
+/// One face, as ACIS models it. A sphere has no edges of its own ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â it is
+/// closed in both directions ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â so what bounds the face is a seam: a single
 /// meridian, traversed once each way. The two poles are its vertices, and the
 /// surface is singular there, which is a thing a B-rep says rather than
 /// avoids.
 ///
-/// `V − E + F = 2 − 1 + 1 = 2`, the same as any other closed shell.
+/// `V ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ E + F = 2 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ 1 + 1 = 2`, the same as any other closed shell.
 pub fn sphere(centre: [f64; 3], radius: f64) -> Option<Body> {
     if radius.is_nan() || radius <= 0.0 {
         return None;
@@ -721,8 +722,11 @@ pub(crate) fn sphere_in_octants(centre: [f64; 3], radius: f64) -> Option<Body> {
 /// A circular or elliptical cylinder standing on `base`.
 ///
 /// The two radii are the semi-axes of both planar end faces. Circular input
-/// keeps the analytic cylinder representation; elliptical input is an exact
-/// rational loft between equal ellipse profiles.
+/// keeps the analytic cylinder representation; elliptical input stays
+/// analytic too ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the cone-surface whose section keeps the base's aspect,
+/// with closed `ellipse-curve` rims ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â which is the form a native ACIS
+/// author writes for an elliptical cylinder, rather than a spline
+/// approximation of one.
 pub fn elliptical_cylinder(
     base: [f64; 3],
     x_radius: f64,
@@ -743,35 +747,169 @@ pub fn elliptical_cylinder(
     if (x_radius - y_radius).abs() <= 1e-12 * scale {
         return cylinder(base, x_radius, height);
     }
+    let (major, ratio, direction) = canonical_ellipse_axes(x_radius, y_radius)?;
+    elliptic_wall_body(base, direction, major, ratio, major, height)
+}
 
-    let bottom = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
-    let top_origin = (Vec3::from(base) + Vec3::Z * height).to_array();
-    let top = Plane::orthonormal(top_origin, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
-    let profile = || {
-        (0..4)
-            .map(|index| {
-                let start = index as f64 * FRAC_PI_2;
-                Curve2::Ellipse(EllipseArc {
-                    ellipse: Ellipse {
-                        centre: [0.0, 0.0],
-                        major_radius: x_radius,
-                        minor_radius: y_radius,
-                        major_axis: [1.0, 0.0],
-                    },
-                    start_parameter: start,
-                    end_parameter: start + FRAC_PI_2,
-                })
-            })
-            .collect()
+/// The larger semi-axis, the smaller over it, and the world direction the
+/// record every elliptical section is written from.
+fn canonical_ellipse_axes(x_radius: f64, y_radius: f64) -> Option<(f64, f64, [f64; 3])> {
+    let (major, minor, direction) = if x_radius >= y_radius {
+        (x_radius, y_radius, [1.0, 0.0, 0.0])
+    } else {
+        (y_radius, x_radius, [0.0, 1.0, 0.0])
     };
-    super::loft::loft(&[(bottom, profile()), (top, profile())])
+    (minor > 0.0).then_some((major, minor / major, direction))
+}
+
+/// An elliptical cylinder, frustum or cone standing on `base` ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the
+/// analytic counterpart of the circular family, and the wire form native
+/// authors give an elliptical solid: one wall face on a cone-surface whose
+/// section keeps a constant aspect while its major shrinks along the axis.
+///
+/// The wall frame carries the major axis on `x`, so `ratio` is at most one.
+/// `top_major` is the major semi-axis at the top; a frustum keeps both end
+/// sections proportional, which is what makes one record cover it. A zero
+/// `top_major` ends the solid in an apex point, mirroring the circular
+/// cone's own construction.
+fn elliptic_wall_body(
+    base: [f64; 3],
+    major_direction: [f64; 3],
+    major: f64,
+    ratio: f64,
+    top_major: f64,
+    height: f64,
+) -> Option<Body> {
+    if !(major.is_finite() && major > 0.0)
+        || !(ratio.is_finite() && ratio > 0.0)
+        || !(top_major.is_finite() && top_major >= 0.0)
+        || !(height.is_finite() && height > 0.0)
+    {
+        return None;
+    }
+    let mut body = Body::new();
+    let bottom_plane = Plane::orthonormal(base, major_direction, [0.0, 0.0, 1.0])?;
+    let top_origin = (Vec3::from(base) + Vec3::Z * height).to_array();
+    let top_plane = Plane::orthonormal(top_origin, major_direction, [0.0, 0.0, 1.0])?;
+
+    // The seam sits where the frame's own major axis meets each rim, as on
+    // the circular cylinder.
+    let seam_low = bottom_plane.point_at([major, 0.0]);
+    let seam_high = if top_major > 0.0 {
+        top_plane.point_at([top_major, 0.0])
+    } else {
+        top_origin
+    };
+    let low = add_vertex(&mut body, seam_low);
+    let high = add_vertex(&mut body, seam_high);
+
+    let bottom_rim_curve = body.curves.insert(Curve3::Ellipse(Ellipse3 {
+        plane: bottom_plane,
+        major_radius: major,
+        minor_radius: major * ratio,
+    }));
+    let bottom_rim = body.edges.insert(Edge {
+        curve: bottom_rim_curve,
+        start_parameter: 0.0,
+        end_parameter: TAU,
+        start: low,
+        end: low,
+        coedges: Vec::new(),
+        provenance: Provenance::Synthesized,
+    });
+    let seam = add_line_edge(&mut body, low, high)?;
+
+    let half_angle = if top_major > 0.0 {
+        ((major - top_major) / height).atan()
+    } else {
+        (major / height).atan()
+    };
+    let wall = body.surfaces.insert(Surface::EllipticCone(EllipticCone {
+        base: bottom_plane,
+        radius: major,
+        ratio,
+        half_angle,
+    }));
+
+    if top_major > 0.0 {
+        // A cylinder or frustum: two discs and a wall whose loop runs round
+        // the bottom rim, up the seam, back round the top rim and down
+        // again ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the circular cylinder's own wiring, ellipses for circles.
+        let top_rim_curve = body.curves.insert(Curve3::Ellipse(Ellipse3 {
+            plane: top_plane,
+            major_radius: top_major,
+            minor_radius: top_major * ratio,
+        }));
+        let top_rim = body.edges.insert(Edge {
+            curve: top_rim_curve,
+            start_parameter: 0.0,
+            end_parameter: TAU,
+            start: high,
+            end: high,
+            coedges: Vec::new(),
+            provenance: Provenance::Synthesized,
+        });
+        let (lump, shell) = add_shell(&mut body);
+        disc(&mut body, shell, bottom_plane, bottom_rim, false)?;
+        disc(&mut body, shell, top_plane, top_rim, true)?;
+
+        let side = body.faces.insert(Face {
+            surface: wall,
+            forward: true,
+            loops: Vec::new(),
+            owner: shell,
+            provenance: Provenance::Synthesized,
+        });
+        let ring = body.loops.insert(Loop {
+            coedges: Vec::new(),
+            owner: side,
+            provenance: Provenance::Synthesized,
+        });
+        let mut coedges = Vec::with_capacity(4);
+        for (edge, forward) in [
+            (bottom_rim, true),
+            (seam, true),
+            (top_rim, false),
+            (seam, false),
+        ] {
+            let coedge = body.coedges.insert(Coedge {
+                edge,
+                forward,
+                pcurve: None,
+                owner: ring,
+                provenance: Provenance::Synthesized,
+            });
+            body.edges.get_mut(edge)?.coedges.push(coedge);
+            coedges.push(coedge);
+        }
+        body.loops.get_mut(ring)?.coedges = coedges;
+        body.faces.get_mut(side)?.loops = vec![ring];
+        body.shells.get_mut(shell)?.faces.push(side);
+        body.lumps.get_mut(lump)?.shells = vec![shell];
+        body.roots = vec![lump];
+    } else {
+        // A cone: the wall's loop runs round the rim and up and back down
+        // the seam, whose meeting point at the apex is the vertex the
+        // surface is singular at ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the circular cone's own construction.
+        let (lump, shell) = add_shell(&mut body);
+        disc(&mut body, shell, bottom_plane, bottom_rim, false)?;
+        close_shell(
+            &mut body,
+            lump,
+            shell,
+            wall,
+            true,
+            &[(bottom_rim, true), (seam, true), (seam, false)],
+        )?;
+    }
+    body.validate().is_empty().then_some(body)
 }
 
 /// A cone standing on `base`, `height` tall, with a base circle of `radius`
 /// and a point at the top.
 ///
 /// Two faces: the cone-surface wall and the disc it stands on. The wall's
-/// loop runs round the rim, up the seam and back down it — the apex is where
+/// loop runs round the rim, up the seam and back down it ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the apex is where
 /// the seam meets itself, a vertex the surface is singular at.
 ///
 /// `None` for a size that is not positive. A truncated cone is a different
@@ -804,7 +942,7 @@ pub fn cone(base: [f64; 3], radius: f64, height: f64) -> Option<Body> {
     let seam = add_line_edge(&mut body, rim_vertex, apex)?;
 
     let (lump, shell) = add_shell(&mut body);
-    // The base looks down, so its own plane — which looks up — is the wrong
+    // The base looks down, so its own plane ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â which looks up ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â is the wrong
     // way round and the face says so.
     disc(&mut body, shell, base_plane, rim, false)?;
     let wall = body.surfaces.insert(Surface::Cone(Cone {
@@ -829,9 +967,11 @@ pub fn cone(base: [f64; 3], radius: f64, height: f64) -> Option<Body> {
 ///
 /// `base_x_radius` and `base_y_radius` are the base semi-axes. `top_radius`
 /// is the top X semi-axis; its Y semi-axis keeps the base aspect ratio. A
-/// zero top radius produces a pointed cone. Circular cones and frusta retain
-/// analytic surfaces and circular cap edges; elliptical forms use exact
-/// rational ruled surfaces.
+/// zero top radius produces a pointed cone. Every tier of it stays analytic:
+/// circular cones and frusta keep their own records, and elliptical ones
+/// ride the same cone-surface record their circular special case does ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â a
+/// native ACIS author's form for all of them ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â rather than a spline
+/// approximation.
 pub fn frustum(
     base: [f64; 3],
     base_x_radius: f64,
@@ -881,115 +1021,27 @@ pub fn frustum(
         return super::sweep::revolve(section, &profile, base, Vec3::Z.to_array(), TAU);
     }
 
-    let base_plane = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
-    let top_origin = (Vec3::from(base) + Vec3::Z * height).to_array();
-    let top_plane = Plane::orthonormal(top_origin, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
-    let top_y_radius = top_radius * base_y_radius / base_x_radius;
-    super::loft::loft(&[
-        (base_plane, ellipse_profile(base_x_radius, base_y_radius)),
-        (top_plane, ellipse_profile(top_radius, top_y_radius)),
-    ])
+    // An elliptical frustum whose end sections keep the base's aspect ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â one
+    // analytic cone-surface, as every native-authored instance of the shape.
+    let (major, ratio, direction) = canonical_ellipse_axes(base_x_radius, base_y_radius)?;
+    let top_major = if base_x_radius >= base_y_radius {
+        top_radius
+    } else {
+        top_radius * base_y_radius / base_x_radius
+    };
+    elliptic_wall_body(base, direction, major, ratio, top_major, height)
 }
 
-fn ellipse_profile(x_radius: f64, y_radius: f64) -> Vec<Curve2> {
-    (0..4)
-        .map(|index| {
-            let start = index as f64 * FRAC_PI_2;
-            Curve2::Ellipse(EllipseArc {
-                ellipse: Ellipse {
-                    centre: [0.0, 0.0],
-                    major_radius: x_radius,
-                    minor_radius: y_radius,
-                    major_axis: [1.0, 0.0],
-                },
-                start_parameter: start,
-                end_parameter: start + FRAC_PI_2,
-            })
-        })
-        .collect()
-}
 
 fn elliptical_cone(base: [f64; 3], x_radius: f64, y_radius: f64, height: f64) -> Option<Body> {
-    let base_plane = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])?;
-    let apex_point = (Vec3::from(base) + Vec3::Z * height).to_array();
-    let rim_point = base_plane.point_at([x_radius, 0.0]);
-    let mut body = Body::new();
-    let rim_vertex = add_vertex(&mut body, rim_point);
-    let apex = add_vertex(&mut body, apex_point);
-    let rim_curve = body.curves.insert(Curve3::Ellipse(Ellipse3 {
-        plane: base_plane,
-        major_radius: x_radius,
-        minor_radius: y_radius,
-    }));
-    let rim = body.edges.insert(Edge {
-        curve: rim_curve,
-        start_parameter: 0.0,
-        end_parameter: TAU,
-        start: rim_vertex,
-        end: rim_vertex,
-        coedges: Vec::new(),
-        provenance: Provenance::Synthesized,
-    });
-    let seam = add_line_edge(&mut body, rim_vertex, apex)?;
-
-    let outline = Curve2::Ellipse(EllipseArc::full(Ellipse {
-        centre: [0.0, 0.0],
-        major_radius: x_radius,
-        minor_radius: y_radius,
-        major_axis: [1.0, 0.0],
-    }));
-    let base_curve = RationalCurve2::from_curve(&outline)?.lifted(&base_plane);
-    let tip_curve = super::nurbs_builder::RationalCurve3 {
-        degree: base_curve.degree,
-        knots: base_curve.knots.clone(),
-        points: vec![apex_point; base_curve.points.len()],
-        weights: base_curve.weights.clone(),
-    };
-    let wall = body
-        .surfaces
-        .insert(Surface::Nurbs(base_curve.ruled_to(&tip_curve)?));
-    let (lump, shell) = add_shell(&mut body);
-    disc(&mut body, shell, base_plane, rim, false)?;
-    close_shell_with_pcurves(
-        &mut body,
-        lump,
-        shell,
-        wall,
-        true,
-        &[
-            (
-                rim,
-                true,
-                Some(Curve2::Line(Line2 {
-                    start: [0.0, 0.0],
-                    end: [1.0, 0.0],
-                })),
-            ),
-            (
-                seam,
-                true,
-                Some(Curve2::Line(Line2 {
-                    start: [1.0, 0.0],
-                    end: [1.0, 1.0],
-                })),
-            ),
-            (
-                seam,
-                false,
-                Some(Curve2::Line(Line2 {
-                    start: [0.0, 1.0],
-                    end: [0.0, 0.0],
-                })),
-            ),
-        ],
-    )?;
-    body.validate().is_empty().then_some(body)
+    let (major, ratio, direction) = canonical_ellipse_axes(x_radius, y_radius)?;
+    elliptic_wall_body(base, direction, major, ratio, 0.0, height)
 }
 
 /// A torus about `centre`, its tube `minor_radius` thick at
 /// `major_radius` out.
 ///
-/// One face and two seams — one round the ring, one round the tube — which is
+/// One face and two seams ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â one round the ring, one round the tube ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â which is
 /// what a surface closed in both directions needs. Its Euler characteristic
 /// is zero rather than two, because a torus has a hole through it and no
 /// closed shell of genus one can have any other.
@@ -1169,7 +1221,7 @@ pub fn pyramid_frustum(
 
     let (lump, shell) = add_shell(&mut body);
 
-    // The base looks down, so its loop runs the rim backwards — which is also
+    // The base looks down, so its loop runs the rim backwards ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â which is also
     // what leaves each rim edge traversed one way by the base and the other
     // by the side standing on it.
     let ground_down = Plane::orthonormal(base, [1.0, 0.0, 0.0], [0.0, 0.0, -1.0])?;
@@ -1326,49 +1378,6 @@ fn close_shell(
     Some(())
 }
 
-fn close_shell_with_pcurves(
-    body: &mut Body,
-    lump: super::topology::LumpKey,
-    shell: super::topology::ShellKey,
-    surface: super::topology::SurfaceKey,
-    forward: bool,
-    edges: &[(EdgeKey, bool, Option<Curve2>)],
-) -> Option<()> {
-    let face = body.faces.insert(Face {
-        surface,
-        forward,
-        loops: Vec::new(),
-        owner: shell,
-        provenance: Provenance::Synthesized,
-    });
-    let ring = body.loops.insert(Loop {
-        coedges: Vec::new(),
-        owner: face,
-        provenance: Provenance::Synthesized,
-    });
-    let mut coedges = Vec::with_capacity(edges.len());
-    for (edge, sense, pcurve) in edges {
-        let coedge = body.coedges.insert(Coedge {
-            edge: *edge,
-            forward: *sense,
-            pcurve: pcurve.clone(),
-            owner: ring,
-            provenance: Provenance::Synthesized,
-        });
-        body.edges.get_mut(*edge)?.coedges.push(coedge);
-        coedges.push(coedge);
-    }
-    body.loops.get_mut(ring)?.coedges = coedges;
-    body.faces.get_mut(face)?.loops = vec![ring];
-    body.shells.get_mut(shell)?.faces.push(face);
-    if body.lumps.get(lump)?.shells.is_empty() {
-        body.lumps.get_mut(lump)?.shells = vec![shell];
-    }
-    if body.roots.is_empty() {
-        body.roots = vec![lump];
-    }
-    Some(())
-}
 
 fn add_vertex(body: &mut Body, point: [f64; 3]) -> VertexKey {
     body.vertices.insert(Vertex {
@@ -1436,7 +1445,7 @@ fn face_plane(body: &Body, corners: &[Key<Vertex>], ring: [usize; 4]) -> Option<
     let origin = at(0)?;
     let along = at(1)? - origin;
     let across = at(3)? - origin;
-    // Counter-clockwise seen from outside, so `along × across` points out.
+    // Counter-clockwise seen from outside, so along x across points out.
     // The frame runs along `across`, which keeps each face's parameterisation
     // what it was before the loops were turned the right way round.
     let normal = along.cross(across).normalize()?;
@@ -1496,7 +1505,7 @@ mod tests {
 
     #[test]
     fn a_box_is_a_closed_surface() {
-        // V − E + F = 8 − 12 + 6 = 2, which is what a shell of genus zero
+        // V ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ E + F = 8 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¾ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ 12 + 6 = 2, which is what a shell of genus zero
         // must give. A face left out or an edge duplicated changes it.
         assert_eq!(unit_box().euler_characteristic(), 2);
     }
@@ -1754,7 +1763,7 @@ mod tests {
     /// How much a meshed solid encloses, by the divergence theorem.
     ///
     /// Negative when the faces are wound inwards, and short of the true
-    /// figure by however much the flat facets cut off — never over, since
+    /// figure by however much the flat facets cut off ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â never over, since
     /// every chord lies inside the surface it approximates.
     fn meshed_volume(solid: &Body) -> f64 {
         let mesh = crate::brep::mesh::body(solid, crate::tessellation::DEFAULT_ANGLE, 1e-9);
@@ -1771,8 +1780,8 @@ mod tests {
     #[test]
     fn every_primitive_that_meshes_encloses_what_it_should() {
         // Measuring the whole mesh rather than looking at each triangle. A
-        // face left out entirely passes any per-triangle check — the ones
-        // that are there are still wound correctly — and for a long while a
+        // face left out entirely passes any per-triangle check ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â the ones
+        // that are there are still wound correctly ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â and for a long while a
         // cylinder's wall was missing from every mesh this way, with only
         // its two discs drawn.
         //
@@ -1803,7 +1812,7 @@ mod tests {
             (
                 pyramid([0.0; 3], 4.0, 9.0, 6).unwrap(),
                 // A regular hexagon of circumradius four: six equilateral
-                // triangles, each with area r²√3/4 at side r.
+                // triangles, each with area rÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â²ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¹ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â¦ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡3/4 at side r.
                 6.0 * (16.0 * 3.0_f64.sqrt() / 4.0) * 9.0 / 3.0,
             ),
         ];
@@ -1883,8 +1892,8 @@ mod tests {
 
     #[test]
     fn a_sphere_meshes_from_what_bounds_it_rather_than_where() {
-        // Its seam ends at the poles, where longitude has no single value —
-        // every meridian passes through them — so where that seam sits in
+        // Its seam ends at the poles, where longitude has no single value ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
+        // every meridian passes through them ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â so where that seam sits in
         // (u, v) cannot be worked out from the geometry at all. What can be
         // worked out is that the seam is the *only* thing bounding the face,
         // and a face bounded by nothing but its own seams covers the whole
@@ -2004,5 +2013,196 @@ mod tests {
             .filter(|(_, f)| !f.provenance.is_reusable())
             .count();
         assert_eq!(dirty_faces, 3, "only the faces those bound");
+    }
+
+    /// The wall of `body`'s shell, which primitives keep as the one face
+    /// that is not a plane.
+    fn wall_surface(body: &Body) -> (&crate::brep::SurfaceKey, &Surface) {
+        let face = body
+            .faces
+            .iter()
+            .find(|(_, face)| !matches!(body.surfaces.get(face.surface), Some(Surface::Plane(_))))
+            .expect("a non-planar wall face");
+        (&face.1.surface, body.surfaces.get(face.1.surface).unwrap())
+    }
+
+    #[test]
+    fn an_elliptical_cylinder_is_the_circular_census_with_a_ratio() {
+        let circular = cylinder([0.0, 0.0, 0.0], 5.0, 10.0).expect("the circular twin");
+        let body =
+            elliptical_cylinder([0.0, 0.0, 0.0], 5.0, 3.0, 10.0).expect("an elliptical cylinder");
+        assert!(body.validate().is_empty());
+        assert_eq!(body.euler_characteristic(), 2);
+        // The same census the circular cylinder carries, counted against it
+        // rather than restated: two closed rims, one seam, the wiring both
+        // walls take.
+        assert_eq!(body.vertices.len(), circular.vertices.len());
+        assert_eq!(body.edges.len(), circular.edges.len());
+        assert_eq!(body.faces.len(), circular.faces.len());
+        assert_eq!(body.loops.len(), circular.loops.len());
+        assert_eq!(body.coedges.len(), circular.coedges.len());
+
+        let (_, wall) = wall_surface(&body);
+        match wall {
+            Surface::EllipticCone(cone) => {
+                assert_eq!(cone.radius, 5.0);
+                assert!((cone.ratio - 0.6).abs() < 1e-12);
+                assert_eq!(cone.half_angle, 0.0, "a cylinder does not taper");
+                assert!((cone.base.point_at([5.0, 0.0])[0] - 5.0).abs() < 1e-12);
+            }
+            other => panic!("the wall left the analytic family: {other:?}"),
+        }
+
+        let ellipse_count = body
+            .curves
+            .iter()
+            .filter(|(_, curve)| {
+                matches!(
+                    curve,
+                    Curve3::Ellipse(ellipse)
+                        if (ellipse.major_radius - 5.0).abs() < 1e-12
+                            && (ellipse.minor_radius - 3.0).abs() < 1e-12
+                )
+            })
+            .count();
+        assert_eq!(ellipse_count, 2, "both rims stay analytic ellipses");
+    }
+
+    #[test]
+    fn an_elliptical_cylinder_keeps_the_major_on_its_frame() {
+        // Major on Y: the frame swaps rather than the record stretching,
+        // which is the direction the SAT basis vector carries.
+        let body = elliptical_cylinder([0.0, 0.0, 0.0], 3.0, 5.0, 10.0).unwrap();
+        let (_, wall) = wall_surface(&body);
+        match wall {
+            Surface::EllipticCone(cone) => {
+                assert_eq!(cone.radius, 5.0);
+                assert!((cone.ratio - 0.6).abs() < 1e-12);
+                // The frame's own x axis points along world Y.
+                let [x, y, _] = cone.base.x_axis;
+                assert!(y > x);
+            }
+            other => panic!("the wall left the analytic family: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_elliptical_cone_tapers_like_its_circular_twin() {
+        let circular = cone([0.0, 0.0, 0.0], 5.0, 10.0).unwrap();
+        let elliptical = frustum([0.0, 0.0, 0.0], 5.0, 3.0, 0.0, 10.0).unwrap();
+        assert!(elliptical.validate().is_empty());
+        assert_eq!(
+            (elliptical.vertices.len(), elliptical.edges.len(), elliptical.faces.len()),
+            (circular.vertices.len(), circular.edges.len(), circular.faces.len()),
+            "the elliptical cone carries the circular cone's census"
+        );
+        let (_, wall) = wall_surface(&elliptical);
+        match wall {
+            Surface::EllipticCone(cone) => {
+                assert_eq!(cone.radius, 5.0);
+                assert!((cone.ratio - 0.6).abs() < 1e-12);
+                assert!(
+                    (cone.half_angle - (5.0f64 / 10.0).atan()).abs() < 1e-12,
+                    "the major falls to nothing over the height, as on a circular cone"
+                );
+            }
+            other => panic!("the wall left the analytic family: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_elliptical_frustum_keeps_its_end_sections_proportional() {
+        let body = frustum([0.0, 0.0, 0.0], 5.0, 3.0, 2.0, 10.0).unwrap();
+        assert!(body.validate().is_empty());
+        assert_eq!(body.euler_characteristic(), 2);
+        let rims: Vec<f64> = body
+            .curves
+            .iter()
+            .filter_map(|(_, curve)| match curve {
+                Curve3::Ellipse(ellipse) => Some(ellipse.major_radius),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rims.len(), 2, "two closed rims");
+        let top = rims.iter().cloned().fold(f64::INFINITY, f64::min);
+        let bottom = rims.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!((top - 2.0).abs() < 1e-12, "top major {top}");
+        assert!((bottom - 5.0).abs() < 1e-12, "bottom major {bottom}");
+        let (_, wall) = wall_surface(&body);
+        match wall {
+            Surface::EllipticCone(cone) => {
+                assert!(
+                    (cone.half_angle - (3.0f64 / 10.0).atan()).abs() < 1e-12,
+                    "the major runs 5 to 2 over the height"
+                );
+                assert!((cone.ratio - 0.6).abs() < 1e-12);
+            }
+            other => panic!("the wall left the analytic family: {other:?}"),
+        }
+    }
+
+    fn of_elliptic(built: Option<Body>) -> (Body, usize, usize, (f64, f64)) {
+        let body = built.expect("a body");
+        let expected = match wall_surface(&body).1 {
+            Surface::EllipticCone(cone) => (cone.radius, cone.ratio),
+            other => panic!("the wall left the analytic family: {other:?}"),
+        };
+        let faces = body.faces.len();
+        let edges = body.edges.len();
+        (body, faces, edges, expected)
+    }
+
+    #[test]
+    fn elliptical_solids_round_trip_through_sat() {
+        for (body, faces, edges, expected) in [
+            of_elliptic(elliptical_cylinder([0.0, 0.0, 0.0], 5.0, 3.0, 10.0)),
+            of_elliptic(frustum([0.0, 0.0, 0.0], 5.0, 3.0, 2.0, 10.0)),
+            of_elliptic(frustum([0.0, 0.0, 0.0], 5.0, 3.0, 0.0, 10.0)),
+        ] {
+            let mut document = opencadcodec::entities::acis::SatDocument::new();
+            assert!(crate::acis::append(&body, &mut document).is_ok());
+            let parsed =
+                opencadcodec::entities::acis::SatDocument::parse(&document.to_sat_string()).unwrap();
+            let (restored, loss) = crate::acis::lift(&parsed);
+            assert!(loss.is_empty(), "{loss:?}");
+            assert_eq!(restored.len(), 1);
+            assert!(restored[0].validate().is_empty());
+            assert_eq!(restored[0].faces.len(), faces, "face census changed");
+            assert_eq!(restored[0].edges.len(), edges, "edge census changed");
+            let restored_pair = match wall_surface(&restored[0]).1 {
+                Surface::EllipticCone(cone) => (cone.radius, cone.ratio),
+                other => panic!("the lifted wall left the analytic family: {other:?}"),
+            };
+            assert!((restored_pair.0 - expected.0).abs() < 1e-12);
+            assert!((restored_pair.1 - expected.1).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn the_emitted_record_is_the_authored_elliptical_wire_form() {
+        // A native ACIS author writes an elliptical cylinder as one
+        // cone-surface whose major basis carries the semi-axis, whose
+        // fourth token is the section ratio, and whose half-angle tokens
+        // read sine 0, cosine 1 ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â measured from the authored gold
+        // fixtures this form was built against.
+        let body = elliptical_cylinder([0.0, 0.0, 0.0], 5.0, 3.0, 10.0).unwrap();
+        let mut document = opencadcodec::entities::acis::SatDocument::new();
+        crate::acis::append(&body, &mut document).unwrap();
+        let parsed = opencadcodec::entities::acis::SatDocument::parse(&document.to_sat_string()).unwrap();
+        for record in &parsed.records {
+            if let Some(cone) = opencadcodec::entities::acis::SatConeSurface::from_record(record) {
+                let (mx, my, mz) = cone.major_axis();
+                assert!(
+                    ((mx.hypot(my).hypot(mz)) - 5.0).abs() < 1e-12,
+                    "the basis is the major semi-axis, not a unit vector"
+                );
+                assert!((cone.ratio() - 0.6).abs() < 1e-12);
+                assert_eq!(cone.sin_half_angle().abs(), 0.0);
+                assert_eq!(cone.cos_half_angle(), 1.0);
+                assert_eq!(cone.radius(), 5.0);
+                return;
+            }
+        }
+        panic!("no cone-surface record was emitted for an elliptical cylinder");
     }
 }

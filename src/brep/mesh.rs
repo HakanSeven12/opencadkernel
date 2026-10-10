@@ -1485,6 +1485,7 @@ fn surface_chordal_radius(surface: &super::geometry::Surface) -> f64 {
     match surface {
         super::geometry::Surface::Cylinder(value) => value.radius.abs(),
         super::geometry::Surface::Cone(value) => value.radius.abs(),
+        super::geometry::Surface::EllipticCone(value) => value.radius.abs(),
         super::geometry::Surface::Sphere(value) => value.radius.abs(),
         super::geometry::Surface::Torus(value) => {
             value.major_radius.abs() + value.minor_radius.abs()
@@ -3786,7 +3787,9 @@ fn periods(surface: &super::geometry::Surface) -> [Option<f64>; 2] {
     use super::geometry::Surface;
     match surface {
         Surface::Plane(_) => [None, None],
-        Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_) => [Some(TAU), None],
+        Surface::Cylinder(_) | Surface::Cone(_) | Surface::EllipticCone(_) | Surface::Sphere(_) => {
+            [Some(TAU), None]
+        }
         Surface::Torus(_) => [Some(TAU), Some(TAU)],
         Surface::Nurbs(surface) => {
             let ((u0, u1), (v0, v1)) = surface.domain();

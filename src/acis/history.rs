@@ -805,6 +805,7 @@ pub fn sweep_profile_geometry(
     transform: [f64; 16],
 ) -> Result<(Plane, Vec<Vec<Curve>>, bool), HistoryRebuildError> {
     if let EmbeddedEntity::Region(region) = entity {
+
         let (mut plane, wires) = region_sweep_profile(region)?;
         let place = placement(transform)?;
         if place.scale().is_none() {

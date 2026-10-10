@@ -1,7 +1,7 @@
 //! The shapes a face sits on and an edge runs along.
 //!
 //! Topology says which face borders which; geometry says where they are. The
-//! two are kept apart because they change independently — a boolean rewrites
+//! two are kept apart because they change independently Ã¢â‚¬â€ a boolean rewrites
 //! adjacency while leaving every surface exactly as it was, and a face can be
 //! moved without any coedge noticing.
 //!
@@ -10,7 +10,7 @@
 //! A cylinder is stored as a cylinder, not as a spline that happens to look
 //! like one. That is not an optimisation: an ACIS file says `cone`, and
 //! lowering it back as a B-spline surface loses the fact that it was ever
-//! round — every downstream consumer, including the next modeller to open
+//! round Ã¢â‚¬â€ every downstream consumer, including the next modeller to open
 //! the file, then sees an approximation. The analytic cases are also the ones
 //! whose intersections have closed forms, which is the difference between a
 //! boolean that lands on the exact circle two cylinders share and one that
@@ -34,10 +34,18 @@ pub enum Surface {
     /// A right circular cylinder about `axis`. `u` runs round it in radians,
     /// `v` along the axis.
     Cylinder(Cylinder),
-    /// A right circular cone, which a cylinder is the zero-angle case of —
+    /// A right circular cone, which a cylinder is the zero-angle case of Ã¢â‚¬â€
     /// kept separate because ACIS stores them as one record with a flag, and
     /// because their intersections behave differently.
     Cone(Cone),
+    /// A cone over an ellipse, which is how ACIS stores every elliptical
+    /// cylinder and cone: one record whose cross-section keeps a constant
+    /// aspect while the major shrinks along the axis. `u` runs round the
+    /// section in radians, `v` along the axis from the base frame, and a
+    /// zero half-angle makes it an elliptical cylinder. The circular cone
+    /// is the `ratio = 1` case, kept separate as its own variant for the
+    /// same reasons as `Cone`.
+    EllipticCone(EllipticCone),
     /// A sphere. `u` is longitude, `v` latitude, both in radians.
     Sphere(Sphere),
     /// A torus. `u` runs the major circle, `v` the minor.
@@ -67,10 +75,30 @@ pub struct Cone {
     /// The frame at the reference circle, as for a cylinder.
     pub base: Plane,
     /// Radius of that circle. This is the radius *at the base*, not at the
-    /// apex — reading it as the apex radius puts every generator on the wrong
+    /// apex Ã¢â‚¬â€ reading it as the apex radius puts every generator on the wrong
     /// slope.
     pub radius: f64,
     /// Half-angle at the apex, positive when the cone narrows along the axis.
+    pub half_angle: f64,
+}
+
+/// A cone over an ellipse, the record ACIS stores every elliptical
+/// cylinder and cone as: one surface whose cross-section keeps a constant
+/// aspect ratio while its major axis shrinks along the axis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EllipticCone {
+    /// The frame at the reference cross-section, whose x axis is the
+    /// major direction of the ellipse.
+    pub base: Plane,
+    /// Half-length of the major axis at `v = 0`, the *reference*
+    /// cross-section.
+    pub radius: f64,
+    /// Minor half-length over major half-length, kept along the whole
+    /// surface Ã¢â‚¬â€ this is what makes one record cover the whole family,
+    /// `ratio = 1` being a circular section.
+    pub ratio: f64,
+    /// Half-angle at the apex, positive when the cone narrows along the
+    /// axis. Zero for an elliptical cylinder.
     pub half_angle: f64,
 }
 
@@ -112,6 +140,14 @@ impl Surface {
                 let around = cone.base.point_at([radius * u.cos(), radius * u.sin()]);
                 offset_along_normal(&cone.base, around, v)
             }
+            Self::EllipticCone(cone) => {
+                // The section keeps its aspect while the major shrinks
+                // along the axis, exactly as the circular cone above.
+                let major = cone.radius - v * cone.half_angle.tan();
+                let minor = major * cone.ratio;
+                let around = cone.base.point_at([major * u.cos(), minor * u.sin()]);
+                offset_along_normal(&cone.base, around, v)
+            }
             Self::Sphere(sphere) => {
                 let ring = sphere.radius * v.cos();
                 let around = sphere.frame.point_at([ring * u.cos(), ring * u.sin()]);
@@ -143,6 +179,19 @@ impl Surface {
                     Vec3::from(cone.base.normal()?) - Vec3::from(radial) * cone.half_angle.tan();
                 Some((
                     cone.base.vector_at([-radius * u.sin(), radius * u.cos()]),
+                    along.to_array(),
+                ))
+            }
+            Self::EllipticCone(cone) => {
+                let major = cone.radius - v * cone.half_angle.tan();
+                let minor = major * cone.ratio;
+                // The section's own radial direction, unscaled by the
+                // ellipse: it is what the axis tilt is measured against.
+                let radial = cone.base.vector_at([u.cos(), cone.ratio * u.sin()]);
+                let along =
+                    Vec3::from(cone.base.normal()?) - Vec3::from(radial) * cone.half_angle.tan();
+                Some((
+                    cone.base.vector_at([-major * u.sin(), minor * u.cos()]),
                     along.to_array(),
                 ))
             }
@@ -198,6 +247,16 @@ impl Surface {
                     .normalize()
                     .map(Vec3::to_array)
             }
+            // An ellipse's outward normal is not radial, so unlike the
+            // circular kinds this one is taken from the tangents, as the
+            // spline arm does.
+            Self::EllipticCone(_) => {
+                let (along_u, along_v) = self.tangents_at(u, v)?;
+                Vec3::from(along_u)
+                    .cross(Vec3::from(along_v))
+                    .normalize()
+                    .map(Vec3::to_array)
+            }
             Self::Nurbs(_) => {
                 let (along_u, along_v) = self.tangents_at(u, v)?;
                 Vec3::from(along_u)
@@ -216,19 +275,20 @@ impl Surface {
             Self::Plane(plane) => plane,
             Self::Cylinder(cylinder) => &cylinder.base,
             Self::Cone(cone) => &cone.base,
+            Self::EllipticCone(cone) => &cone.base,
             Self::Sphere(sphere) => &sphere.frame,
             Self::Torus(torus) => &torus.frame,
             Self::Nurbs(_) => return None,
         })
     }
 
-    /// The `(u, v)` of a point on the surface — the inverse of
+    /// The `(u, v)` of a point on the surface Ã¢â‚¬â€ the inverse of
     /// [`point_at`](Self::point_at).
     ///
     /// A point off the surface is answered for the nearest point on it, so a
     /// caller holding an intersection result does not have to be exact
     /// first. `None` only where the frame is degenerate, or at a place with
-    /// no single answer — a sphere's pole, where every longitude meets.
+    /// no single answer Ã¢â‚¬â€ a sphere's pole, where every longitude meets.
     pub fn parameters_at(&self, point: [f64; 3]) -> Option<(f64, f64)> {
         match self {
             Self::Plane(plane) => {
@@ -244,6 +304,20 @@ impl Surface {
                 let local = cone.base.project(point)?;
                 let height = height_above(&cone.base, point)?;
                 Some((local[1].atan2(local[0]), height))
+            }
+            Self::EllipticCone(cone) => {
+                let local = cone.base.project(point)?;
+                let height = height_above(&cone.base, point)?;
+                let major = cone.radius - height * cone.half_angle.tan();
+                let scale = cone.radius.abs().max(1.0);
+                if major.abs() <= 1e-12 * scale {
+                    // The apex. Every longitude passes through it, so there
+                    // is no `u` to report rather than an arbitrary one Ã¢â‚¬â€
+                    // the sphere's pole answered the same way.
+                    return None;
+                }
+                let minor = major * cone.ratio;
+                Some(((local[1] / minor).atan2(local[0] / major), height))
             }
             Self::Sphere(sphere) => {
                 let local = sphere.frame.project(point)?;
@@ -294,7 +368,7 @@ impl Surface {
 
     /// Where a ray meets the surface, as distances along `direction`.
     ///
-    /// In order, and including negative ones — behind the origin is still on
+    /// In order, and including negative ones Ã¢â‚¬â€ behind the origin is still on
     /// the surface, and a caller counting crossings ahead filters for itself.
     ///
     /// `None` where a spline patch's crossing will not settle. As everywhere
@@ -351,12 +425,16 @@ impl Surface {
                     across_offset.length_squared() - at_start * at_start,
                 ))
             }
+            // An elliptic section is a quartic like the torus's is, but
+            // with no closed form and no upstream counterpart: keep the
+            // honest `None`, not an empty list.
+            Self::EllipticCone(_) => None,
             Self::Torus(torus) => {
                 // The section is a quartic in the ray parameter. Its roots
                 // lie within the torus's bounding sphere, so the span there is
                 // walked for sign changes and each one halved down to a
                 // root. Two roots inside one step, or a graze, show no
-                // change and are missed together — an even number, which
+                // change and are missed together ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â an even number, which
                 // leaves a crossing count's parity as it was.
                 let axis = Vec3::from(torus.frame.normal()?);
                 let (major, minor) = (torus.major_radius.abs(), torus.minor_radius.abs());
@@ -419,7 +497,7 @@ impl Surface {
 
     /// Signed distance from `point` to the surface, positive outside.
     ///
-    /// Exact for every analytic kind here — no search, no sampling.
+    /// Exact for every analytic kind here Ã¢â‚¬â€ no search, no sampling.
     pub fn distance_to(&self, point: [f64; 3]) -> f64 {
         match self {
             Self::Plane(plane) => plane.distance_to(point).unwrap_or(f64::INFINITY),
@@ -427,7 +505,7 @@ impl Surface {
             Self::Cone(cone) => {
                 let (along, across) = axial_distance(&cone.base, point);
                 // In the (across, along) half plane the cone's profile is not
-                // one line but two, meeting at the apex — the record covers
+                // one line but two, meeting at the apex Ã¢â‚¬â€ the record covers
                 // both nappes, so past the apex the radius grows again on the
                 // mirrored half. Taking the magnitude is what folds the
                 // second one in; reading the first line's own extension
@@ -454,6 +532,7 @@ impl Surface {
                     outer
                 }
             }
+            Self::EllipticCone(cone) => elliptic_cone_distance(cone, point),
             // Unsigned off the patch's side, where the nearest point is on
             // its edge and the normal says nothing about the side.
             Self::Nurbs(surface) => {
@@ -470,9 +549,86 @@ impl Surface {
     }
 }
 
+/// Signed distance from `point` to an elliptical cone surface.
+///
+/// The section is an ellipse, whose nearest point has no closed form Ã¢â‚¬â€ a
+/// circle's has. What the circular arms answer by algebra here comes from a
+/// short Gauss-Newton iteration instead: refine `(u, v)` from the point's
+/// own longitude and height toward the nearest surface point. Several
+/// seeds are tried, the ellipse's quadrants and the reflected nappe among
+/// them Ã¢â‚¬â€ the torus arm's two sheets answered the same way Ã¢â‚¬â€ and the
+/// smallest residual keeps the answer. Points *on* the surface, which is
+/// what `contains` gates a lift on, converge to a zero residual in a step
+/// or two from the point's own longitude.
+fn elliptic_cone_distance(cone: &EllipticCone, point: [f64; 3]) -> f64 {
+    let Some(local) = cone.base.project(point) else {
+        return f64::INFINITY;
+    };
+    let Some(height) = height_above(&cone.base, point) else {
+        return f64::INFINITY;
+    };
+    let scale = cone.radius.abs().max(1.0);
+    let section_major = (cone.radius - height * cone.half_angle.tan()).abs().max(1e-12 * scale);
+    let section_minor = (section_major * cone.ratio).abs().max(1e-12 * scale);
+    let longitude = (local[1] / section_minor).atan2(local[0] / section_major);
+
+    let mut best: Option<f64> = None;
+    for (u0, v0) in [
+        (longitude, height),
+        (longitude + std::f64::consts::FRAC_PI_2, height),
+        (longitude - std::f64::consts::FRAC_PI_2, height),
+        (longitude + std::f64::consts::PI, height),
+    ] {
+        let mut u = u0;
+        let mut v = v0;
+        for _ in 0..16 {
+            let surface_point = Surface::EllipticCone(*cone).point_at(u, v);
+            let delta = Vec3::from(point) - Vec3::from(surface_point);
+            let Some((along_u, along_v)) = Surface::EllipticCone(*cone).tangents_at(u, v) else {
+                break;
+            };
+            let along_u = Vec3::from(along_u);
+            let along_v = Vec3::from(along_v);
+            let a = along_u.dot(along_u);
+            let b = along_u.dot(along_v);
+            let c = along_v.dot(along_v);
+            let d = along_u.dot(delta);
+            let e = along_v.dot(delta);
+            let determinant = a * c - b * b;
+            if determinant.abs() <= f64::MIN_POSITIVE {
+                break;
+            }
+            let step_u = (c * d - b * e) / determinant;
+            let step_v = (a * e - b * d) / determinant;
+            u += step_u;
+            v += step_v;
+            if step_u.abs() < 1e-14 && step_v.abs() < 1e-14 {
+                break;
+            }
+        }
+        let surface_point = Surface::EllipticCone(*cone).point_at(u, v);
+        let residual = Vec3::from(surface_point).distance(Vec3::from(point));
+        let signed = match Surface::EllipticCone(*cone).normal_at(u, v) {
+            Some(normal) => {
+                let toward_point = Vec3::from(point) - Vec3::from(surface_point);
+                if Vec3::from(normal).dot(toward_point) < 0.0 {
+                    -residual
+                } else {
+                    residual
+                }
+            }
+            None => residual,
+        };
+        if best.map_or(true, |current| signed.abs() < current.abs()) {
+            best = Some(signed);
+        }
+    }
+    best.unwrap_or(f64::INFINITY)
+}
+
 /// Where a ray meets a spline patch: the crossings of a grid of the patch's
 /// own points, each then refined onto the patch itself by Newton's method in
-/// `(u, v, t)`. `None` when a crossing will not settle — a ray grazing the
+/// `(u, v, t)`. `None` when a crossing will not settle Ã¢â‚¬â€ a ray grazing the
 /// patch, whose count of crossings is not to be trusted either way.
 fn nurbs_ray_hits(surface: &NurbsSurface3, origin: Vec3, direction: Vec3) -> Option<Vec<f64>> {
     let ((u0, u1), (v0, v1)) = surface.domain();
@@ -531,7 +687,7 @@ fn nurbs_ray_hits(surface: &NurbsSurface3, origin: Vec3, direction: Vec3) -> Opt
 }
 
 /// Where a ray crosses a triangle: its distance and the crossing's second
-/// and third barycentric weights. The edges count as inside — a crossing on
+/// and third barycentric weights. The edges count as inside Ã¢â‚¬â€ a crossing on
 /// one is found from both its triangles and kept once.
 fn ray_triangle(origin: Vec3, direction: Vec3, [a, b, c]: [Vec3; 3]) -> Option<(f64, f64, f64)> {
     let (ab, ac) = (b - a, c - a);
@@ -549,7 +705,7 @@ fn ray_triangle(origin: Vec3, direction: Vec3, [a, b, c]: [Vec3; 3]) -> Option<(
         .then(|| (ac.dot(back) / determinant, beta, gamma))
 }
 
-/// A grid crossing pulled onto the patch: `S(u, v) = origin + t·direction`
+/// A grid crossing pulled onto the patch: `S(u, v) = origin + tÃ‚Â·direction`
 /// solved from the grid's guess.
 fn refine_ray_hit(
     surface: &NurbsSurface3,
@@ -571,7 +727,7 @@ fn refine_ray_hit(
         if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
             return None;
         }
-        // Cramer's rule for J·step = -residual, J = [S_u S_v -d].
+        // Cramer's rule for JÃ‚Â·step = -residual, J = [S_u S_v -d].
         let target = residual * -1.0;
         u += target.dot(along_v.cross(back)) / determinant;
         v += along_u.dot(target.cross(back)) / determinant;
@@ -601,7 +757,7 @@ fn perpendicular(vector: Vec3, axis: Vec3) -> Vec3 {
     vector - axis * vector.dot(axis)
 }
 
-/// Real roots of `a·t² + b·t + c`, in order.
+/// Real roots of `aÃ‚Â·tÃ‚Â² + bÃ‚Â·t + c`, in order.
 ///
 /// Falls back to the linear case when the quadratic term vanishes, which is
 /// how a ray parallel to a cone's own slope is answered rather than divided
@@ -654,7 +810,7 @@ pub enum Curve3 {
     /// radians measured from the plane's x axis.
     Circle(Circle3),
     /// An ellipse, lying in `plane`. `t` is the ellipse's own parameter, not
-    /// an angle — the two differ everywhere except on the axes.
+    /// an angle Ã¢â‚¬â€ the two differ everywhere except on the axes.
     ///
     /// Where a plane cuts a cylinder at a slant this is what they share
     /// exactly; approximating it with a circle or a spline would put the
@@ -830,7 +986,7 @@ mod tests {
 
     #[test]
     fn a_cone_holds_the_nappe_past_its_own_apex() {
-        // One record, both halves — which `ray_hits` has always said, since a
+        // One record, both halves Ã¢â‚¬â€ which `ray_hits` has always said, since a
         // ray up one side meets the other. The distance has to agree: past
         // the apex the radius grows again on the mirrored half, and reading
         // the first half's generator extended instead reports a point lying
@@ -838,7 +994,7 @@ mod tests {
         //
         // What that cost was a cone's whole wall. A seam runs from the rim to
         // the apex, the check that a curve lies on its surface samples past
-        // both ends, and the sample beyond the apex was refused — so the
+        // both ends, and the sample beyond the apex was refused Ã¢â‚¬â€ so the
         // face's boundary could not be projected and nothing of it was drawn.
         let surface = Surface::Cone(Cone {
             base: xy(),

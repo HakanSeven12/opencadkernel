@@ -64,7 +64,9 @@ pub use blend::{chamfer, chamfer_edges, fillet, fillet_edges, presspull, Chamfer
 pub use boolean::{combine, Operation};
 pub use bounds::{body_bounds, face_bounds, operation_tolerance, Aabb};
 pub use classify::{contains_point, Containment};
-pub use geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
+pub use geometry::{
+    Circle3, Cone, Curve3, Cylinder, Ellipse3, EllipticCone, Line3, Sphere, Surface, Torus,
+};
 pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};
 pub use loft::loft;
@@ -104,7 +106,7 @@ pub use topology::{
 /// A node's origin in the document it was lifted from.
 ///
 /// Opaque here on purpose: this layer knows a node came from record *n* of
-/// something, not what a record is. The format layer owns the mapping — see
+/// something, not what a record is. The format layer owns the mapping Ã¢â‚¬â€ see
 /// the `acis` module.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceRef(u32);

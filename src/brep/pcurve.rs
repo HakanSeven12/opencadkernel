@@ -148,6 +148,41 @@ pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curv
             _ => sampled_closed_conic(surface, curve),
         },
 
+        // The same two shapes on an elliptical cone: a rim keeps its height
+        // exactly as a circle's does on a circular one, and a generator stays
+        // at one longitude — the straight world line both ends' radii run
+        // down, since major and minor both shrink by the same proportion of
+        // the way up. The longitude itself is read after the section's own
+        // stretching: `atan2` over the plain frame would fold the ellipse
+        // back onto a circle's measure and put the seam in the wrong place.
+        Surface::EllipticCone(cone) => match curve {
+            Curve3::Ellipse(ellipse) => {
+                let axis = Vec3::from(cone.base.normal()?);
+                let plane_normal = Vec3::from(ellipse.plane.normal()?);
+                if !plane_normal.is_parallel_to(axis, tolerance) {
+                    return None;
+                }
+                let height =
+                    (Vec3::from(ellipse.plane.origin) - Vec3::from(cone.base.origin)).dot(axis);
+                Some(band_at(height))
+            }
+            Curve3::Line(line) => {
+                let longitude = |point: [f64; 3]| {
+                    let local = cone.base.project(point)?;
+                    Some((local[1] / cone.ratio). atan2(local[0]))
+                };
+                let start = longitude(line.origin)?;
+                let further =
+                    longitude((Vec3::from(line.origin) + Vec3::from(line.direction)).to_array())?;
+                let turn = (further - start).abs();
+                if turn.min(TAU - turn) > tolerance {
+                    return None;
+                }
+                Some(generator_at(start))
+            }
+            _ => None,
+        },
+
         // A torus closes both ways, so both families of circles on it are
         // straight in `(u, v)`: the parallels, which run round the ring at
         // one place on the tube, and the meridians, which run round the tube
@@ -663,7 +698,9 @@ fn meridian_at(angle: f64) -> Curve {
 pub(crate) fn periods(surface: &Surface) -> [Option<f64>; 2] {
     match surface {
         Surface::Plane(_) => [None, None],
-        Surface::Cylinder(_) | Surface::Cone(_) | Surface::Sphere(_) => [Some(TAU), None],
+        Surface::Cylinder(_) | Surface::Cone(_) | Surface::EllipticCone(_) | Surface::Sphere(_) => {
+            [Some(TAU), None]
+        }
         Surface::Torus(_) => [Some(TAU), Some(TAU)],
         Surface::Nurbs(surface) => {
             let ((u0, u1), (v0, v1)) = surface.domain();

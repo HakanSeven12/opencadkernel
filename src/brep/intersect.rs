@@ -168,7 +168,7 @@ fn revolution_profile(
                 Profile::Circle { centre: [-major, height], radius: minor },
             ]
         }
-        Surface::Nurbs(_) => return None,
+        Surface::EllipticCone(_) | Surface::Nurbs(_) => return None,
     })
 }
 
