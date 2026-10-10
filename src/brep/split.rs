@@ -1759,6 +1759,7 @@ fn onto_both(edge: &Curve3, cutter: &Curve3, point: [f64; 3], tolerance: f64) ->
             / (2.0 * step)
     };
     let (mut s, mut t) = (edge.parameter_at(point), cutter.parameter_at(point));
+    let first_gap = Vec3::from(point).distance(Vec3::from(cutter.point_at(t)));
     for _ in 0..32 {
         let gap = Vec3::from(edge.point_at(s)) - Vec3::from(cutter.point_at(t));
         if gap.length() <= tolerance * 0.01 {
@@ -1775,9 +1776,12 @@ fn onto_both(edge: &Curve3, cutter: &Curve3, point: [f64; 3], tolerance: f64) ->
         t -= (aa * rb - ab * ra) / det;
     }
     let landed = edge.point_at(s);
-    // A step that ran off to another crossing is no refinement.
+    // A step that ran off to another crossing is no refinement. A traced
+    // cutter passes the edge to within its fit, a little more than the
+    // tolerance, still far nearer than the sampled crossing was.
+    let gap = Vec3::from(landed).distance(Vec3::from(cutter.point_at(t)));
     if Vec3::from(landed).distance(Vec3::from(point)) > 0.1 * Vec3::from(point).length().max(1.0)
-        || Vec3::from(landed).distance(Vec3::from(cutter.point_at(t))) > tolerance
+        || (gap > tolerance && gap * 100.0 > first_gap)
     {
         return point;
     }

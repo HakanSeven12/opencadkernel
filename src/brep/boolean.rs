@@ -1478,4 +1478,33 @@ mod tests {
         assert!(before.iter().all(|forward| *forward), "the input was all forward");
         assert!(flipped > 0, "nothing was turned around");
     }
+
+    #[test]
+    fn a_rounded_boss_meets_a_copy_moved_up_and_across() {
+        // A cylinder rounded into its top: the copy's round crosses the top
+        // where the original's own round meets it, a traced curve touching
+        // the top's circle at two points with a lens between.
+        let plain = cylinder([0.0; 3], 1.0, 0.6).unwrap();
+        let rim = plain
+            .edges
+            .iter()
+            .find(|(_, edge)| {
+                matches!(plain.curves.get(edge.curve),
+                    Some(Curve3::Circle(circle)) if circle.plane.origin[2] > 0.3)
+            })
+            .map(|(key, _)| key)
+            .unwrap();
+        let boss = crate::brep::fillet_edges(&plain, &[rim], 0.3).unwrap();
+        let moved = crate::brep::transform(
+            &boss,
+            &crate::brep::Placement::at([0.37, 0.11, 0.23]),
+        )
+        .unwrap();
+        let volume = |body: &Body| crate::brep::mass_properties(body).unwrap().volume;
+        let tolerance = 2e-7;
+        let union = combine(boss.clone(), moved.clone(), Operation::Union, tolerance).unwrap();
+        let common = combine(boss.clone(), moved, Operation::Intersection, tolerance).unwrap();
+        let both = volume(&union) + volume(&common);
+        assert!((both - 2.0 * volume(&boss)).abs() < 1e-4 * both, "{both}");
+    }
 }

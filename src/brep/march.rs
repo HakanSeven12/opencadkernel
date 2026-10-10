@@ -91,7 +91,24 @@ pub(super) fn traced(
             if walk.closed {
                 NurbsCurve3::interpolate_periodic(&points, Parameterization::Chord)
             } else {
-                NurbsCurve3::interpolate_fit(&points, None, None, Parameterization::Chord)
+                // Each end runs the way the meeting heads there, not the way
+                // a free end of the spline would swing: a cut lands near an
+                // end, where that swing was most of the fit's error.
+                let end = |at: usize, towards: usize| -> Option<[f64; 3]> {
+                    let (point, next) = (Vec3::from(points[at]), Vec3::from(points[towards]));
+                    let along = heading(one, other, point)?;
+                    let sign = if along.dot(next - point) < 0.0 { -1.0 } else { 1.0 };
+                    let sign = if at == 0 { sign } else { -sign };
+                    Some((along * sign).to_array())
+                };
+                let last = points.len() - 1;
+                let (first_tangent, last_tangent) = (end(0, 1), end(last, last - 1));
+                NurbsCurve3::interpolate_fit(
+                    &points,
+                    first_tangent,
+                    last_tangent,
+                    Parameterization::Chord,
+                )
             }
             .map(Curve3::Nurbs)
         })

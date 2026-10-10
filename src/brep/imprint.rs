@@ -267,29 +267,137 @@ fn separate_pinched_loops(body: &mut Body, tolerance: f64) {
         let Some(starts) = starts else {
             continue;
         };
-        // A loop using an edge twice — a seam, a bridge to a hole — comes
-        // back through its corners by that edge, not round a second region.
-        let edges: HashSet<_> =
-            coedges.iter().filter_map(|coedge| body.coedges.get(*coedge)).map(|c| c.edge).collect();
-        if edges.len() != coedges.len() {
+        let Some(edges) = coedges
+            .iter()
+            .map(|coedge| body.coedges.get(*coedge).map(|coedge| coedge.edge))
+            .collect::<Option<Vec<_>>>()
+        else {
             continue;
-        }
+        };
+        // A loop using an edge twice — a seam, a bridge to a hole — comes
+        // back through its corners by that edge, not round a second region:
+        // a part taking one use of it and leaving the other is no lobe.
+        let keeps_pairs = |first: usize, second: usize| {
+            edges.iter().enumerate().all(|(index, edge)| {
+                let inside = |at: usize| (first..second).contains(&at);
+                edges
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, twin)| *other != index && *twin == edge)
+                    .all(|(other, _)| inside(other) == inside(index))
+            })
+        };
         // Each corner passed twice is a place the loop may come apart;
         // the first where both parts are regions of their own is taken.
         let pairs: Vec<(usize, usize)> = (0..starts.len())
             .flat_map(|first| (first + 1..starts.len()).map(move |second| (first, second)))
             .filter(|(first, second)| starts[*first] == starts[*second])
+            .filter(|(first, second)| keeps_pairs(*first, *second))
             .collect();
+        let mut split = None;
         for (first, second) in pairs {
             let pair = (first, second);
-            let Some(other) = split_lobe(body, face, &node, ring, &coedges, pair, tolerance) else {
-                continue;
-            };
+            if let Some(other) = split_lobe(body, face, &node, ring, &coedges, pair, tolerance) {
+                split = Some(other);
+                break;
+            }
+        }
+        // A cutter touching an edge of the face at two points, a lens
+        // between: the loop passes each touch twice, the lens's two sides
+        // apart in it, with the rest of the loop between them on one side
+        // and round the far side of a seam on the other.
+        if split.is_none() {
+            let count = starts.len();
+            let mut nested = Vec::new();
+            for p1 in 0..count {
+                for p2 in p1 + 3..count {
+                    if starts[p1] != starts[p2] {
+                        continue;
+                    }
+                    for q1 in p1 + 1..p2 {
+                        for q2 in q1 + 1..p2 {
+                            if starts[q1] == starts[q2] && starts[q1] != starts[p1] {
+                                nested.push([p1, q1, q2, p2]);
+                            }
+                        }
+                    }
+                }
+            }
+            split = nested.into_iter().find_map(|corners| {
+                lens_round_seam(body, face, ring, &coedges, corners, tolerance)
+            });
+        }
+        if let Some(other) = split {
             pending.push(face);
             pending.push(other);
-            break;
         }
     }
+}
+
+/// The lens of a loop passing two corners twice each, nested, cut off as a
+/// face of its own; the two runs left join round the seam they each cross
+/// once, the seam edge going. Nothing changes and `None` comes back unless
+/// both parts are regions wound alike.
+fn lens_round_seam(
+    body: &mut Body,
+    face: FaceKey,
+    ring: LoopKey,
+    coedges: &[CoedgeKey],
+    [p1, q1, q2, p2]: [usize; 4],
+    tolerance: f64,
+) -> Option<FaceKey> {
+    let lens: Vec<CoedgeKey> = coedges[p1..q1].iter().chain(&coedges[q2..p2]).copied().collect();
+    let inner: Vec<CoedgeKey> = coedges[q1..q2].to_vec();
+    let outer: Vec<CoedgeKey> = coedges[p2..].iter().chain(&coedges[..p1]).copied().collect();
+    let edge_of = |coedge: &CoedgeKey| body.coedges.get(*coedge).map(|coedge| coedge.edge);
+    // The seam: one edge, used once in each run.
+    let (outer_at, inner_at) = outer.iter().enumerate().find_map(|(index, coedge)| {
+        let edge = edge_of(coedge)?;
+        let other = inner.iter().position(|twin| edge_of(twin) == Some(edge))?;
+        let uses = body.edges.get(edge)?.coedges.len();
+        (uses == 2).then_some((index, other))
+    })?;
+    let seam = edge_of(&outer[outer_at])?;
+    // The inner run from just past its seam use round to just before it
+    // goes where the outer run's seam use went.
+    let mut joined: Vec<CoedgeKey> = outer[..outer_at].to_vec();
+    joined.extend(inner[inner_at + 1..].iter().chain(&inner[..inner_at]));
+    joined.extend(&outer[outer_at + 1..]);
+    let mut trial = body.clone();
+    let node = trial.faces.get(face)?.clone();
+    let lens_face = trial.faces.insert(Face {
+        loops: Vec::new(),
+        provenance: Provenance::Synthesized,
+        ..node.clone()
+    });
+    let lens_ring = trial.loops.insert(Loop {
+        coedges: lens.clone(),
+        owner: lens_face,
+        provenance: Provenance::Synthesized,
+    });
+    for coedge in &lens {
+        trial.coedges.get_mut(*coedge)?.owner = lens_ring;
+    }
+    trial.faces.get_mut(lens_face)?.loops = vec![lens_ring];
+    trial.loops.get_mut(ring)?.coedges = joined;
+    for coedge in [outer[outer_at], inner[inner_at]] {
+        trial.coedges.remove(coedge);
+    }
+    trial.edges.remove(seam);
+    trial.shells.get_mut(node.owner)?.faces.push(lens_face);
+    let area = |face: FaceKey| {
+        super::pcurve::face_boundary_parts(&trial, face, tolerance).map_or(0.0, |parts| {
+            parts.iter().map(|(_, part)| part.enclosed_area()).sum::<f64>()
+        })
+    };
+    if area(face) * area(lens_face) <= 0.0 || !trial.validate().is_empty() {
+        return None;
+    }
+    if let Some(node) = trial.faces.get_mut(face) {
+        node.provenance.soil();
+    }
+    *body = trial;
+    Some(lens_face)
 }
 
 /// [`separate_pinched_loops`] at one corner the loop passes twice: the
