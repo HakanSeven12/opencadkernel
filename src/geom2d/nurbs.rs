@@ -267,22 +267,35 @@ impl NurbsCurve {
         // rather than Newton: it needs no derivative and cannot diverge where
         // the curve doubles back on itself.
         let step = 1.0 / coarse as f64;
-        let (mut low, mut high) = ((best - step).max(0.0), (best + step).min(1.0));
-        for _ in 0..60 {
-            if high - low < 1e-15 {
-                break;
+        let narrow = |mut low: f64, mut high: f64| {
+            let mut best = (low + high) * 0.5;
+            for _ in 0..60 {
+                if high - low < 1e-15 {
+                    break;
+                }
+                let third = (high - low) / 3.0;
+                let left = low + third;
+                let right = high - third;
+                if distance_at(left) < distance_at(right) {
+                    high = right;
+                } else {
+                    low = left;
+                }
+                best = (low + high) * 0.5;
             }
-            let third = (high - low) / 3.0;
-            let left = low + third;
-            let right = high - third;
-            if distance_at(left) < distance_at(right) {
-                high = right;
-            } else {
-                low = left;
+            best.clamp(0.0, 1.0)
+        };
+        let found = narrow((best - step).max(0.0), (best + step).min(1.0));
+        // A closed curve's two ends are one sample, and the nearer one won
+        // only the tie: a point just before the end would be narrowed
+        // against the start and pinned there.
+        if (best == 0.0 || best == 1.0) && self.is_closed() {
+            let other = if best == 0.0 { narrow(1.0 - step, 1.0) } else { narrow(0.0, step) };
+            if distance_at(other) < distance_at(found) {
+                return other;
             }
-            best = (low + high) * 0.5;
         }
-        best.clamp(0.0, 1.0)
+        found
     }
 
     /// Samples the curve, giving every knot span at least `per_span` pieces.
@@ -958,6 +971,27 @@ mod tests {
             Some(vec![1.0, weight, 1.0]),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_point_just_short_of_a_closed_curves_end_projects_there() {
+        // Four rational quarters round a unit circle, starting and ending at
+        // (1, 0): the end sample ties with the start, and a point a hair
+        // before the seam must not be pinned to it.
+        let w = std::f64::consts::FRAC_PI_4.cos();
+        let circle = NurbsCurve::new(
+            2,
+            vec![
+                [1.0, 0.0], [1.0, -1.0], [0.0, -1.0], [-1.0, -1.0], [-1.0, 0.0],
+                [-1.0, 1.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0],
+            ],
+            vec![0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0],
+            Some(vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0]),
+        )
+        .unwrap();
+        let below = [0.03_f64.cos(), 0.03_f64.sin()];
+        let t = circle.parameter_at(below);
+        assert!(close(circle.point_at(t), below, 1e-9), "{t}");
     }
 
     #[test]

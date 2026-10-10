@@ -608,21 +608,37 @@ impl NurbsCurve3 {
         } else {
             (best.saturating_sub(1) as f64, (best + 1).min(steps) as f64)
         };
-        let mut low = from + (to - from) * below / steps as f64;
-        let mut high = from + (to - from) * above / steps as f64;
         // Down to rounding: a corner placed on the curve is found on it again
         // within a modelling tolerance, not a sampling one.
-        for _ in 0..64 {
-            let third = (high - low) / 3.0;
-            let one = low + third;
-            let two = high - third;
-            if distance(one) <= distance(two) {
-                high = two;
+        let narrow = |below: f64, above: f64| {
+            let mut low = from + (to - from) * below / steps as f64;
+            let mut high = from + (to - from) * above / steps as f64;
+            for _ in 0..64 {
+                let third = (high - low) / 3.0;
+                let one = low + third;
+                let two = high - third;
+                if distance(one) <= distance(two) {
+                    high = two;
+                } else {
+                    low = one;
+                }
+            }
+            wrap_parameter(0.5 * (low + high), from, to, self.closed)
+        };
+        let found = narrow(below, above);
+        // Clamped but closed, its two ends are one sample and the start won
+        // only the tie: a point just short of the end is narrowed there too.
+        if !self.closed && (best == 0 || best == steps) && self.is_closed() {
+            let other = if best == 0 {
+                narrow(steps as f64 - 1.0, steps as f64)
             } else {
-                low = one;
+                narrow(0.0, 1.0)
+            };
+            if distance(other) < distance(found) {
+                return other;
             }
         }
-        wrap_parameter(0.5 * (low + high), from, to, self.closed)
+        found
     }
 
     /// Solve tangency from an external point near a knot-parameter seed.
@@ -1386,6 +1402,25 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_point_just_short_of_a_clamped_loops_end_projects_there() {
+        let w = std::f64::consts::FRAC_PI_4.cos();
+        let circle = NurbsCurve3::new(
+            2,
+            vec![
+                [1.0, 0.0, 0.0], [1.0, -1.0, 0.0], [0.0, -1.0, 0.0], [-1.0, -1.0, 0.0],
+                [-1.0, 0.0, 0.0], [-1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [1.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ],
+            vec![0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0],
+            Some(vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0]),
+        )
+        .unwrap();
+        let below = [0.01_f64.cos(), 0.01_f64.sin(), 0.0];
+        let on = circle.point_at_knot(circle.parameter_at(below));
+        assert!(Vec3::from(on).distance(Vec3::from(below)) < 1e-9, "{on:?}");
+    }
 
     fn helix_points() -> Vec<[f64; 3]> {
         vec![
