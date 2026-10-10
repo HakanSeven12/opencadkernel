@@ -255,14 +255,15 @@ pub fn chamfer_edges(
             LocalError::InvalidResult => ChamferError::InvalidResult,
         });
     }
-    if let Some(result) = super::chamfer_prismatic::chamfer_prismatic(
+    let prismatic = super::chamfer_prismatic::chamfer_prismatic(
         body,
         &selected,
         base_face,
         base_distance,
         other_distance,
-    ) {
-        return result;
+    );
+    if let Some(Ok(result)) = prismatic {
+        return Ok(result);
     }
     let tolerance = operation_tolerance(&[body]);
     if is_open_sheet(body) {
@@ -276,7 +277,8 @@ pub fn chamfer_edges(
         );
     }
     let distances = (base_distance, other_distance);
-    let convex = chamfer_convex(body, &selected, base_face, distances, tolerance);
+    let convex = prismatic
+        .unwrap_or_else(|| chamfer_convex(body, &selected, base_face, distances, tolerance));
     // A body the convex solver cannot rebuild may still take a local cut.
     let Err(error) = convex else { return convex };
     let local = LocalBlend::Chamfer { base_face, base: base_distance, other: other_distance };
@@ -1738,7 +1740,14 @@ fn existing_corners(body: &Body) -> Option<Vec<(Halfspace, Sphere)>> {
         let origin = points[0];
         if points.iter().any(|point| normal.dot(*point - origin).abs() > tolerance
             || (point.distance(centre) - sphere.radius).abs() > tolerance) { return None; }
-        corners.push((Halfspace { origin, normal, offset: normal.dot(origin), added: true }, *sphere));
+        // Framed as a new corner is, poles and seam off the patch: a file's
+        // frame may put a pole on a corner, which meshes only through the
+        // file's own parameter curves, gone once the face is rebuilt.
+        let pole = (points[0] - points[1]).normalize()?;
+        let frame = Plane::orthonormal(sphere.frame.origin, normal.to_array(), pole.to_array())?;
+        let sphere = Sphere { frame, radius: sphere.radius };
+        let plane = Halfspace { origin, normal, offset: normal.dot(origin), added: true };
+        corners.push((plane, sphere));
     }
     Some(corners)
 }
