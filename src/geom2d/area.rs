@@ -72,6 +72,22 @@ impl Curve {
         }
     }
 
+    /// This curve's share of a closed chain's area: [`Self::enclosed_area`],
+    /// except that an open polyline is not closed by its own chord. A face's
+    /// boundary pieces, summed round each loop, give the area inside it.
+    pub fn chain_area(&self) -> f64 {
+        match self {
+            Self::Polyline(polyline) if !polyline.closed && polyline.vertices.len() >= 2 => {
+                let (first, last) = (
+                    polyline.vertices[0].position,
+                    polyline.vertices[polyline.vertices.len() - 1].position,
+                );
+                polyline_area(polyline) - 0.5 * Vec2::from(last).cross(Vec2::from(first))
+            }
+            _ => self.enclosed_area(),
+        }
+    }
+
     /// Area obtained by closing a bounded curve with the straight chord from
     /// its end point back to its start point.
     ///
@@ -369,6 +385,22 @@ mod tests {
             closed: false,
         });
         assert!((three_sides.enclosed_area() - 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn an_open_polyline_shares_a_chain_without_its_chord() {
+        // Three sides of the square as one piece and the fourth as another:
+        // their shares of the chain add up to the square.
+        let vertex = |position| PolylineVertex { position, bulge: 0.0 };
+        let three_sides = Curve::Polyline(Polyline {
+            vertices: [[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]
+                .into_iter()
+                .map(vertex)
+                .collect(),
+            closed: false,
+        });
+        let last = Curve::Line(Line { start: [0.0, 10.0], end: [0.0, 0.0] });
+        assert!((three_sides.chain_area() + last.chain_area() - 100.0).abs() < 1e-9);
     }
 
     #[test]

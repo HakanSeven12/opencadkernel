@@ -92,9 +92,9 @@ pub fn extrude(plane: Plane, profile: &[Curve2], direction: [f64; 3]) -> Option<
         .zip(&senses)
         .map(|(piece, forwards)| {
             if *forwards {
-                piece.enclosed_area()
+                piece.chain_area()
             } else {
-                -piece.enclosed_area()
+                -piece.chain_area()
             }
         })
         .sum();
@@ -372,7 +372,7 @@ pub fn extrude_tapered(
     let signed_area = profile
         .iter()
         .zip(&senses)
-        .map(|(piece, forward)| piece.enclosed_area() * if *forward { 1.0 } else { -1.0 })
+        .map(|(piece, forward)| piece.chain_area() * if *forward { 1.0 } else { -1.0 })
         .sum::<f64>();
     if !signed_area.is_finite() || signed_area.abs() <= 1e-12 {
         return None;
@@ -411,7 +411,7 @@ pub fn extrude_tapered(
                 Curve2::Polyline(polyline.clone())
                     .segments()
                     .iter()
-                    .map(Curve2::enclosed_area)
+                    .map(Curve2::chain_area)
                     .sum::<f64>()
                     .abs()
             };
@@ -453,7 +453,7 @@ pub fn extrude_tapered(
         let top_area = top_profile
             .iter()
             .zip(top_senses)
-            .map(|(piece, forward)| piece.enclosed_area() * if forward { 1.0 } else { -1.0 })
+            .map(|(piece, forward)| piece.chain_area() * if forward { 1.0 } else { -1.0 })
             .sum::<f64>();
         if !top_area.is_finite() || top_area.abs() >= signed_area.abs() {
             return None;
@@ -2511,9 +2511,9 @@ pub fn revolve(
         .zip(&senses)
         .map(|(piece, forwards)| {
             if *forwards {
-                piece.enclosed_area()
+                piece.chain_area()
             } else {
-                -piece.enclosed_area()
+                -piece.chain_area()
             }
         })
         .sum();

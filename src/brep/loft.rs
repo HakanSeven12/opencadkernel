@@ -192,7 +192,7 @@ fn curved_loft(sections: &[(Plane, Vec<Curve>)]) -> Option<Body> {
         .1
         .iter()
         .zip(&first_senses)
-        .map(|(piece, forward)| piece.enclosed_area() * if *forward { 1.0 } else { -1.0 })
+        .map(|(piece, forward)| piece.chain_area() * if *forward { 1.0 } else { -1.0 })
         .sum::<f64>();
     if !first_area.is_finite() || first_area.abs() <= 1e-12 {
         return None;

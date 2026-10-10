@@ -2341,7 +2341,7 @@ fn prepare_wires(wires: &[Vec<Curve>]) -> Option<Vec<Wire>> {
         let origin = source[0].point_at(0.0);
         let shift = Transform::translation([-origin[0], -origin[1]]);
         let area = source.iter().zip(&senses)
-            .map(|(piece, forward)| Some(piece.transformed(&shift)?.enclosed_area()
+            .map(|(piece, forward)| Some(piece.transformed(&shift)?.chain_area()
                 * if *forward { 1.0 } else { -1.0 }))
             .collect::<Option<Vec<_>>>()?.into_iter().sum::<f64>();
         if closed && (!area.is_finite() || area.abs() <= 1e-14) { return None; }

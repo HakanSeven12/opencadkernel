@@ -387,7 +387,7 @@ fn lens_round_seam(
     trial.shells.get_mut(node.owner)?.faces.push(lens_face);
     let area = |face: FaceKey| {
         super::pcurve::face_boundary_parts(&trial, face, tolerance).map_or(0.0, |parts| {
-            parts.iter().map(|(_, part)| part.enclosed_area()).sum::<f64>()
+            parts.iter().map(|(_, part)| part.chain_area()).sum::<f64>()
         })
     };
     if area(face) * area(lens_face) <= 0.0 || !trial.validate().is_empty() {
@@ -443,7 +443,7 @@ fn split_lobe(
     // other way is a hole the loop dips into, not a second region.
     let area = |face: FaceKey| {
         super::pcurve::face_boundary_parts(body, face, tolerance).map_or(0.0, |parts| {
-            parts.iter().map(|(_, part)| part.enclosed_area()).sum::<f64>()
+            parts.iter().map(|(_, part)| part.chain_area()).sum::<f64>()
         })
     };
     let closes = |face: FaceKey| {

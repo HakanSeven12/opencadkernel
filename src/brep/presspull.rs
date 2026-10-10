@@ -72,7 +72,7 @@ pub fn planar_face_profile(body: &Body, key: FaceKey) -> Option<PlanarFaceProfil
     // A face's loops come in no order; the one enclosing the rest is the
     // one enclosing the most.
     let area =
-        |ring: &Vec<Curve>| ring.iter().map(|curve| curve.enclosed_area()).sum::<f64>().abs();
+        |ring: &Vec<Curve>| ring.iter().map(|curve| curve.chain_area()).sum::<f64>().abs();
     let outer = (0..loops.len()).max_by(|a, b| area(&loops[*a]).total_cmp(&area(&loops[*b])));
     if let Some(outer) = outer {
         loops.swap(0, outer);
@@ -1893,7 +1893,7 @@ fn curve_span(
 }
 
 fn boundary_area(curves: &[Curve]) -> f64 {
-    curves.iter().map(Curve::enclosed_area).sum()
+    curves.iter().map(Curve::chain_area).sum()
 }
 
 #[cfg(test)]
