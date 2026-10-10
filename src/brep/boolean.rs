@@ -65,10 +65,18 @@ pub fn combine(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body,
         Some((super::transform(&a, &there)?, super::transform(&b, &there)?, centre))
     });
     let Some((a, b, centre)) = moved else {
-        return combine_here(a, b, how, tolerance);
+        return combine_retried(a, b, how, tolerance);
     };
-    let result = combine_here(a, b, how, tolerance)?;
+    let result = combine_retried(a, b, how, tolerance)?;
     super::transform(&result, &Placement::at(centre.to_array())).ok_or(Snag::CutRefused)
+}
+
+/// [`combine_here`], tried once more with the tolerance opened up tenfold
+/// where it refuses: cuts landing a hair apart, a hair from a corner, read
+/// as one.
+fn combine_retried(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+    combine_here(a.clone(), b.clone(), how, tolerance)
+        .or_else(|snag| combine_here(a, b, how, tolerance * 10.0).map_err(|_| snag))
 }
 
 fn combine_here(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
