@@ -153,11 +153,12 @@ fn face_hits(
         {
             return None;
         }
-        if pcurve::contains_parameter(
+        if pcurve::contains_parameter_facing(
             surface,
             &boundary,
             [u, v],
             Tolerance::new(tolerance),
+            node.forward,
         ) {
             out.push(distance);
         }
@@ -215,11 +216,12 @@ pub(super) fn face_distance(
     // boundary.
     let boundary = pcurve::face_boundary(body, face, tolerance)?;
     let (u, v) = surface.parameters_at(point)?;
-    if pcurve::contains_parameter(
+    if pcurve::contains_parameter_facing(
         surface,
         &boundary,
         [u, v],
         Tolerance::new(tolerance),
+        node.forward,
     ) {
         Some(gap)
     } else {

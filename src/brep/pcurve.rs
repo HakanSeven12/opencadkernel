@@ -751,6 +751,106 @@ pub(crate) fn contains_parameter(
     })
 }
 
+/// [`contains_parameter`] for a face whose loops run as `forward` says: a
+/// band round a torus's tube — rims wrapping round `v`, the face running
+/// between them along `u` — is one of the two stretches of `u` the rims
+/// part, and only which way the rims run tells which.
+pub(crate) fn contains_parameter_facing(
+    surface: &Surface,
+    boundary: &[Curve],
+    point: [f64; 2],
+    tolerance: crate::geom2d::Tolerance,
+    forward: bool,
+) -> bool {
+    tube_band_side(periods(surface), boundary, point, tolerance, forward)
+        .unwrap_or_else(|| contains_parameter(surface, boundary, point, tolerance))
+}
+
+/// Inside a band round a torus's tube: the boundary first met going on
+/// along `u` keeps the face on its left in a forward face, so the point is
+/// inside when that boundary runs up `v` there. `None` for any other face.
+fn tube_band_side(
+    periods: [Option<f64>; 2],
+    boundary: &[Curve],
+    point: [f64; 2],
+    tolerance: crate::geom2d::Tolerance,
+    forward: bool,
+) -> Option<bool> {
+    let [Some(u_period), Some(v_period)] = periods else {
+        return None;
+    };
+    // Loops end where the next piece does not take up; a rim's ends are a
+    // turn of `v` apart.
+    let joined =
+        |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= u_period * 1e-3;
+    let mut rims = 0;
+    let mut loop_start = 0;
+    for (index, curve) in boundary.iter().enumerate() {
+        let end = curve.point_at(1.0);
+        if boundary.get(index + 1).is_some_and(|next| joined(next.point_at(0.0), end)) {
+            continue;
+        }
+        let start = boundary[loop_start].point_at(0.0);
+        let (du, dv) = ((end[0] - start[0]).abs(), (end[1] - start[1]).abs());
+        if (dv - v_period).abs() <= v_period * 1e-3 && du <= u_period * 1e-3 {
+            rims += 1;
+        } else if !joined(start, end) {
+            return None;
+        }
+        loop_start = index + 1;
+    }
+    if rims < 2 {
+        return None;
+    }
+    let ray = Curve::Line(Line { start: point, end: [point[0] + u_period, point[1]] });
+    let mut nearest: Option<(f64, bool)> = None;
+    for curve in boundary {
+        // A piece's box from samples, grown for what bulges between them:
+        // only the turns that bring it across the ray are tried.
+        let (mut low, mut high) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for sample in (0..=16).map(|step| curve.point_at(step as f64 / 16.0)) {
+            for axis in 0..2 {
+                low[axis] = low[axis].min(sample[axis]);
+                high[axis] = high[axis].max(sample[axis]);
+            }
+        }
+        let pad = (high[0] - low[0]).hypot(high[1] - low[1]) * 0.05 + u_period * 1e-3;
+        for u_turn in -2..=2 {
+            let shift_u = u_turn as f64 * u_period;
+            if high[0] + shift_u < point[0] - pad || low[0] + shift_u > point[0] + u_period + pad {
+                continue;
+            }
+            for v_turn in -1..=1 {
+                let shift = [shift_u, v_turn as f64 * v_period];
+                if high[1] + shift[1] < point[1] - pad || low[1] + shift[1] > point[1] + pad {
+                    continue;
+                }
+                let moved = |at: f64| {
+                    let p = curve.point_at(at.clamp(0.0, 1.0));
+                    [p[0] + shift[0], p[1] + shift[1]]
+                };
+                let by = crate::geom2d::Transform::translation(shift);
+                let Some(image) = curve.transformed(&by) else { continue };
+                for crossing in crate::geom2d::intersect(&ray, &image, tolerance) {
+                    let along = crossing.point[0] - point[0];
+                    if along <= tolerance.linear() {
+                        continue;
+                    }
+                    let step = 1e-4;
+                    let up = moved(crossing.t_b + step)[1] - moved(crossing.t_b - step)[1];
+                    if up == 0.0 {
+                        return None;
+                    }
+                    if nearest.is_none_or(|(seen, _)| along < seen) {
+                        nearest = Some((along, up > 0.0));
+                    }
+                }
+            }
+        }
+    }
+    nearest.map(|(_, up)| up == forward)
+}
+
 /// A cone face running up to its apex along a seam has no edge there: in
 /// `(u, v)` its loop stops at one end of the apex line and goes on from the
 /// other, an open chain no polygon test reads. The apex line closes it.
@@ -1074,7 +1174,7 @@ mod tests {
     use crate::brep::geometry::{Circle3, Cone, Cylinder, Ellipse3, Line3, Sphere};
     use crate::geom2d::{NurbsCurve, Vec2};
     use crate::space::Plane;
-    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4};
+    use std::f64::consts::{FRAC_PI_2, FRAC_PI_4, PI};
 
     const TOL: f64 = 1e-9;
 
@@ -1376,5 +1476,20 @@ mod tests {
             .expect("a clockwise full circle has an exact projection");
         assert!(matches!(whole, Curve::Nurbs(_)));
         assert!(Vec2::from(whole.point_at(0.25)).distance(Vec2::from([0.0, -2.0])) < TOL);
+    }
+
+    #[test]
+    fn a_band_round_a_torus_tube_is_the_stretch_its_rims_keep() {
+        // Rims round the tube at u = -π (going up v) and u = 2.4 (going
+        // down): the forward face is u from 2.4 on to π, not back to -π.
+        let line = |start, end| Curve::Line(Line { start, end });
+        let boundary = [line([-PI, -1.0], [-PI, TAU - 1.0]), line([2.4, 0.0], [2.4, -TAU])];
+        let periods = [Some(TAU), Some(TAU)];
+        let tolerance = crate::geom2d::Tolerance::new(1e-9);
+        let side =
+            |u: f64, forward| tube_band_side(periods, &boundary, [u, 0.3], tolerance, forward);
+        assert_eq!(side(1.6, true), Some(false));
+        assert_eq!(side(2.9, true), Some(true));
+        assert_eq!(side(1.6, false), Some(true));
     }
 }

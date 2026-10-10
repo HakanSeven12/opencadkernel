@@ -202,7 +202,7 @@ impl Mesh {
     }
 }
 
-fn principal_axes(mut matrix: [[f64; 3]; 3]) -> ([f64; 3], [f64; 9]) {
+pub(super) fn principal_axes(mut matrix: [[f64; 3]; 3]) -> ([f64; 3], [f64; 9]) {
     let mut vectors = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     for _ in 0..24 {
         let (p, q) = [(0usize, 1usize), (0, 2), (1, 2)]

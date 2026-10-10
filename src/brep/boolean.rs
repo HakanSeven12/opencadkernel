@@ -760,11 +760,12 @@ fn interior_point_where(
         // apex line are no closed polygon, and a plain polygon test over them
         // could put a point of one half of a cut band into the other.
         (!on_edge
-            && pcurve::contains_parameter(
+            && pcurve::contains_parameter_facing(
                 surface,
                 &boundary,
                 candidate,
                 crate::geom2d::Tolerance::new(tolerance),
+                node.forward,
             )
             && accept(surface.point_at(candidate[0], candidate[1])))
         .then_some(candidate)
