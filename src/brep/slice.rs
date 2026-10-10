@@ -377,8 +377,16 @@ fn cap_regions(
         }
         rings.push(ring);
     }
-    // Each ring as a polygon in the plane, turning round `outward`.
+    // Each ring as a polygon in the plane, turning round `outward`, measured
+    // from a corner of the first: at survey coordinates the areas otherwise
+    // cancel down to a few bits.
     let axes = (Vec3::from(plane.x_axis), Vec3::from(plane.y_axis));
+    let origin = rings
+        .first()
+        .and_then(|ring| ring.first())
+        .and_then(|(edge, _)| body.edges.get(*edge))
+        .and_then(|edge| body.vertices.get(edge.start))
+        .map_or(Vec3::from(plane.origin), |vertex| Vec3::from(vertex.point));
     let facing = Vec3::from(plane.normal().ok_or(Snag::CutRefused)?).dot(outward).signum();
     let polygon = |ring: &[(EdgeKey, bool)]| -> Option<Vec<[f64; 2]>> {
         let mut points = Vec::new();
@@ -391,6 +399,7 @@ fn cap_regions(
                 let point = Vec3::from(curve.point_at(
                     node.start_parameter + (node.end_parameter - node.start_parameter) * t,
                 ));
+                let point = point - origin;
                 points.push([point.dot(axes.0), point.dot(axes.1) * facing]);
             }
         }
