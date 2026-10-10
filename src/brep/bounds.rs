@@ -67,6 +67,9 @@ impl Aabb {
     }
 
     /// Whether two boxes share any space.
+    /// A box holding nothing, overlapping no other.
+    pub const EMPTY: Self = Self { min: [f64::INFINITY; 3], max: [f64::NEG_INFINITY; 3] };
+
     pub fn overlaps(&self, other: &Self) -> bool {
         (0..3).all(|axis| self.min[axis] <= other.max[axis] && other.min[axis] <= self.max[axis])
     }

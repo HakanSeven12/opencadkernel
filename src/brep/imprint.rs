@@ -59,7 +59,22 @@ pub struct Imprint {
 ///
 /// `tolerance` is passed through to the intersection and the cutting.
 pub fn imprint(a: &mut Body, b: &mut Body, tolerance: f64) -> Result<Imprint, Snag> {
-    let meetings = shared_curves(a, b, tolerance)?;
+    imprint_reaching(a, b, tolerance, false)
+}
+
+/// [`imprint`], with `reach` a line found on a curved face cutting each
+/// body's face across all of that face rather than only where the two
+/// faces' boxes overlap: the meeting may end inside a face, where another
+/// one takes over, and a cut has to reach the face's edges. Extended so,
+/// a line also cuts slivers off beside a round's tangent edge; it is the
+/// second try.
+pub(super) fn imprint_reaching(
+    a: &mut Body,
+    b: &mut Body,
+    tolerance: f64,
+    reach: bool,
+) -> Result<Imprint, Snag> {
+    let meetings = shared_curves(a, b, tolerance, reach)?;
     let count = meetings.len();
     // Islands first, while the faces they go into are still the ones found;
     // the largest first, so one lying inside another goes into the face the
@@ -148,10 +163,14 @@ pub fn imprint(a: &mut Body, b: &mut Body, tolerance: f64) -> Result<Imprint, Sn
         .collect();
     splines.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut dropped = Vec::new();
+    // Copies only for the same body: a line kept to one body's face and the
+    // same line kept to the other's each cut their own.
+    let sides = |index: usize| found[index].map(|bounds| bounds != Some(Aabb::EMPTY));
     for (position, (length, points, index)) in splines.iter().enumerate() {
         let fit = tolerance.max(length * 1e-3);
         let copied = splines[..position].iter().any(|(_, _, longer)| {
             !dropped.contains(longer)
+                && sides(*longer) == sides(*index)
                 && points.iter().all(|point| {
                     let curve = &curves[*longer];
                     Vec3::from(curve.point_at(curve.parameter_at(*point)))
@@ -1408,7 +1427,7 @@ fn clipped_line(line: &super::geometry::Line3, near: &Aabb, far: &Aabb) -> Optio
 }
 
 /// Every curve the two bodies' faces share.
-fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag> {
+fn shared_curves(a: &Body, b: &Body, tolerance: f64, reach: bool) -> Result<Vec<Shared>, Snag> {
     let near: Vec<(FaceKey, Option<Aabb>)> =
         a.face_keys().map(|key| (key, face_bounds(a, key))).collect();
     let far: Vec<(FaceKey, Option<Aabb>)> =
@@ -1478,16 +1497,31 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64) -> Result<Vec<Shared>, Snag
                     }
                     let curved = !matches!(one_surface, Surface::Plane(_))
                         || !matches!(other_surface, Surface::Plane(_));
-                    let curves = curves
-                        .into_iter()
-                        .filter_map(|curve| match (&curve, one_box, other_box, curved) {
-                            (Curve3::Line(line), Some(near), Some(far), true) => {
-                                clipped_line(line, near, far)
+                    // A line on a curved face is kept to where the two faces'
+                    // boxes overlap; reaching, to each body's own face — the
+                    // other body's piece of it cutting nothing there.
+                    let mut kept = Vec::new();
+                    for curve in curves {
+                        match (&curve, one_box, other_box, curved, reach) {
+                            (Curve3::Line(line), Some(near), Some(far), true, false) => {
+                                kept.extend(clipped_line(line, near, far));
                             }
-                            _ => Some(curve),
-                        })
-                        .collect();
-                    out.push(Shared { curves, boxes: [*one_box, *other_box], islands: Vec::new() });
+                            (Curve3::Line(line), Some(near), Some(far), true, true) => {
+                                let empty = Some(Aabb::EMPTY);
+                                let sides =
+                                    [(near, [empty, *other_box]), (far, [*one_box, empty])];
+                                for (own, boxes) in sides {
+                                    if let Some(piece) = clipped_line(line, own, own) {
+                                        let curves = vec![piece];
+                                        out.push(Shared { curves, boxes, islands: Vec::new() });
+                                    }
+                                }
+                            }
+                            _ => kept.push(curve),
+                        }
+                    }
+                    let boxes = [*one_box, *other_box];
+                    out.push(Shared { curves: kept, boxes, islands: Vec::new() });
                 }
                 // Two faces on one surface. Where they cover exactly the same
                 // ground there is nothing to imprint — the boolean decides

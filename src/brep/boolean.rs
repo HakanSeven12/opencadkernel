@@ -25,7 +25,7 @@
 
 use super::classify::{contains_point, Containment};
 use super::geometry::{Curve3, Line3, Surface};
-use super::imprint::{imprint, Snag};
+use super::imprint::{imprint_reaching, Snag};
 use super::pcurve;
 use super::topology::{Body, CoedgeKey, EdgeKey, Face, FaceKey, Lump, Shell, VertexKey};
 use super::{Placement, Provenance};
@@ -75,15 +75,19 @@ pub fn combine(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body,
 /// where it refuses: cuts landing a hair apart, a hair from a corner, read
 /// as one.
 fn combine_retried(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
-    combine_here(a.clone(), b.clone(), how, tolerance, false)
+    combine_here(a.clone(), b.clone(), how, tolerance, false, false)
         .or_else(|snag| {
-            combine_here(a.clone(), b.clone(), how, tolerance * 10.0, false).map_err(|_| snag)
+            combine_here(a.clone(), b.clone(), how, tolerance, false, true).map_err(|_| snag)
+        })
+        .or_else(|snag| {
+            combine_here(a.clone(), b.clone(), how, tolerance * 10.0, false, false)
+                .map_err(|_| snag)
         })
         // The pair the other way round: the imprint cuts the second body
         // against the first's cuts, and the order can settle a corner. Taken
         // only where every face of it still meshes.
         .or_else(|snag| {
-            let Ok(result) = combine_here(b, a, how, tolerance, true) else {
+            let Ok(result) = combine_here(b, a, how, tolerance, true, false) else {
                 return Err(snag);
             };
             let mesh = super::mesh::tessellate(
@@ -97,13 +101,15 @@ fn combine_retried(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<B
 }
 
 /// `swapped`: the bodies come second first, which only a difference minds —
-/// the first is then the one taken away.
+/// the first is then the one taken away. `reach`: see
+/// [`imprint_reaching`].
 fn combine_here(
     mut a: Body,
     mut b: Body,
     how: Operation,
     tolerance: f64,
     swapped: bool,
+    reach: bool,
 ) -> Result<Body, Snag> {
     let (divided_a, divided_b) = (divided_sphere(&a, &b, tolerance), divided_sphere(&b, &a, tolerance));
     if let Some(divided) = divided_a {
@@ -120,7 +126,7 @@ fn combine_here(
     let shared_edges = [&a, &b]
         .iter()
         .any(|body| body.edges.iter().any(|(_, edge)| edge.coedges.len() > 2));
-    imprint(&mut a, &mut b, tolerance)?;
+    imprint_reaching(&mut a, &mut b, tolerance, reach)?;
 
     let (keep_a, keep_b, flip_a, flip_b) = match (how, swapped) {
         (Operation::Union, _) => (Containment::Outside, Containment::Outside, false, false),
@@ -1506,5 +1512,36 @@ mod tests {
         let common = combine(boss.clone(), moved, Operation::Intersection, tolerance).unwrap();
         let both = volume(&union) + volume(&common);
         assert!((both - 2.0 * volume(&boss)).abs() < 1e-4 * both, "{both}");
+    }
+
+    #[test]
+    fn a_box_rounded_along_its_top_meets_a_copy_moved_up_and_across() {
+        // The copy's back round meets the top in a line that runs on to the
+        // copy's side round inside the top: cut only where the two faces'
+        // boxes overlap, it never reached the top's own edges.
+        let block = cuboid([0.0; 3], [2.0, 1.4, 1.0]).unwrap();
+        let rims: Vec<EdgeKey> = block
+            .edges
+            .iter()
+            .filter(|(_, edge)| {
+                let curve = block.curves.get(edge.curve).unwrap();
+                [edge.start_parameter, edge.end_parameter]
+                    .iter()
+                    .all(|at| curve.point_at(*at)[2] > 0.5)
+            })
+            .map(|(key, _)| key)
+            .collect();
+        let rounded = crate::brep::fillet_edges(&block, &rims, 0.25).unwrap();
+        let moved = crate::brep::transform(
+            &rounded,
+            &crate::brep::Placement::at([0.443, -0.447, 0.082]),
+        )
+        .unwrap();
+        let volume = |body: &Body| crate::brep::mass_properties(body).unwrap().volume;
+        let tolerance = 2e-7;
+        let union = combine(rounded.clone(), moved.clone(), Operation::Union, tolerance).unwrap();
+        let common = combine(rounded.clone(), moved, Operation::Intersection, tolerance).unwrap();
+        let both = volume(&union) + volume(&common);
+        assert!((both - 2.0 * volume(&rounded)).abs() < 1e-4 * both, "{both}");
     }
 }
