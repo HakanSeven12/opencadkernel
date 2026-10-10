@@ -134,13 +134,55 @@ pub fn face_bounds(body: &Body, face: FaceKey) -> Option<Aabb> {
         let edge = body.edges.get(body.coedges.get(coedge)?.edge)?;
         let curve = body.curves.get(edge.curve)?;
         let span = edge.end_parameter - edge.start_parameter;
-        for step in 0..=SAMPLES {
-            let point =
-                curve.point_at(edge.start_parameter + span * step as f64 / SAMPLES as f64);
-            match &mut bounds {
-                Some(box_) => box_.absorb(point),
-                None => bounds = Some(Aabb::at(point)),
+        let mut points: Vec<[f64; 3]> = (0..=SAMPLES)
+            .map(|step| curve.point_at(edge.start_parameter + span * step as f64 / SAMPLES as f64))
+            .collect();
+        // A circle or ellipse reaches furthest along each axis between its
+        // samples; those turns go in exactly, where they lie on the edge.
+        let conic = match curve {
+            super::Curve3::Circle(circle) => Some((circle.plane, circle.radius, circle.radius)),
+            super::Curve3::Ellipse(ellipse) => {
+                Some((ellipse.plane, ellipse.major_radius, ellipse.minor_radius))
             }
+            _ => None,
+        };
+        if let Some((plane, across, along)) = conic {
+            let (low, high) = (
+                edge.start_parameter.min(edge.end_parameter),
+                edge.start_parameter.max(edge.end_parameter),
+            );
+            for axis in 0..3 {
+                let turn = (along * plane.y_axis[axis]).atan2(across * plane.x_axis[axis]);
+                for base in [turn, turn + std::f64::consts::PI] {
+                    let period = std::f64::consts::TAU;
+                    let at = base + period * ((low - base) / period).ceil();
+                    if at <= high {
+                        points.push(curve.point_at(at));
+                    }
+                }
+            }
+        }
+        // A spline bulges past the chords between its samples by an amount
+        // no sample shows: a twentieth of the chord, as a circle would.
+        let chord = points
+            .windows(2)
+            .map(|pair| {
+                (0..3).map(|axis| (pair[1][axis] - pair[0][axis]).powi(2)).sum::<f64>().sqrt()
+            })
+            .fold(0.0, f64::max);
+        let pad = if matches!(curve, super::Curve3::Nurbs(_) | super::Curve3::PlanarSpline { .. })
+        {
+            chord * 0.06
+        } else {
+            0.0
+        };
+        let Some(around) = Aabb::around(points) else {
+            continue;
+        };
+        let around = around.grown(pad);
+        match &mut bounds {
+            Some(box_) => box_.merge(around),
+            None => bounds = Some(around),
         }
     }
     // A cone face running up to its apex ends there in a loop with no edge,

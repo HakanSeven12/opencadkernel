@@ -65,13 +65,46 @@ pub fn combine(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body,
         Some((super::transform(&a, &there)?, super::transform(&b, &there)?, centre))
     });
     let Some((a, b, centre)) = moved else {
-        return combine_here(a, b, how, tolerance);
+        return combine_retried(a, b, how, tolerance);
     };
-    let result = combine_here(a, b, how, tolerance)?;
+    let result = combine_retried(a, b, how, tolerance)?;
     super::transform(&result, &Placement::at(centre.to_array())).ok_or(Snag::CutRefused)
 }
 
-fn combine_here(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+/// [`combine_here`], tried once more with the tolerance opened up tenfold
+/// where it refuses: cuts landing a hair apart, a hair from a corner, read
+/// as one.
+fn combine_retried(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+    combine_here(a.clone(), b.clone(), how, tolerance, false)
+        .or_else(|snag| {
+            combine_here(a.clone(), b.clone(), how, tolerance * 10.0, false).map_err(|_| snag)
+        })
+        // The pair the other way round: the imprint cuts the second body
+        // against the first's cuts, and the order can settle a corner. Taken
+        // only where every face of it still meshes.
+        .or_else(|snag| {
+            let Ok(result) = combine_here(b, a, how, tolerance, true) else {
+                return Err(snag);
+            };
+            let mesh = super::mesh::tessellate(
+                &result,
+                super::mesh::TessellationTolerance::new(0.2, 1e-3),
+            );
+            (mesh.missing_faces.is_empty() && !mesh.mesh.is_empty())
+                .then_some(result)
+                .ok_or(snag)
+        })
+}
+
+/// `swapped`: the bodies come second first, which only a difference minds —
+/// the first is then the one taken away.
+fn combine_here(
+    mut a: Body,
+    mut b: Body,
+    how: Operation,
+    tolerance: f64,
+    swapped: bool,
+) -> Result<Body, Snag> {
     let (divided_a, divided_b) = (divided_sphere(&a, &b, tolerance), divided_sphere(&b, &a, tolerance));
     if let Some(divided) = divided_a {
         a = divided;
@@ -89,10 +122,13 @@ fn combine_here(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Res
         .any(|body| body.edges.iter().any(|(_, edge)| edge.coedges.len() > 2));
     imprint(&mut a, &mut b, tolerance)?;
 
-    let (keep_a, keep_b, flip_b) = match how {
-        Operation::Union => (Containment::Outside, Containment::Outside, false),
-        Operation::Intersection => (Containment::Inside, Containment::Inside, false),
-        Operation::Difference => (Containment::Outside, Containment::Inside, true),
+    let (keep_a, keep_b, flip_a, flip_b) = match (how, swapped) {
+        (Operation::Union, _) => (Containment::Outside, Containment::Outside, false, false),
+        (Operation::Intersection, _) => (Containment::Inside, Containment::Inside, false, false),
+        (Operation::Difference, false) => {
+            (Containment::Outside, Containment::Inside, false, true)
+        }
+        (Operation::Difference, true) => (Containment::Inside, Containment::Outside, true, false),
     };
 
     let mut result = Body::new();
@@ -109,15 +145,15 @@ fn combine_here(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Res
     result.roots = vec![lump];
 
     let mut kept = 0;
-    for (body, other, classifier, wanted, flip, first) in [
-        (&a, &b, &original_b, keep_a, false, true),
-        (&b, &a, &original_a, keep_b, flip_b, false),
+    for (body, other, classifier, wanted, flip, flip_other, first) in [
+        (&a, &b, &original_b, keep_a, flip_a, flip_b, true),
+        (&b, &a, &original_a, keep_b, flip_b, flip_a, false),
     ] {
         for face in body.face_keys() {
             // A shared wall is settled by the two normals rather than by
             // which side it is on: it is on both.
             if let Some(twin) = coincident_twin(body, other, face, tolerance) {
-                if keeps_shared_wall(body, face, other, twin, flip_b, first) {
+                if keeps_shared_wall(body, face, other, twin, [flip, flip_other], first) {
                     copy_face_with_tolerance(&mut result, body, face, shell, flip, tolerance)?;
                     kept += 1;
                 }
@@ -158,15 +194,26 @@ fn combine_here(mut a: Body, mut b: Body, how: Operation, tolerance: f64) -> Res
 /// top, become one face, and straight edges left in line become one edge.
 /// A body that would not validate afterwards is left as it was.
 pub(super) fn merge_coplanar_faces(body: &mut Body, tolerance: f64) {
+    merge_coplanar(body, tolerance, false);
+}
+
+/// [`merge_coplanar_faces`] along curved edges too: a fill put back into a
+/// rounded corner leaves its end in a piece of the end wall, cut off along
+/// the round's arc.
+pub(super) fn merge_coplanar_pieces(body: &mut Body, tolerance: f64) {
+    merge_coplanar(body, tolerance, true);
+}
+
+fn merge_coplanar(body: &mut Body, tolerance: f64, curved: bool) {
     let mut merged = body.clone();
     let mut changed = false;
     loop {
         let next = merged
             .edges
             .keys()
-            .find(|edge| coplanar_split(&merged, *edge, tolerance).is_some());
+            .find(|edge| coplanar_split(&merged, *edge, tolerance, curved).is_some());
         let Some(edge) = next else { break };
-        if join_faces(&mut merged, edge, tolerance).is_none() {
+        if join_faces(&mut merged, edge, tolerance, curved).is_none() {
             return;
         }
         changed = true;
@@ -192,9 +239,15 @@ fn owner_face(body: &Body, coedge: CoedgeKey) -> Option<FaceKey> {
 
 /// The two faces a straight edge splits one plane into, when it is the only
 /// edge they share and neither carries parameter-space curves.
-fn coplanar_split(body: &Body, key: EdgeKey, tolerance: f64) -> Option<[FaceKey; 2]> {
+fn coplanar_split(
+    body: &Body,
+    key: EdgeKey,
+    tolerance: f64,
+    curved: bool,
+) -> Option<[FaceKey; 2]> {
     let edge = body.edges.get(key)?;
-    if edge.coedges.len() != 2 || !matches!(body.curves.get(edge.curve)?, Curve3::Line(_)) {
+    let straight = matches!(body.curves.get(edge.curve)?, Curve3::Line(_));
+    if edge.coedges.len() != 2 || !(straight || curved) {
         return None;
     }
     let faces = [owner_face(body, edge.coedges[0])?, owner_face(body, edge.coedges[1])?];
@@ -232,8 +285,8 @@ fn coplanar_split(body: &Body, key: EdgeKey, tolerance: f64) -> Option<[FaceKey;
 }
 
 /// Splices the second face's loop into the first's across their edge.
-fn join_faces(body: &mut Body, key: EdgeKey, tolerance: f64) -> Option<()> {
-    let [keep, gone] = coplanar_split(body, key, tolerance)?;
+fn join_faces(body: &mut Body, key: EdgeKey, tolerance: f64, curved: bool) -> Option<()> {
+    let [keep, gone] = coplanar_split(body, key, tolerance, curved)?;
     let edge = body.edges.remove(key)?;
     let (kept_use, gone_use) = if owner_face(body, edge.coedges[0])? == keep {
         (edge.coedges[0], edge.coedges[1])
@@ -591,7 +644,7 @@ fn keeps_shared_wall(
     face: FaceKey,
     other: &Body,
     twin: FaceKey,
-    flip_second: bool,
+    [flip_mine, flip_theirs]: [bool; 2],
     is_first: bool,
 ) -> bool {
     let Some(point) = interior_point(body, face, 1e-9) else { return false; };
@@ -602,11 +655,10 @@ fn keeps_shared_wall(
         let normal = Vec3::from(surface.normal_at(u, v)?);
         Some(if node.forward != flipped { normal } else { -normal })
     };
-    // Each face is flipped only if it belongs to the second solid and the
-    // operation turns that solid around.
+    // Each face is flipped only if the operation turns its solid around.
     let (Some(mine), Some(theirs)) = (
-        outward(body, face, flip_second && !is_first),
-        outward(other, twin, flip_second && is_first),
+        outward(body, face, flip_mine),
+        outward(other, twin, flip_theirs),
     ) else {
         return false;
     };

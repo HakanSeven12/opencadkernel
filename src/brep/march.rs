@@ -32,10 +32,11 @@ pub(super) fn traced(
     tolerance: f64,
 ) -> Option<Vec<Curve3>> {
     // Near enough that the meshes could hide a meeting, yet not crossing:
-    // touching, or crossing by less than the meshes show. Neither is known.
+    // touching, or crossing by less than the meshes show. Either way there
+    // is no curve to trace, and the faces are left as they are.
     let seeds = crossing_points(first, second);
     if seeds.is_empty() {
-        return None;
+        return Some(Vec::new());
     }
     // Walked through the whole overlap of the two bodies, not just of these
     // faces: a curve that comes back round is then traced closed once, rather

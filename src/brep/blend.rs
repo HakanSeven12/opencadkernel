@@ -280,13 +280,28 @@ pub fn chamfer_edges(
     // A body the convex solver cannot rebuild may still take a local cut.
     let Err(error) = convex else { return convex };
     let local = LocalBlend::Chamfer { base_face, base: base_distance, other: other_distance };
-    match blend_lines(body, &selected, local) {
+    let local = match blend_lines(body, &selected, local) {
         Some(result) => result.map_err(|error| match error {
             LocalError::TooLarge => ChamferError::DistanceTooLargeOrInteracting,
             LocalError::OutsideBaseFace(edge) => ChamferError::EdgeOutsideBaseFace(edge),
             LocalError::InvalidResult => ChamferError::InvalidResult,
         }),
         None => Err(error),
+    };
+    // Last, the bevel cut by a boolean, as a fillet's round is.
+    match local {
+        Err(
+            error @ (ChamferError::UnsupportedBodyTopology
+            | ChamferError::NonConvexBody
+            | ChamferError::UnsupportedExistingFillet
+            | ChamferError::UnsupportedBodySurface
+            | ChamferError::DistanceTooLargeOrInteracting
+            | ChamferError::InvalidResult),
+        ) => {
+            let bevel = Section::Bevel { base_face, base: base_distance, other: other_distance };
+            blend_by_cut(body, &selected, bevel).ok_or(error)
+        }
+        result => result,
     }
 }
 
@@ -590,11 +605,12 @@ pub fn fillet_edges(
             }
         });
     }
-    if let Some(result) = super::fillet_prismatic::fillet_prismatic(body, &selected, radius) {
-        return result;
+    let prismatic = super::fillet_prismatic::fillet_prismatic(body, &selected, radius);
+    if let Some(Ok(result)) = prismatic {
+        return Ok(result);
     }
 
-    let convex = match fillet_convex(body, &selected, radius) {
+    let convex = match prismatic.unwrap_or_else(|| fillet_convex(body, &selected, radius)) {
         Err(
             error @ (FilletError::RadiusTooLargeOrInteracting
             | FilletError::UnsupportedEndCondition(_)
@@ -604,7 +620,7 @@ pub fn fillet_edges(
     };
     // A body the convex solver cannot rebuild may still take a local cut.
     let Err(error) = convex else { return convex };
-    match blend_lines(body, &selected, LocalBlend::Fillet(radius)) {
+    let local = match blend_lines(body, &selected, LocalBlend::Fillet(radius)) {
         Some(result) => result.map_err(|error| match error {
             LocalError::TooLarge => FilletError::RadiusTooLargeOrInteracting,
             LocalError::OutsideBaseFace(_) | LocalError::InvalidResult => {
@@ -612,7 +628,201 @@ pub fn fillet_edges(
             }
         }),
         None => Err(error),
+    };
+    // Last, the edge rounded by a boolean: whatever else the body is, the
+    // corner between two planes and the rolling cylinder is a prism.
+    match local {
+        Err(
+            error @ (FilletError::UnsupportedBodyTopology
+            | FilletError::NonConvexBody
+            | FilletError::UnsupportedExistingFillet
+            | FilletError::UnsupportedBodySurface
+            | FilletError::UnsupportedEndCondition(_)
+            | FilletError::RadiusTooLargeOrInteracting
+            | FilletError::InvalidResult),
+        ) => blend_by_cut(body, &selected, Section::Round(radius)).ok_or(error),
+        result => result,
     }
+}
+
+/// What a cut along an edge leaves: a round, or a bevel set back by one
+/// distance on a base face and another on the face across the edge.
+#[derive(Clone, Copy)]
+enum Section {
+    Round(f64),
+    Bevel { base_face: FaceKey, base: f64, other: f64 },
+}
+
+/// Straight edges between two planes rounded or bevelled one by one with
+/// booleans: the region between the two faces and the round or bevel, run
+/// the edge's length, cut away from a convex edge or filled into a concave
+/// one. `None` unless the section rests on both faces along every edge.
+fn blend_by_cut(body: &Body, selected: &[EdgeKey], section: Section) -> Option<Body> {
+    let tolerance = operation_tolerance(&[body]);
+    // Each boolean renames the edges; they are found again by their ends.
+    let ends: Vec<(Vec3, Vec3)> = selected
+        .iter()
+        .map(|edge| {
+            let edge = body.edges.get(*edge)?;
+            Some((
+                Vec3::from(body.vertices.get(edge.start)?.point),
+                Vec3::from(body.vertices.get(edge.end)?.point),
+            ))
+        })
+        .collect::<Option<_>>()?;
+    let mut result = body.clone();
+    for (start, end) in ends {
+        let edge = result.edges.iter().find_map(|(key, edge)| {
+            let a = Vec3::from(result.vertices.get(edge.start)?.point);
+            let b = Vec3::from(result.vertices.get(edge.end)?.point);
+            let near = |p: Vec3, q: Vec3| p.distance(q) <= tolerance * 10.0;
+            ((near(a, start) && near(b, end)) || (near(a, end) && near(b, start)))
+                .then_some(key)
+        })?;
+        result = cut_along_edge(&result, edge, section, tolerance)?;
+    }
+    Some(result)
+}
+
+fn cut_along_edge(
+    body: &Body,
+    edge_key: EdgeKey,
+    section: Section,
+    tolerance: f64,
+) -> Option<Body> {
+    let edge = body.edges.get(edge_key)?;
+    if !matches!(body.curves.get(edge.curve)?, Curve3::Line(_)) || edge.coedges.len() != 2 {
+        return None;
+    }
+    let start = Vec3::from(body.vertices.get(edge.start)?.point);
+    let end = Vec3::from(body.vertices.get(edge.end)?.point);
+    let length = start.distance(end);
+    let axis = (end - start).normalize()?;
+    let face_of = |coedge| Some(body.loops.get(body.coedges.get(coedge)?.owner)?.owner);
+    let faces = [face_of(edge.coedges[0])?, face_of(edge.coedges[1])?];
+    let normal_of = |face_key: FaceKey| {
+        let face = body.faces.get(face_key)?;
+        let Surface::Plane(plane) = body.surfaces.get(face.surface)? else {
+            return None;
+        };
+        let normal = Vec3::from(plane.normal()?);
+        Some(if face.forward { normal } else { -normal })
+    };
+    let normals = [normal_of(faces[0])?, normal_of(faces[1])?];
+    let dot = normals[0].dot(normals[1]);
+    if dot.abs() > 1.0 - 1e-9 {
+        return None;
+    }
+    // Convex where the solid is missing just behind the first face's plane
+    // and in front of the second's; a point taken locally, as a far
+    // interior point of a non-convex face can sit past the edge.
+    let probe = start.lerp(end, 0.5) + (normals[1] - normals[0]) * (length * 0.01);
+    let convex = super::classify::contains_point(body, probe.to_array(), tolerance)
+        == super::Containment::Outside;
+    // The ball's centre is a radius off both planes, on the solid's side of
+    // a convex edge and outside a concave one; a bevel's ends lie set back
+    // across each face from the edge.
+    let side = if convex { -1.0 } else { 1.0 };
+    let radius = match section {
+        Section::Round(radius) => radius,
+        Section::Bevel { base, other, .. } => base.max(other),
+    };
+    let offset = (normals[0] + normals[1]) * (side * radius / (1.0 + dot));
+    let across = |index: usize| (normals[1 - index] - normals[index] * dot).normalize();
+    let setback = |index: usize| match section {
+        Section::Round(_) => radius,
+        Section::Bevel { base_face, base, other } => {
+            if faces[index] == base_face { base } else { other }
+        }
+    };
+    let touch = |at: Vec3, index: usize| match section {
+        Section::Round(_) => at + offset - normals[index] * (side * radius),
+        Section::Bevel { .. } => {
+            at + across(index).unwrap_or(Vec3::new(0.0, 0.0, 0.0)) * (side * setback(index))
+        }
+    };
+    if matches!(section, Section::Bevel { .. }) && (across(0).is_none() || across(1).is_none()) {
+        return None;
+    }
+    // The section square to the edge, at a start reached back past it for
+    // a convex edge so the cut runs out through any slanted end face —
+    // unless the solid goes on past that end (the edge stops at a wall),
+    // where the cut stops square at the end instead.
+    let reach = |at: Vec3, out: Vec3| {
+        let probe = at + out * radius + (normals[0] + normals[1]) * (-0.25 * radius);
+        let inside = super::classify::contains_point(body, probe.to_array(), tolerance);
+        if convex && inside == super::Containment::Outside {
+            radius * 2.0
+        } else {
+            0.0
+        }
+    };
+    let (margin, beyond) = (reach(start, -axis), reach(end, axis));
+    // The ball must rest on both faces all along, not run off either —
+    // except over an end the cut runs out through, where a face slanting
+    // away from the edge only trims the round.
+    for (at, open) in [(0.02, margin > 0.0), (0.5, false), (0.98, beyond > 0.0)] {
+        let along = start.lerp(end, at);
+        for index in 0..2 {
+            let point = touch(along, index).to_array();
+            let gap = super::classify::face_distance(body, faces[index], point, tolerance)?;
+            if gap > tolerance && !open {
+                return None;
+            }
+        }
+    }
+    let origin = start - axis * margin;
+    let plane = Plane::orthonormal(origin.to_array(), normals[0].to_array(), axis.to_array())?;
+    let flat = |point: Vec3| plane.project(point.to_array());
+    // The prism's flat sides stand a little off the two faces, outside a
+    // convex edge: lying on the faces they overlapped them, and the
+    // boolean refuses an overlap. The solid ends at the faces anyway, so
+    // nothing more is cut.
+    let clear = if convex { radius * 0.25 } else { 0.0 };
+    let lift = |point: Vec3, index: usize| point + normals[index] * clear;
+    let (corner, first, second, centre) = (
+        flat(start + (normals[0] + normals[1]) * clear)?,
+        flat(touch(start, 0))?,
+        flat(touch(start, 1))?,
+        flat(start + offset)?,
+    );
+    let first_out = flat(lift(touch(start, 0), 0))?;
+    let second_out = flat(lift(touch(start, 1), 1))?;
+    let angle = |p: [f64; 2]| (p[1] - centre[1]).atan2(p[0] - centre[0]);
+    let (a, b, c) = (angle(first), angle(second), angle(corner));
+    let span = |from: f64, to: f64| (to - from).rem_euclid(TAU);
+    // The arc of the ball between its two touches facing the corner.
+    let (from, to) = if span(a, c) < span(a, b) { (a, b) } else { (b, a) };
+    let line = |start, end| crate::geom2d::Curve::Line(crate::geom2d::Line { start, end });
+    let arc = match section {
+        Section::Round(_) => crate::geom2d::Curve::Arc(crate::geom2d::Arc {
+            centre,
+            radius,
+            start_angle: from,
+            end_angle: from + span(from, to),
+        }),
+        Section::Bevel { .. } => line(second, first),
+    };
+    let profile = if convex {
+        vec![
+            line(first, first_out),
+            line(first_out, corner),
+            line(corner, second_out),
+            line(second_out, second),
+            arc,
+        ]
+    } else {
+        vec![line(corner, first), arc, line(second, corner)]
+    };
+    let run = axis * (length + margin + beyond);
+    let tool = super::extrude_region(plane, &[profile], run.to_array())?;
+    let how = if convex {
+        super::boolean::Operation::Difference
+    } else {
+        super::boolean::Operation::Union
+    };
+    let rounded = super::combine(body.clone(), tool, how, tolerance).ok()?;
+    (rounded.validate().is_empty() && !rounded.roots.is_empty()).then_some(rounded)
 }
 
 /// An edge next to an earlier fillet of the same radius: rebuild the sharp
@@ -1545,6 +1755,23 @@ fn blend_boundaries_fit(body: &Body, tolerance: f64) -> bool {
             })
         })
     })
+}
+
+/// The convex body the planes bound, each given by a point on it and its
+/// outward unit normal; `None` where they bound nothing, or the first of them
+/// bounds none of it.
+pub(super) fn bounded_by(planes: &[(Vec3, Vec3)], tolerance: f64) -> Option<Body> {
+    let mut halfspaces: Vec<Halfspace> = planes
+        .iter()
+        .map(|(origin, normal)| Halfspace {
+            origin: *origin,
+            normal: *normal,
+            offset: normal.dot(*origin),
+            added: false,
+        })
+        .collect();
+    halfspaces.first_mut()?.added = true;
+    convex_body(&halfspaces, tolerance).map(|(body, _)| body)
 }
 
 fn convex_body(halfspaces: &[Halfspace], tolerance: f64) -> Option<(Body, FaceKey)> {

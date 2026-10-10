@@ -760,15 +760,22 @@ pub(super) fn apex_closed(
     boundary: &[Curve],
     tolerance: crate::geom2d::Tolerance,
 ) -> Option<Vec<Curve>> {
-    let Surface::Cone(cone) = surface else {
-        return None;
+    // The latitudes where the surface closes to a point: a cone's apex, a
+    // sphere's poles — a sphere face reaching a pole stops there the same
+    // way.
+    let apexes: Vec<f64> = match surface {
+        Surface::Cone(cone) => vec![cone.radius / cone.half_angle.tan()],
+        Surface::Sphere(_) => vec![std::f64::consts::FRAC_PI_2, -std::f64::consts::FRAC_PI_2],
+        _ => return None,
     };
-    let apex = cone.radius / cone.half_angle.tan();
-    if !apex.is_finite() {
+    if apexes.iter().any(|apex| !apex.is_finite()) {
         return None;
     }
-    let slack = tolerance.linear().max(apex.abs() * 1e-9);
-    let at_apex = |point: [f64; 2]| (point[1] - apex).abs() <= slack;
+    let slack = |apex: f64| tolerance.linear().max(apex.abs() * 1e-9);
+    let pole = |point: [f64; 2]| {
+        apexes.iter().position(|apex| (point[1] - apex).abs() <= slack(*apex))
+    };
+    let same_apex = |a: [f64; 2], b: [f64; 2]| pole(a).is_some() && pole(a) == pole(b);
     let joined = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) <= TAU * 1e-3;
     let line = |start: [f64; 2], end: [f64; 2]| Curve::Line(Line { start, end });
     let mut out = Vec::with_capacity(boundary.len() + 3);
@@ -781,7 +788,7 @@ pub(super) fn apex_closed(
         let end = curve.point_at(1.0);
         match boundary.get(index + 1).map(|next| next.point_at(0.0)) {
             Some(next) if joined(next, end) => continue,
-            Some(next) if at_apex(end) && at_apex(next) => {
+            Some(next) if same_apex(end, next) => {
                 out.push(line(end, next));
                 changed = true;
                 continue;
@@ -789,7 +796,7 @@ pub(super) fn apex_closed(
             _ => {}
         }
         let start = boundary[loop_start].point_at(0.0);
-        if !joined(start, end) && at_apex(start) && at_apex(end) {
+        if !joined(start, end) && same_apex(start, end) {
             out.push(line(end, start));
             changed = true;
         } else if ((end[0] - start[0]).abs() - TAU).abs() <= TAU * 1e-3
@@ -801,7 +808,8 @@ pub(super) fn apex_closed(
     }
     // A face with one rim round the cone and nothing else — its apex loop
     // has no curve — is everything from the rim up to the apex.
-    if let [(at, start, end)] = wrapping[..] {
+    if let ([(at, start, end)], [apex]) = (&wrapping[..], &apexes[..]) {
+        let (at, start, end, apex) = (*at, *start, *end, *apex);
         let (over_end, over_start) = ([end[0], apex], [start[0], apex]);
         let closing = [line(end, over_end), line(over_end, over_start), line(over_start, start)];
         out.splice(at..at, closing);
@@ -821,7 +829,9 @@ fn band_parity(
     point: [f64; 2],
     tolerance: crate::geom2d::Tolerance,
 ) -> Option<bool> {
-    let ([Some(period), None], false) = (periods, boundary.is_empty()) else {
+    // A torus closes along `v` as well; a band round it that stays within
+    // one turn of `v` is a band all the same.
+    let ([Some(period), v_period], false) = (periods, boundary.is_empty()) else {
         return None;
     };
     // A band has its rims wrap round, each a turn along, in pairs; with no
@@ -863,6 +873,16 @@ fn band_parity(
             (low.min(sample[0]), high.max(sample[0]), top.max(sample[1]))
         },
     );
+    let mut point = point;
+    if let Some(v_period) = v_period {
+        let bottom = samples.iter().map(|sample| sample[1]).fold(f64::INFINITY, f64::min);
+        if top - bottom >= v_period * (1.0 - 1e-6) {
+            return None;
+        }
+        // The point's turn of `v` nearest the band's.
+        let middle = 0.5 * (bottom + top);
+        point[1] += v_period * ((middle - point[1]) / v_period).round();
+    }
     if point[1] >= top {
         return Some(false);
     }
