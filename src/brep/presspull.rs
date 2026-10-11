@@ -1584,6 +1584,16 @@ fn circular_piece(curve: &Curve) -> Option<Curve> {
     };
     let at = |t: f64| Vec3::new(curve.point_at(t)[0], curve.point_at(t)[1], 0.0);
     let (a, b, c) = (at(0.0), at(1.0 / 3.0), at(2.0 / 3.0));
+    let end = at(1.0);
+    // Measured against the piece itself, not its radius: a straight piece's
+    // radius runs to 1e16, and a millionth of that took it for a whole
+    // circle — one quarter of it reaching across the world.
+    let size = [b, c, end].iter().map(|point| point.distance(a)).fold(0.0, f64::max);
+    let fit = size * 1e-9;
+    if (0..=32).all(|step| at(step as f64 / 32.0).distance_to_segment(a, end) <= fit) {
+        return (a.distance(end) > fit)
+            .then_some(Curve::Line(Line { start: [a.x, a.y], end: [end.x, end.y] }));
+    }
     // The centre is where the perpendicular bisectors of ab and bc meet.
     let (ab, bc) = (b - a, c - b);
     let det = 2.0 * (ab.x * bc.y - ab.y * bc.x);
@@ -1594,14 +1604,13 @@ fn circular_piece(curve: &Curve) -> Option<Curve> {
     let centre = Vec3::new((ka * bc.y - kb * ab.y) / det, (kb * ab.x - ka * bc.x) / det, 0.0);
     let radius = a.distance(centre);
     let round = (0..=32).all(|step| {
-        (at(step as f64 / 32.0).distance(centre) - radius).abs() <= radius * 1e-9
+        (at(step as f64 / 32.0).distance(centre) - radius).abs() <= fit.max(radius * 1e-12)
     });
     if !round {
         return None;
     }
     let angle = |p: Vec3| (p.y - centre.y).atan2(p.x - centre.x);
-    let end = at(1.0);
-    if end.distance(a) <= radius * 1e-9 {
+    if end.distance(a) <= fit {
         return Some(Curve::Circle(crate::geom2d::Circle {
             centre: [centre.x, centre.y],
             radius,
@@ -2031,6 +2040,23 @@ mod tests {
             intersect_planar_regions(&[left, separate], 1e-9).unwrap(),
             PlanarIntersection::Disjoint
         ));
+    }
+
+    #[test]
+    fn a_straight_rational_piece_is_a_line_not_a_world_wide_circle() {
+        // A file's straight edge written as a rational quadratic: its
+        // control points in a row, its "radius" near 1e16.
+        let straight = Curve::Nurbs(
+            crate::geom2d::nurbs::NurbsCurve::new(
+                2,
+                vec![[15.0, -39.9], [15.0, -12.7], [15.0, 14.4]],
+                vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                Some(vec![1.0, 0.7, 1.0]),
+            )
+            .unwrap(),
+        );
+        let pieces = extrusion_profile_pieces(&[straight]);
+        assert!(matches!(pieces[..], [Curve::Line(_)]), "{pieces:?}");
     }
 
     #[test]
