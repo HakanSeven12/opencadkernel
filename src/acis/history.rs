@@ -1120,7 +1120,9 @@ fn sweep_history_geometry(
     if value.flags_294_296[1] {
         // The placed profile stands at the path end the sweep starts from;
         // an open path is traversed from that end.
-        let placed = Vec3::from(placement(path_transform)?.origin);
+        // The placed frame is the record's path matrix; the geometry itself
+        // is already in world coordinates (identity `path_transform`).
+        let placed = Vec3::from(placement(value.path_entity_transform)?.origin);
         if let (Some(start), Some(end)) = (path.start(), path.end()) {
             if Vec3::from(end).distance(placed) + 1e-9 < Vec3::from(start).distance(placed) {
                 path = path.reversed().ok_or(HistoryRebuildError::InvalidParameters)?;
