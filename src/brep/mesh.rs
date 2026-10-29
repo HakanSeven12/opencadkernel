@@ -3769,6 +3769,11 @@ fn rotate_periodic_rim(
                 position: surface.point_at(parameters[0], parameters[1]),
             },
         );
+    } else {
+        // A corner a rounding past the seam is on it, and starts there
+        // exactly: left where it lies, the rim also ends that rounding past
+        // the other rim, and the two no longer span one turn (#2308's brace).
+        rim[0].parameters[varying] = seam;
     }
     let mut closing = rim.first()?.clone();
     closing.parameters[varying] += period;
@@ -5867,12 +5872,9 @@ mod tests {
         assert!(angles.len() >= 48, "only {} sides", angles.len());
     }
 
-    #[test]
-    fn a_tube_with_no_seam_still_knows_the_band_it_covers() {
-        // A cylinder wall bounded by a rim at each end and nothing else: it
-        // wraps the whole way round, so no seam cuts it open and its boundary
-        // traces no ring in (u, v). Files carry solids shaped that way, and
-        // the face was dropped for want of a ring to fill.
+    /// A cylinder wall on its two rims alone, the seam between them taken
+    /// away.
+    fn seamless_tube() -> (Body, FaceKey) {
         let mut solid = crate::brep::make::cylinder([0.0; 3], 3.0, 6.0).unwrap();
         let wall = solid
             .faces
@@ -5913,7 +5915,16 @@ mod tests {
             solid.coedges.get_mut(coedge).unwrap().owner = owner;
             solid.faces.get_mut(wall).unwrap().loops.push(owner);
         }
+        (solid, wall)
+    }
 
+    #[test]
+    fn a_tube_with_no_seam_still_knows_the_band_it_covers() {
+        // A cylinder wall bounded by a rim at each end and nothing else: it
+        // wraps the whole way round, so no seam cuts it open and its boundary
+        // traces no ring in (u, v). Files carry solids shaped that way, and
+        // the face was dropped for want of a ring to fill.
+        let (solid, wall) = seamless_tube();
         let mesh =
             crate::brep::mesh::face(&solid, wall, default_angle(), 1e-9).expect("a drawn wall");
         let area: f64 = mesh
@@ -5929,6 +5940,67 @@ mod tests {
             (area - expected).abs() < 0.02 * expected,
             "{area} vs {expected}"
         );
+    }
+
+    #[test]
+    fn a_tube_whose_rims_start_a_rounding_apart_still_meshes() {
+        // The tube of a scaffold brace (OpenCADStudio#2308). Its rims are
+        // fitted intersection curves, on the wall at their corner and a hair
+        // off it in between, so neither reads as a circle of the surface.
+        // Both corners sit at one angle round the axis but land a rounding
+        // apart, each placed by its own curve. Rotated to a common seam, one
+        // rim started that rounding past it and ended as far beyond the
+        // other, and the wall was dropped. Which rim leads depends on the
+        // loop order, so the turn is tried both ways.
+        for turn in [3e-11_f64, -3e-11] {
+            let (mut solid, wall) = seamless_tube();
+            let rims: Vec<EdgeKey> = solid
+                .faces
+                .get(wall)
+                .unwrap()
+                .loops
+                .iter()
+                .map(|ring| {
+                    let coedge = solid.loops.get(*ring).unwrap().coedges[0];
+                    solid.coedges.get(coedge).unwrap().edge
+                })
+                .collect();
+            for rim in rims {
+                let edge = solid.edges.get(rim).unwrap().clone();
+                let Some(crate::brep::Curve3::Circle(circle)) = solid.curves.get(edge.curve) else {
+                    panic!("a circular rim");
+                };
+                let origin = circle.plane.origin;
+                let start = if origin[2] > 0.0 { turn } else { 0.0 };
+                let plane =
+                    Plane::orthonormal(origin, [start.cos(), start.sin(), 0.0], [0.0, 0.0, 1.0])
+                        .unwrap();
+                let fitted = crate::brep::Curve3::Ellipse(crate::brep::geometry::Ellipse3 {
+                    plane,
+                    major_radius: 3.0,
+                    minor_radius: 3.0 - 2e-6,
+                });
+                solid.vertices.get_mut(edge.start).unwrap().point = fitted.point_at(0.0);
+                *solid.curves.get_mut(edge.curve).unwrap() = fitted;
+            }
+
+            let mesh = crate::brep::mesh::face(&solid, wall, default_angle(), 1e-9)
+                .unwrap_or_else(|| panic!("no wall with the top rim turned {turn:e}"));
+            let mut area = 0.0;
+            for t in &mesh.triangles {
+                let at = |i: usize| Vec3::from(mesh.positions[t[i]]);
+                let normal = (at(1) - at(0)).cross(at(2) - at(0));
+                let centre = (at(0) + at(1) + at(2)) * (1.0 / 3.0);
+                let out = Vec3::new(centre.x, centre.y, 0.0);
+                assert!(normal.dot(out) > 0.0, "a triangle facing the axis");
+                area += normal.length() * 0.5;
+            }
+            let expected = TAU * 3.0 * 6.0;
+            assert!(
+                (area - expected).abs() < 0.02 * expected,
+                "{area} vs {expected} with the top rim turned {turn:e}"
+            );
+        }
     }
 
     #[test]
