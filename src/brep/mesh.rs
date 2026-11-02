@@ -4026,6 +4026,10 @@ pub fn face(body: &Body, face: FaceKey, max_angle: f64, tolerance: f64) -> Optio
 /// curves do not (a spline beside the arc it leaves at a shallow angle).
 /// Its own edges sampled finer then; the seam with the neighbours can open
 /// by at most the tolerance, which a hole the size of the face cannot beat.
+///
+/// The 0.01 retry samples a hundred times as finely, and filling the face costs far more than
+/// linearly in its samples (a face of about 10 000 edge samples took 12-18 s to fail again), so
+/// it is only tried while it stays small: see [`finest_retry_affordable`].
 fn finer_face(body: &Body, face: FaceKey, max_angle: f64, tolerance: f64) -> Option<Mesh> {
     let node = body.faces.get(face)?;
     for factor in [0.1, 0.01] {
@@ -4045,8 +4049,21 @@ fn finer_face(body: &Body, face: FaceKey, max_angle: f64, tolerance: f64) -> Opt
         if let Some(mesh) = scheduled_face(body, face, max_angle, tolerance, &schedules) {
             return Some(mesh);
         }
+        let points: usize = schedules.values().map(Vec::len).sum();
+        if !finest_retry_affordable(points) {
+            return None;
+        }
     }
     None
+}
+
+/// The most edge samples the finest retry of [`finer_face`] may use on one face.
+const FINEST_RETRY_MAX_POINTS: usize = 4_000;
+
+/// Whether the 0.01 retry may follow a failed 0.1 one that sampled `points`: sample counts grow
+/// about tenfold per step, so it is predicted from them rather than paid for first.
+fn finest_retry_affordable(points: usize) -> bool {
+    points.saturating_mul(10) <= FINEST_RETRY_MAX_POINTS
 }
 
 fn fill_scheduled_band(
@@ -5584,6 +5601,20 @@ mod tests {
     fn a_triangle_away_from_the_pole_is_still_refined() {
         let away = refine([[0.2, 0.4], [0.8, 0.4], [0.5, 0.6]]);
         assert!(matches!(away, TriangleRefinement::Interior(_)));
+    }
+
+    #[test]
+    fn the_finest_retry_is_not_tried_on_a_face_that_already_needs_hundreds_of_samples() {
+        // On a real corridor solid the 0.1 retry of three faces that still failed sampled 841,
+        // 1 100 and 1 179 edge points; the 0.01 retry then sampled ten times as many and took
+        // 12-18 s per face to fail again, which was 44.5 s of a 44.6 s tessellation.
+        for points in [401, 841, 1_100, 1_179, usize::MAX] {
+            assert!(!finest_retry_affordable(points), "{points} samples");
+        }
+        // A small face keeps the retry the audit that added it relied on.
+        for points in [0, 12, 48, 400] {
+            assert!(finest_retry_affordable(points), "{points} samples");
+        }
     }
 
     #[test]
