@@ -27,7 +27,9 @@
 //! caller that wants a magnitude takes the absolute value; a caller deciding
 //! whether a loop is a hole wants the sign.
 
-use super::curve::Curve;
+use super::arrangement::{bounded_faces, signed_area};
+use super::curve::{Curve, Line};
+use super::Tolerance;
 use super::polyline::{BulgeArc, Polyline};
 use super::transform::Transform;
 use super::vec::Vec2;
@@ -95,13 +97,24 @@ impl Curve {
     /// polyline shown in an object-properties palette. It deliberately stays
     /// separate from [`Self::enclosed_area`], whose open-curve contribution is
     /// composable when several entities form a boundary.
+    ///
+    /// A curve that crosses itself encloses each place it covers once: a
+    /// figure eight is its two loops added, not their signed sum of nearly
+    /// zero, and a pentagram counts its centre once. The sign is the signed
+    /// integral's.
     pub fn chord_closed_area(&self) -> Option<f64> {
         if matches!(self, Self::Ray(_) | Self::XLine(_)) {
             return None;
         }
         let start = self.point_at(0.0);
         let end = self.point_at(1.0);
-        Some(self.enclosed_area() + line_moments(end, start).0)
+        // `chain_area`: an open polyline's own integral already closes it,
+        // and adding the chord on top would count the closing edge twice.
+        let signed = self.chain_area() + line_moments(end, start).0;
+        Some(match covered_area(self) {
+            Some(covered) => covered.copysign(signed),
+            None => signed,
+        })
     }
 
     /// Centroid of the region closed by this curve.
@@ -270,6 +283,82 @@ fn bulge_moments(arc: &BulgeArc) -> (f64, f64, f64) {
     )
 }
 
+/// The area a self-crossing chord-closed curve covers, counting every place
+/// it winds round once; `None` when it winds round nothing more than once,
+/// so the exact integral already is that area.
+///
+/// Measured on the curve's tessellation split into the regions it bounds,
+/// keeping those it winds round. Straight pieces are exact; curved ones are
+/// sampled at two densities and extrapolated, since a chord's lost sliver
+/// shrinks with the square of the step.
+fn covered_area(curve: &Curve) -> Option<f64> {
+    let coarse = covered_ring_area(curve, 64.0)?;
+    let fine = covered_ring_area(curve, 128.0)?;
+    Some(fine + (fine - coarse) / 3.0)
+}
+
+fn covered_ring_area(curve: &Curve, segments_per_radian: f64) -> Option<f64> {
+    let mut ring = curve.tessellate(segments_per_radian);
+    if ring.first() != ring.last() {
+        ring.push(ring[0]);
+    }
+    let segments: Vec<Line> = ring
+        .windows(2)
+        .filter(|pair| pair[0] != pair[1])
+        .map(|pair| Line {
+            start: pair[0],
+            end: pair[1],
+        })
+        .collect();
+    let extent = ring.iter().fold(0.0_f64, |size, point| {
+        size.max((point[0] - ring[0][0]).abs())
+            .max((point[1] - ring[0][1]).abs())
+    });
+    if segments.len() < 3 || !(extent > 0.0) || !extent.is_finite() {
+        return None;
+    }
+    let faces = bounded_faces(&segments, Tolerance::new(extent * 1.0e-12));
+    let covered: f64 = faces
+        .iter()
+        .filter(|face| winding_inside(face, &ring) != 0)
+        .map(|face| signed_area(face).abs())
+        .sum();
+    // Wound round at most once everywhere: the integral is the area.
+    ((covered - signed_area(&ring).abs()).abs() > covered * 1.0e-9).then_some(covered)
+}
+
+/// How many times `ring` winds round a point just inside `face` (a
+/// counter-clockwise region of the arrangement the ring makes).
+fn winding_inside(face: &[[f64; 2]], ring: &[[f64; 2]]) -> i32 {
+    // Off the middle of the face's longest edge, a hair to its left.
+    let Some((a, b)) = face
+        .iter()
+        .zip(face.iter().cycle().skip(1))
+        .max_by(|(a, b), (c, d)| {
+            Vec2::from(**a)
+                .distance(Vec2::from(**b))
+                .total_cmp(&Vec2::from(**c).distance(Vec2::from(**d)))
+        })
+    else {
+        return 0;
+    };
+    let (a, b) = (Vec2::from(*a), Vec2::from(*b));
+    let along = b - a;
+    let left = Vec2::new(-along.y, along.x) * 1.0e-6;
+    let point = (a + b) * 0.5 + left;
+    let mut winding = 0;
+    for pair in ring.windows(2) {
+        let (p, q) = (Vec2::from(pair[0]), Vec2::from(pair[1]));
+        let side = (q - p).cross(point - p);
+        if p.y <= point.y && q.y > point.y && side > 0.0 {
+            winding += 1;
+        } else if q.y <= point.y && p.y > point.y && side < 0.0 {
+            winding -= 1;
+        }
+    }
+    winding
+}
+
 fn line_moments(start: [f64; 2], end: [f64; 2]) -> (f64, f64, f64) {
     let step = [end[0] - start[0], end[1] - start[1]];
     let first = integrated_first_moments(
@@ -353,6 +442,43 @@ mod tests {
         let sampled = crate::geom2d::signed_area(&curve.tessellate(20.0));
         assert!(sampled < PI - 1e-4, "the polygon should read short: {sampled}");
         assert!((curve.enclosed_area() - PI).abs() < 1e-12);
+    }
+
+    fn closed_ring(points: &[[f64; 2]]) -> Curve {
+        Curve::Polyline(Polyline {
+            vertices: points
+                .iter()
+                .map(|&position| PolylineVertex {
+                    position,
+                    bulge: 0.0,
+                })
+                .collect(),
+            closed: true,
+        })
+    }
+
+    #[test]
+    fn a_self_crossing_ring_covers_each_place_once() {
+        let measured = |points: &[[f64; 2]]| closed_ring(points).chord_closed_area().unwrap().abs();
+        // Figure eight: two loops of opposite sense, signed sum zero.
+        assert!((measured(&[[0.0, 0.0], [100.0, 100.0], [100.0, 0.0], [0.0, 100.0]]) - 5000.0).abs() < 1e-6);
+        // A square traced twice still covers one square.
+        let twice = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [0.0, 100.0]].repeat(2);
+        assert!((measured(&twice) - 10_000.0).abs() < 1e-6);
+        // A loop that leaves a hole the curve does not wind round.
+        let hole = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [40.0, 100.0], [40.0, -50.0], [70.0, -50.0], [70.0, 20.0], [0.0, 20.0]];
+        assert!((measured(&hole) - 8300.0).abs() < 1e-6);
+        // An open chain is closed by its chord once, not twice.
+        let open = Curve::Polyline(Polyline {
+            vertices: [[10.0, 10.0], [20.0, 10.0], [20.0, 30.0]]
+                .into_iter()
+                .map(|position| PolylineVertex { position, bulge: 0.0 })
+                .collect(),
+            closed: false,
+        });
+        assert!((open.chord_closed_area().unwrap().abs() - 100.0).abs() < 1e-9);
+        // A simple square is untouched.
+        assert!((measured(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]) - 100.0).abs() < 1e-9);
     }
 
     #[test]
