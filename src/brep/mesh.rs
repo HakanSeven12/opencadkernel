@@ -278,6 +278,7 @@ pub struct TessellationTolerance {
     isolines: [usize; 2],
     planar_isolines: bool,
     solid_isolines: bool,
+    triangle_budget: Option<usize>,
 }
 
 impl TessellationTolerance {
@@ -289,7 +290,19 @@ impl TessellationTolerance {
             isolines: [0; 2],
             planar_isolines: false,
             solid_isolines: false,
+            triangle_budget: None,
         }
+    }
+
+    /// Stop refining once the body has `triangles` triangles, for callers
+    /// that would rather show a body incomplete than build a mesh far larger
+    /// than they can use. The face being refined when the budget runs out,
+    /// and every face after it, is left out and [`BodyMesh::over_budget`] is
+    /// set; the work done stays near the budget. Without it (the default)
+    /// there is no limit.
+    pub fn with_triangle_budget(mut self, triangles: usize) -> Self {
+        self.triangle_budget = Some(triangles);
+        self
     }
 
     pub fn with_chordal_deflection(mut self, deflection: f64) -> Self {
@@ -354,6 +367,9 @@ pub struct BodyMesh {
     pub isolines: Vec<FacePolyline>,
     pub precision: f64,
     pub missing_faces: Vec<FaceKey>,
+    /// The tolerance's triangle budget ran out: the faces from the one being
+    /// refined then on are in `missing_faces`.
+    pub over_budget: bool,
     analytic_cones: Vec<AnalyticConeFace>,
     /// Some face was filled with its boundary chords split where they cross
     /// (see `crossing_face`): its error no longer falls as the square of the
@@ -957,15 +973,28 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
     let mut out = BodyMesh::default();
     for face_key in body.face_keys() {
         let max_angle = face_chordal_angle(body, face_key, tolerance.angle, tolerance.chordal);
-        match scheduled_face(body, face_key, max_angle, tolerance.linear, &schedules)
-            .or_else(|| finer_face(body, face_key, max_angle, tolerance.linear))
-            .or_else(|| {
+        let limit = FaceLimit::set(
+            tolerance
+                .triangle_budget
+                .map(|budget| budget.saturating_sub(out.mesh.triangles.len())),
+        );
+        if limit.exhausted() {
+            out.over_budget = true;
+            out.missing_faces.push(face_key);
+            continue;
+        }
+        let mut face = scheduled_face(body, face_key, max_angle, tolerance.linear, &schedules);
+        // A face the budget stopped is not retried finer.
+        if face.is_none() && !limit.reached() {
+            face = finer_face(body, face_key, max_angle, tolerance.linear).or_else(|| {
                 let mesh =
                     crossing_face(body, face_key, max_angle, tolerance.linear, &schedules)?;
                 out.crossed = true;
                 Some(mesh)
-            })
-        {
+            });
+        }
+        out.over_budget |= limit.reached();
+        match face {
             Some(mesh) => {
                 if let Some(cone) = analytic_cone_face(body, face_key, &mesh) {
                     out.analytic_cones.push(cone);
@@ -1007,6 +1036,51 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
     out.missing_faces.dedup();
     out.precision = silhouette_precision(&out.mesh);
     out
+}
+
+std::thread_local! {
+    /// While a [`tessellate`] with a triangle budget fills a face: the
+    /// triangles it may still add, and whether a fill ran into that limit.
+    static FACE_LIMIT: std::cell::Cell<(Option<usize>, bool)> =
+        const { std::cell::Cell::new((None, false)) };
+}
+
+/// The triangle limit of the face being filled, for as long as it lives.
+struct FaceLimit((Option<usize>, bool));
+
+impl FaceLimit {
+    fn set(limit: Option<usize>) -> Self {
+        Self(FACE_LIMIT.with(|cell| cell.replace((limit, false))))
+    }
+
+    /// The budget is spent before the face starts.
+    fn exhausted(&self) -> bool {
+        FACE_LIMIT.with(|cell| cell.get().0 == Some(0))
+    }
+
+    /// A fill of this face stopped at the limit.
+    fn reached(&self) -> bool {
+        FACE_LIMIT.with(|cell| cell.get().1)
+    }
+}
+
+impl Drop for FaceLimit {
+    fn drop(&mut self) {
+        FACE_LIMIT.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Whether `triangles` on the face being filled would pass its budget
+/// limit, noting it when they would; never without a budget.
+fn face_limit_exceeded(triangles: usize) -> bool {
+    FACE_LIMIT.with(|cell| {
+        let (limit, _) = cell.get();
+        let exceeded = limit.is_some_and(|limit| triangles > limit);
+        if exceeded {
+            cell.set((limit, true));
+        }
+        exceeded
+    })
 }
 
 /// Tessellates display edges and optional face isolines without triangulating.
@@ -4339,13 +4413,12 @@ fn fill_scheduled_band(
         .len()
         .saturating_add(band.high.len())
         .saturating_sub(2);
-    if fixed_values
+    let band_triangles = fixed_values
         .len()
         .saturating_sub(1)
         .saturating_mul(base_triangles)
-        .saturating_mul(2)
-        > MAX_FACE_ADDITIONS
-    {
+        .saturating_mul(2);
+    if band_triangles > MAX_FACE_ADDITIONS || face_limit_exceeded(band_triangles) {
         return None;
     }
     while lower + 1 < band.low.len() || upper + 1 < band.high.len() {
@@ -4637,11 +4710,10 @@ fn fill_scheduled_singular_cap(
     })?;
     let triangles = loop {
         let steps = 1usize.checked_shl(radial_depth)?;
-        if steps
+        let cap_triangles = steps
             .saturating_mul(rim.len().saturating_sub(1))
-            .saturating_mul(2)
-            > MAX_FACE_ADDITIONS
-        {
+            .saturating_mul(2);
+        if cap_triangles > MAX_FACE_ADDITIONS || face_limit_exceeded(cap_triangles) {
             return None;
         }
         let triangles = singular_cap_triangles(rim, apex, band.varying, steps);
@@ -4757,7 +4829,8 @@ fn fill_whole_surface(
     } else {
         4
     };
-    if u_cells.saturating_mul(v_cells).saturating_mul(2) > MAX_FACE_ADDITIONS {
+    let cells = u_cells.saturating_mul(v_cells).saturating_mul(2);
+    if cells > MAX_FACE_ADDITIONS || face_limit_exceeded(cells) {
         return None;
     }
     // A square parameter grid needlessly refines the nearly straight direction
@@ -4882,7 +4955,8 @@ fn fill_scheduled(
         candidates.retain(|(parameters, _)| unique.insert(parameters.map(f64::to_bits)));
         let mut inserted = 0;
         for (parameters, corners) in candidates {
-            if additions >= MAX_FACE_ADDITIONS {
+            // Each added point adds about two triangles.
+            if additions >= MAX_FACE_ADDITIONS || face_limit_exceeded(additions.saturating_mul(2)) {
                 return None;
             }
             match domain.insert(parameters) {
@@ -5437,7 +5511,7 @@ fn refine_scheduled(
     // Recursive patches need the same growth bound as constrained faces.
     // A folded or singular surface can otherwise keep emitting triangles
     // around a normal discontinuity until memory is exhausted.
-    if mesh.triangles.len() >= MAX_FACE_ADDITIONS {
+    if mesh.triangles.len() >= MAX_FACE_ADDITIONS || face_limit_exceeded(mesh.triangles.len()) {
         return false;
     }
     let Some(node) = body.faces.get(face) else {
@@ -6266,6 +6340,65 @@ mod tests {
         let mesh = self::body(&solid, default_angle(), TOL);
         assert_eq!(mesh.len(), 12, "six faces, two triangles each");
         assert_eq!(mesh.positions.len(), 36);
+    }
+
+    fn budget_tolerance() -> TessellationTolerance {
+        TessellationTolerance::new(crate::tessellation::DEFAULT_ANGLE, 1e-3)
+            .with_chordal_deflection(5e-3)
+    }
+
+    #[test]
+    fn a_triangle_budget_stops_the_mesh_and_says_so() {
+        let torus = crate::brep::make::torus([0.0; 3], 5.0, 1.0).unwrap();
+        let whole = tessellate(&torus, budget_tolerance());
+        assert!(!whole.over_budget && whole.missing_faces.is_empty());
+        let budgeted = tessellate(&torus, budget_tolerance().with_triangle_budget(1_000));
+        assert!(budgeted.over_budget);
+        assert!(!budgeted.missing_faces.is_empty());
+        assert!(
+            budgeted.mesh.triangles.len() <= 1_000,
+            "{} triangles",
+            budgeted.mesh.triangles.len()
+        );
+    }
+
+    #[test]
+    fn a_mesh_within_its_budget_is_the_mesh_without_one() {
+        // Triangle count and a hash of every vertex, normal and index of the
+        // default tessellation, measured on 003eee3 before budgets existed.
+        let fingerprint = |mesh: &Mesh| {
+            let mut hash = 0xcbf2_9ce4_8422_2325u64;
+            let mut eat = |word: u64| {
+                for byte in word.to_le_bytes() {
+                    hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+                }
+            };
+            for point in mesh.positions.iter().chain(&mesh.normals) {
+                point.iter().for_each(|value| eat(value.to_bits()));
+            }
+            for triangle in &mesh.triangles {
+                triangle.iter().for_each(|index| eat(*index as u64));
+            }
+            (mesh.triangles.len(), hash)
+        };
+        let bodies = [
+            (
+                crate::brep::make::cylinder([0.0; 3], 5.0, 10.0).unwrap(),
+                (508, 12_334_101_914_323_719_284),
+            ),
+            (
+                crate::brep::make::torus([0.0; 3], 5.0, 1.0).unwrap(),
+                (23_762, 7_737_320_732_063_767_409),
+            ),
+        ];
+        for (body, before) in bodies {
+            let plain = tessellate(&body, budget_tolerance());
+            assert_eq!(fingerprint(&plain.mesh), before);
+            for budget in [usize::MAX, 2 * plain.mesh.triangles.len()] {
+                let budgeted = tessellate(&body, budget_tolerance().with_triangle_budget(budget));
+                assert_eq!(budgeted, plain);
+            }
+        }
     }
 
     #[test]
