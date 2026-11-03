@@ -89,9 +89,21 @@ fn combine_dividing(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<
             super::mesh::TessellationTolerance::new(crate::tessellation::DEFAULT_ANGLE, 1e-9);
         body.face_keys().all(|face| super::mesh::face_meshes(body, face, tolerance))
     };
+    // A way of dividing that finds nothing more to divide than the one
+    // before it repeats that one's work exactly, so it is not tried.
+    let carries = |round: fn(&Surface) -> bool| {
+        [&a, &b].iter().any(|body| body.surfaces.iter().any(|(_, surface)| round(surface)))
+    };
+    let tori_or_cones = carries(|surface| matches!(surface, Surface::Torus(_) | Surface::Cone(_)));
+    let cylinders = carries(|surface| matches!(surface, Surface::Cylinder(_)));
     // The first result made stands where none meshes whole.
     let mut first: Option<Result<Body, Snag>> = None;
     for divide in [Divide::TorusAndCone, Divide::Nothing, Divide::AlsoCylinder] {
+        if (divide == Divide::Nothing && !tori_or_cones)
+            || (divide == Divide::AlsoCylinder && !cylinders)
+        {
+            continue;
+        }
         let result = combine_retried(a.clone(), b.clone(), how, tolerance, divide);
         if result.as_ref().is_ok_and(|body| body.faces.is_empty() || meshes(body)) {
             return result;

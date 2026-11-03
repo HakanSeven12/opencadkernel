@@ -1894,7 +1894,7 @@ fn closed_period(curve: &Curve3) -> Option<f64> {
     }
 }
 
-fn periodic_images(
+pub(super) fn periodic_images(
     curve: &crate::geom2d::Curve,
     periods: [Option<f64>; 2],
 ) -> Vec<crate::geom2d::Curve> {

@@ -1718,8 +1718,81 @@ fn copy_island(
     Some(island)
 }
 
-/// The stretch of a line inside both boxes, widened a little so it still
-/// crosses the faces' edges, as a straight spline. `None` when it misses.
+/// Whether a circle or an ellipse runs over both faces at once: the
+/// stretches of it inside each face, cut where its image in that face's
+/// parameters (or a copy a turn away) crosses the face's boundary, sharing
+/// some of it or touching. `None` for any other curve, or where an image or
+/// a boundary cannot be had.
+fn conic_meets_both(
+    a: &Body,
+    one: FaceKey,
+    b: &Body,
+    other: FaceKey,
+    curve: &Curve3,
+    tolerance: f64,
+) -> Option<bool> {
+    use std::f64::consts::TAU;
+    let radius = match curve {
+        Curve3::Circle(circle) => circle.radius,
+        Curve3::Ellipse(ellipse) => ellipse.minor_radius.min(ellipse.major_radius),
+        _ => return None,
+    };
+    let fit = crate::geom2d::Tolerance::new(tolerance);
+    let spans = |body: &Body, face: FaceKey| -> Option<Vec<(f64, f64)>> {
+        let node = body.faces.get(face)?;
+        let surface = body.surfaces.get(node.surface)?;
+        let flat = super::pcurve::project(surface, curve, tolerance)?;
+        let boundary = super::pcurve::face_boundary(body, face, tolerance)?;
+        let inside = |at: f64| {
+            let point = curve.point_at(at);
+            surface.distance_to(point).abs() <= tolerance
+                && surface.parameters_at(point).is_some_and(|(u, v)| {
+                    super::pcurve::contains_parameter_facing(
+                        surface,
+                        &boundary,
+                        [u, v],
+                        fit,
+                        node.forward,
+                    )
+                })
+        };
+        let mut cuts: Vec<f64> = Vec::new();
+        for image in super::split::periodic_images(&flat, super::pcurve::periods(surface)) {
+            for edge in &boundary {
+                for crossing in crate::geom2d::intersect(&image, edge, fit) {
+                    let point = surface.point_at(crossing.point[0], crossing.point[1]);
+                    cuts.push(curve.parameter_at(point).rem_euclid(TAU));
+                }
+            }
+        }
+        cuts.sort_by(f64::total_cmp);
+        cuts.dedup_by(|next, kept| (*next - *kept).abs() <= 1e-9);
+        if cuts.is_empty() {
+            return Some(if inside(0.0) { vec![(0.0, TAU)] } else { Vec::new() });
+        }
+        Some(
+            (0..cuts.len())
+                .map(|index| {
+                    let from = cuts[index];
+                    let to = cuts.get(index + 1).copied().unwrap_or(cuts[0] + TAU);
+                    (from, to)
+                })
+                .filter(|(from, to)| inside(0.5 * (from + to)))
+                .collect(),
+        )
+    };
+    let (first, second) = (spans(a, one)?, spans(b, other)?);
+    // Stretches within an angle the tolerance covers of each other touch.
+    let slack = tolerance / radius.max(f64::MIN_POSITIVE);
+    Some(first.iter().any(|(from, to)| {
+        second.iter().any(|(start, end)| {
+            [-TAU, 0.0, TAU].into_iter().any(|turn| {
+                from - slack <= end + turn && start + turn <= to + slack
+            })
+        })
+    }))
+}
+
 /// Whether a few points of one of `curves` lie on both faces — proof that
 /// the faces meet, found without meshing either to prove they do not. Silent
 /// on a spline, and on a meeting short enough to fall between the points:
@@ -1733,9 +1806,22 @@ fn seen_meeting(
     boxes: [Option<Aabb>; 2],
     tolerance: f64,
 ) -> bool {
-    let on = |body: &Body, face: FaceKey, point: [f64; 3]| {
-        super::classify::face_distance(body, face, point, tolerance)
-            .is_some_and(|gap| gap <= tolerance)
+    // As `classify::face_distance` asks it, each face's boundary built once
+    // for all the points rather than once a point.
+    let fit = crate::geom2d::Tolerance::new(tolerance);
+    let boundaries = [(a, one), (b, other)].map(|(body, face)| {
+        let node = body.faces.get(face)?;
+        let surface = body.surfaces.get(node.surface)?;
+        Some((surface, node.forward, super::pcurve::face_boundary(body, face, tolerance)?))
+    });
+    let on = |side: usize, point: [f64; 3]| {
+        let Some((surface, forward, boundary)) = &boundaries[side] else {
+            return false;
+        };
+        surface.distance_to(point).abs() <= tolerance
+            && surface.parameters_at(point).is_some_and(|(u, v)| {
+                super::pcurve::contains_parameter_facing(surface, boundary, [u, v], fit, *forward)
+            })
     };
     curves.iter().any(|curve| {
         let points: Vec<[f64; 3]> = match curve {
@@ -1758,10 +1844,12 @@ fn seen_meeting(
             },
             _ => Vec::new(),
         };
-        points.into_iter().any(|point| on(b, other, point) && on(a, one, point))
+        points.into_iter().any(|point| on(1, point) && on(0, point))
     })
 }
 
+/// The stretch of a line inside both boxes, widened a little so it still
+/// crosses the faces' edges, as a straight spline. `None` when it misses.
 fn clipped_line(line: &super::geometry::Line3, near: &Aabb, far: &Aabb) -> Option<Curve3> {
     let low: [f64; 3] = std::array::from_fn(|axis| near.min[axis].max(far.min[axis]));
     let high: [f64; 3] = std::array::from_fn(|axis| near.max[axis].min(far.max[axis]));
@@ -1899,6 +1987,22 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64, reach: bool) -> Result<Vec<
                     // nothing.
                     let pair = [*one_box, *other_box];
                     let seen = seen_meeting(a, *one, b, *other, &curves, pair, tolerance);
+                    // A circle or an ellipse settles it exactly: where it
+                    // runs inside each face, from its crossings with the
+                    // faces' boundaries, and whether those stretches share
+                    // any of it.
+                    let settled: Option<Vec<bool>> = (!seen)
+                        .then(|| {
+                            curves
+                                .iter()
+                                .map(|curve| conic_meets_both(a, *one, b, *other, curve, tolerance))
+                                .collect()
+                        })
+                        .flatten();
+                    if settled.as_ref().is_some_and(|meets| meets.iter().all(|meet| !meet)) {
+                        continue;
+                    }
+                    let seen = seen || settled.is_some();
                     if !seen {
                         let soups = soups.get_or_insert_with(|| {
                             (

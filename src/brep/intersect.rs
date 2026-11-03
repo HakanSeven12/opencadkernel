@@ -80,6 +80,11 @@ pub fn surfaces(a: &Surface, b: &Surface, tolerance: f64) -> Meeting {
         | (Surface::Cylinder(cylinder), Surface::Torus(torus)) => {
             torus_cylinder(torus, cylinder, tolerance)
         }
+        (Surface::Plane(plane), Surface::Torus(torus))
+        | (Surface::Torus(torus), Surface::Plane(plane)) => plane_torus(plane, torus, tolerance)
+            .or_else(|| coaxial_revolutions(a, b, tolerance))
+            .or_else(|| apart(a, b, tolerance))
+            .unwrap_or(Meeting::Unknown),
         // One torus twice — a fillet both solids of an assembly carry.
         (Surface::Torus(one), Surface::Torus(other)) if same_torus(one, other, tolerance) => {
             Meeting::Coincident
@@ -393,6 +398,36 @@ fn sphere_cylinder(sphere: &Sphere, cylinder: &Cylinder, tolerance: f64) -> Meet
 /// shaft through a knurled hub whose tube stands clear of it (#1563). Off
 /// that axis the section is a quartic; only a cylinder clear of the whole
 /// torus is answered.
+/// A plane through a torus's axis cuts it in the tube's own section on
+/// either side of the axis: two circles of the minor radius. `None` for any
+/// other plane.
+fn plane_torus(plane: &Plane, torus: &Torus, tolerance: f64) -> Option<Meeting> {
+    let normal = Vec3::from(plane.normal()?).normalize()?;
+    let axis = Vec3::from(torus.frame.normal()?).normalize()?;
+    let centre = Vec3::from(torus.frame.origin);
+    if normal.dot(axis).abs() > 1e-9
+        || (centre - Vec3::from(plane.origin)).dot(normal).abs() > tolerance
+    {
+        return None;
+    }
+    let across = axis.cross(normal).normalize()?;
+    let (major, minor) = (torus.major_radius.abs(), torus.minor_radius.abs());
+    Some(Meeting::Curves(
+        [1.0, -1.0]
+            .map(|side| {
+                Curve3::Circle(Circle3 {
+                    plane: Plane {
+                        origin: (centre + across * (major * side)).to_array(),
+                        x_axis: across.to_array(),
+                        y_axis: axis.to_array(),
+                    },
+                    radius: minor,
+                })
+            })
+            .to_vec(),
+    ))
+}
+
 fn torus_cylinder(torus: &Torus, cylinder: &Cylinder, tolerance: f64) -> Meeting {
     let (Some(axis), Some(torus_axis)) = (cylinder.base.normal(), torus.frame.normal()) else {
         return Meeting::Unknown;
