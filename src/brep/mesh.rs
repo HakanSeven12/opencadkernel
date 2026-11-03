@@ -5400,6 +5400,49 @@ fn parameter_triangle_degenerate(corners: [[f64; 2]; 3]) -> bool {
     (ab[0] * ac[1] - ab[1] * ac[0]).abs() <= f64::EPSILON * 128.0 * scale * scale
 }
 
+/// The largest distance between the surface along a straight parameter chord
+/// and the straight chord in space between its ends.
+fn chord_deviation(surface: &super::geometry::Surface, ends: [[f64; 2]; 2]) -> f64 {
+    let [from, to] = ends.map(|uv| surface.point_at(uv[0], uv[1]));
+    [0.25, 0.5, 0.75]
+        .into_iter()
+        .map(|unit| {
+            let on_surface = surface.point_at(
+                ends[0][0] + (ends[1][0] - ends[0][0]) * unit,
+                ends[0][1] + (ends[1][1] - ends[0][1]) * unit,
+            );
+            let on_chord = [0, 1, 2].map(|axis| from[axis] + (to[axis] - from[axis]) * unit);
+            distance3(on_surface, on_chord)
+        })
+        .fold(0.0, f64::max)
+}
+
+/// The largest distance between the surface over a parameter triangle and
+/// the flat triangle in space between its corners.
+fn flat_triangle_deviation(surface: &super::geometry::Surface, corners: [[f64; 2]; 3]) -> f64 {
+    let positions = corners.map(|uv| surface.point_at(uv[0], uv[1]));
+    [
+        [0.5, 0.5, 0.0],
+        [0.0, 0.5, 0.5],
+        [0.5, 0.0, 0.5],
+        [1.0 / 3.0; 3],
+        [0.5, 0.25, 0.25],
+        [0.25, 0.5, 0.25],
+        [0.25, 0.25, 0.5],
+    ]
+    .into_iter()
+    .map(|weights| {
+        let at = |values: [f64; 3]| {
+            values[0] * weights[0] + values[1] * weights[1] + values[2] * weights[2]
+        };
+        let on_surface =
+            surface.point_at(at(corners.map(|uv| uv[0])), at(corners.map(|uv| uv[1])));
+        let flat = [0, 1, 2].map(|axis| at(positions.map(|point| point[axis])));
+        distance3(on_surface, flat)
+    })
+    .fold(0.0, f64::max)
+}
+
 fn triangle_refinement(
     surface: &super::geometry::Surface,
     triangle: &crate::geom2d::constrained::ConstrainedTriangle,
@@ -5427,11 +5470,38 @@ fn triangle_refinement(
     // The edge sampler measures the curve's own turn, this the surface
     // normal's along the straight parameter chord, and the two differ by a
     // hair — 0.171 against 0.170 on a torus rim failed a whole face (#1563).
-    // Within twice the limit it stands; beyond that the ring is broken.
+    // Within twice the limit it stands; beyond that the ring is broken --
+    // unless the chord still lies within the caller's chordal deflection of
+    // the surface: then the normal turns across it (a crease, or a bend
+    // tighter than the boundary samples) but the chord is where the surface
+    // is. The triangle on it is then settled by its own deviation, since the
+    // chord cannot be split and its turn would refine it without end.
+    let deflection = fold_deviation(tolerance);
+    let turning_chords = (0..3)
+        .filter(|index| {
+            let [from, to] = edge_vertices[*index];
+            angle_exceeds(edge_angles[*index], max_angle * 2.0)
+                && triangle.constraints[*index]
+                && distance3(
+                    surface.point_at(corners[from][0], corners[from][1]),
+                    surface.point_at(corners[to][0], corners[to][1]),
+                ) > tolerance
+        })
+        .collect::<Vec<_>>();
+    if !turning_chords.is_empty()
+        && turning_chords.iter().all(|index| {
+            let [from, to] = edge_vertices[*index];
+            chord_deviation(surface, [corners[from], corners[to]]) <= deflection
+        })
+        && flat_triangle_deviation(surface, corners) <= deflection
+    {
+        return Some(TriangleRefinement::Complete);
+    }
     if (0..3).any(|index| {
         let [from, to] = edge_vertices[index];
         angle_exceeds(edge_angles[index], max_angle * 2.0)
             && triangle.constraints[index]
+            && chord_deviation(surface, [corners[from], corners[to]]) > deflection
             && distance3(
                 surface.point_at(corners[from][0], corners[from][1]),
                 surface.point_at(corners[to][0], corners[to][1]),
@@ -5755,8 +5825,9 @@ impl Drop for FoldDeviation {
     }
 }
 
-/// How far a folded piece may stray from its surface: the running
-/// tessellation's chordal deflection, else the `linear` tolerance at hand.
+/// How far a folded piece, a boundary chord, or a triangle on one may stray
+/// from its surface: the running tessellation's chordal deflection, else the
+/// `linear` tolerance at hand.
 fn fold_deviation(linear: f64) -> f64 {
     FOLD_DEVIATION.with(|cell| cell.get()).unwrap_or(linear)
 }
@@ -6284,6 +6355,65 @@ mod tests {
     fn a_triangle_away_from_the_pole_is_still_refined() {
         let away = refine([[0.2, 0.4], [0.8, 0.4], [0.5, 0.6]]);
         assert!(matches!(away, TriangleRefinement::Interior(_)));
+    }
+
+    /// A degree-1 spline ridge, 2 wide and 1 deep: two flat halves meeting
+    /// at `u = 0.5` (x = 1), 0.3 high there, so the normal turns by about
+    /// 33 degrees across the crease.
+    fn creased_sheet() -> Surface {
+        let net = [[0.0, 0.0], [1.0, 0.3], [2.0, 0.0]]
+            .iter()
+            .map(|[x, z]| vec![[*x, 0.0, *z], [*x, 1.0, *z]])
+            .collect();
+        Surface::Nurbs(crate::space::NurbsSurface3::new(1, 1, net, vec![], vec![], None).unwrap())
+    }
+
+    /// A triangle whose first side is a boundary chord 0.02 long across the
+    /// crease (about 3e-3 below the ridge), refined with a 15 degree limit.
+    fn refine_across_crease(tolerance: f64) -> TriangleRefinement {
+        let triangle = crate::geom2d::constrained::ConstrainedTriangle {
+            parameters: [[0.495, 0.5], [0.505, 0.5], [0.5, 0.505]],
+            constraints: [true, false, false],
+        };
+        let mut cache = ParameterMap::default();
+        triangle_refinement(
+            &creased_sheet(),
+            &triangle,
+            15f64.to_radians(),
+            tolerance,
+            &mut cache,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_boundary_chord_across_a_crease_within_the_deflection_is_kept() {
+        // The normal turns by more than twice the limit along the chord, which
+        // refused the triangle and lost the whole face; the chord is 3e-3
+        // from the surface, inside a 5e-3 deflection.
+        assert!(matches!(
+            refine_across_crease(5e-3),
+            TriangleRefinement::Complete
+        ));
+        let _deflection = FoldDeviation::set(5e-3);
+        assert!(matches!(
+            refine_across_crease(1e-3),
+            TriangleRefinement::Complete
+        ));
+    }
+
+    #[test]
+    fn a_boundary_chord_across_a_crease_beyond_the_deflection_is_still_refused() {
+        // A tighter deflection than the chord's 3e-3 keeps today's refusal.
+        assert!(matches!(
+            refine_across_crease(1e-3),
+            TriangleRefinement::Boundary
+        ));
+        let _deflection = FoldDeviation::set(1e-3);
+        assert!(matches!(
+            refine_across_crease(1e-3),
+            TriangleRefinement::Boundary
+        ));
     }
 
     #[test]
