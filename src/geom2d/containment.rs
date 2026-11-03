@@ -110,16 +110,36 @@ pub fn contains(boundary: &[Curve], point: [f64; 2], tolerance: Tolerance) -> bo
     if boundary.is_empty() {
         return false;
     }
-    // On the edge is in.
-    if boundary
+    // Each piece's box, grown by the tolerance: a face with a hundred holes
+    // asks only the few a ray or the point comes near, not every one.
+    let boxes: Vec<Option<[[f64; 2]; 2]>> = boundary
         .iter()
-        .any(|curve| distance_to(curve, point) <= tolerance.linear())
-    {
+        .map(|curve| {
+            curve_box(curve).map(|[low, high]| {
+                let grow = tolerance.linear();
+                [[low[0] - grow, low[1] - grow], [high[0] + grow, high[1] + grow]]
+            })
+        })
+        .collect();
+    // On the edge is in.
+    if boundary.iter().zip(&boxes).any(|(curve, bounds)| {
+        bounds.is_none_or(|[low, high]| {
+            (0..2).all(|axis| point[axis] >= low[axis] && point[axis] <= high[axis])
+        }) && distance_to(curve, point) <= tolerance.linear()
+    }) {
         return true;
     }
 
     for direction in CAST_DIRECTIONS {
-        if let Some(inside) = cast(boundary, point, direction, tolerance) {
+        let reached: Vec<&Curve> = boundary
+            .iter()
+            .zip(&boxes)
+            .filter(|(_, bounds)| {
+                bounds.is_none_or(|bounds| ray_meets_box(point, direction, &bounds))
+            })
+            .map(|(curve, _)| curve)
+            .collect();
+        if let Some(inside) = cast(&reached, point, direction, tolerance) {
             return inside;
         }
     }
@@ -129,9 +149,60 @@ pub fn contains(boundary: &[Curve], point: [f64; 2], tolerance: Tolerance) -> bo
     false
 }
 
+/// A box round a curve, or `None` where there is none to hand: a circle's,
+/// an arc's or an ellipse's whole round, a line's ends, a spline's control
+/// points with positive weights.
+fn curve_box(curve: &Curve) -> Option<[[f64; 2]; 2]> {
+    let around = |points: &mut dyn Iterator<Item = [f64; 2]>| {
+        points.fold(None, |bounds: Option<[[f64; 2]; 2]>, p| {
+            Some(match bounds {
+                None => [p, p],
+                Some([low, high]) => {
+                    [[low[0].min(p[0]), low[1].min(p[1])], [high[0].max(p[0]), high[1].max(p[1])]]
+                }
+            })
+        })
+    };
+    let round = |centre: [f64; 2], radius: f64| {
+        let radius = radius.abs();
+        Some([[centre[0] - radius, centre[1] - radius], [centre[0] + radius, centre[1] + radius]])
+    };
+    match curve {
+        Curve::Line(line) => around(&mut [line.start, line.end].into_iter()),
+        Curve::Circle(circle) => round(circle.centre, circle.radius),
+        Curve::Arc(arc) => round(arc.centre, arc.radius),
+        Curve::Ellipse(arc) => {
+            let ellipse = &arc.ellipse;
+            round(ellipse.centre, ellipse.major_radius.abs().max(ellipse.minor_radius.abs()))
+        }
+        Curve::Nurbs(spline) if spline.weights().iter().all(|weight| *weight > 0.0) => {
+            around(&mut spline.control_points().iter().copied())
+        }
+        _ => None,
+    }
+}
+
+/// Whether a ray from `origin` along `direction` reaches a box.
+fn ray_meets_box(origin: [f64; 2], direction: [f64; 2], [low, high]: &[[f64; 2]; 2]) -> bool {
+    let (mut near, mut far) = (0.0f64, f64::INFINITY);
+    for axis in 0..2 {
+        if direction[axis].abs() <= f64::EPSILON {
+            if origin[axis] < low[axis] || origin[axis] > high[axis] {
+                return false;
+            }
+            continue;
+        }
+        let a = (low[axis] - origin[axis]) / direction[axis];
+        let b = (high[axis] - origin[axis]) / direction[axis];
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+    }
+    near <= far
+}
+
 /// One ray cast. `None` when the result cannot be trusted.
 fn cast(
-    boundary: &[Curve],
+    boundary: &[&Curve],
     point: [f64; 2],
     direction: [f64; 2],
     tolerance: Tolerance,
@@ -141,7 +212,7 @@ fn cast(
         direction,
     });
     let mut hits: Vec<Vec2> = Vec::new();
-    for curve in boundary {
+    for &curve in boundary {
         // Keep polyline corners visible to the endpoint-degeneracy check.
         let segments = curve.segments();
         let pieces = if matches!(curve, Curve::Polyline(_)) {

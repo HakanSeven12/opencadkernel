@@ -84,10 +84,21 @@ enum Divide {
 /// patches first, as it came where that does not give a result whose every
 /// face meshes, and with a cylinder divided too where neither does.
 fn combine_dividing(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+    // Only round faces are asked: dividing round bodies is all the ways of
+    // trying differ by, and no way of dividing them mends a flat face that
+    // will not mesh — while a plate's face, with every hole cut so far, was
+    // meshed again at every cut of a long sequence.
     let meshes = |body: &Body| {
         let tolerance =
             super::mesh::TessellationTolerance::new(crate::tessellation::DEFAULT_ANGLE, 1e-9);
-        body.face_keys().all(|face| super::mesh::face_meshes(body, face, tolerance))
+        body.face_keys().all(|face| {
+            let flat = body
+                .faces
+                .get(face)
+                .and_then(|node| body.surfaces.get(node.surface))
+                .is_some_and(|surface| matches!(surface, Surface::Plane(_)));
+            flat || super::mesh::face_meshes(body, face, tolerance)
+        })
     };
     // A way of dividing that finds nothing more to divide than the one
     // before it repeats that one's work exactly, so it is not tried.
@@ -214,6 +225,10 @@ fn combine_here(
     result.roots = vec![lump];
 
     let mut kept = 0;
+    // Each body's face boxes, measured once for the twin search: index 0 the
+    // second body's (asked while the first is copied), 1 the first's.
+    let boxes: [HashMap<FaceKey, Option<super::Aabb>>; 2] = [&b, &a]
+        .map(|body| body.face_keys().map(|face| (face, super::face_bounds(body, face))).collect());
     // The faces taken from the first body, once it is done.
     let mut from_first = HashSet::new();
     for (body, other, classifier, wanted, flip, flip_other, first) in [
@@ -223,17 +238,34 @@ fn combine_here(
         if !first {
             from_first = result.face_keys().collect();
         }
+        // Faces meeting along an edge off every surface of the other body
+        // are on one side of it: the side is asked once a group.
+        let groups = side_groups(body, classifier, tolerance);
+        let mut sides: HashMap<usize, Containment> = HashMap::new();
         for face in body.face_keys() {
             // A shared wall is settled by the two normals rather than by
             // which side it is on: it is on both.
-            if let Some(twin) = coincident_twin(body, other, face, tolerance) {
+            let other_boxes = if first { &boxes[0] } else { &boxes[1] };
+            if let Some(twin) = coincident_twin(body, other, face, other_boxes, tolerance) {
                 if keeps_shared_wall(body, face, other, twin, [flip, flip_other], first) {
                     copy_face_with_tolerance(&mut result, body, face, shell, flip, tolerance)?;
                     kept += 1;
                 }
                 continue;
             }
-            match face_side(body, classifier, face, tolerance) {
+            let group = groups.get(&face).copied();
+            let side = match group.and_then(|group| sides.get(&group)) {
+                Some(side) => *side,
+                None => {
+                    let side = face_side(body, classifier, face, tolerance);
+                    if let (Some(group), Containment::Inside | Containment::Outside) = (group, side)
+                    {
+                        sides.insert(group, side);
+                    }
+                    side
+                }
+            };
+            match side {
                 // A piece of a shared wall the imprint divided differently
                 // on the two bodies has no twin of its own, but it lies on
                 // a face of the other on the same surface: the normals
@@ -361,6 +393,99 @@ fn part_loop(body: &mut Body, ring: super::LoopKey, outward: Vec3) -> Option<()>
     let at = loops.iter().position(|key| *key == ring)?;
     loops.insert(at + 1, hole);
     Some(())
+}
+
+/// A closed shell's volume, signed by which way its faces point.
+fn meshed_volume(piece: &Body, tolerance: f64) -> Result<f64, Snag> {
+    let mesh =
+        super::mesh::tessellate(piece, super::mesh::TessellationTolerance::new(0.3, tolerance));
+    if !mesh.missing_faces.is_empty() || mesh.mesh.is_empty() {
+        return Err(Snag::CutRefused);
+    }
+    let pivot = Vec3::from(mesh.mesh.positions[0]);
+    Ok(mesh
+        .mesh
+        .triangles
+        .iter()
+        .map(|triangle| {
+            let a = Vec3::from(mesh.mesh.positions[triangle[0]]) - pivot;
+            let b = Vec3::from(mesh.mesh.positions[triangle[1]]) - pivot;
+            let c = Vec3::from(mesh.mesh.positions[triangle[2]]) - pivot;
+            a.dot(b.cross(c)) / 6.0
+        })
+        .sum())
+}
+
+/// A closed shell's box volume, negative where its faces point into what
+/// it encloses — a cavity's: a step off a face along its outward normal
+/// lands inside the shell. Meshing each shell for its signed volume was
+/// most of a block's time being bitten into again and again. `None` where
+/// the step reads neither way.
+fn shell_sense(piece: &Body, tolerance: f64) -> Option<f64> {
+    let bounds = super::body_bounds(piece)?;
+    let size = Vec3::from(bounds.min).distance(Vec3::from(bounds.max));
+    let extent: f64 =
+        (0..3).map(|axis| (bounds.max[axis] - bounds.min[axis]).max(tolerance)).product();
+    let face = piece.face_keys().next()?;
+    let node = piece.faces.get(face)?;
+    let surface = piece.surfaces.get(node.surface)?;
+    let point = interior_point(piece, face, tolerance)?;
+    let (u, v) = surface.parameters_at(point)?;
+    let normal = Vec3::from(surface.normal_at(u, v)?).normalize()?;
+    let outward = if node.forward { normal } else { -normal };
+    let step = (size * 1e-4).max(tolerance * 100.0);
+    match contains_point(piece, (Vec3::from(point) + outward * step).to_array(), tolerance) {
+        Containment::Outside => Some(extent),
+        Containment::Inside => Some(-extent),
+        _ => None,
+    }
+}
+
+/// Groups of `body`'s faces joined across edges that keep off every surface
+/// of `other`: after the imprint each face lies wholly to one side of the
+/// other body, and crossing an edge that is not on its boundary does not
+/// change the side. A face on its boundary forms no group.
+fn side_groups(body: &Body, other: &Body, tolerance: f64) -> HashMap<FaceKey, usize> {
+    let surfaces: Vec<&Surface> =
+        other.faces.iter().filter_map(|(_, face)| other.surfaces.get(face.surface)).collect();
+    let near = |point: [f64; 3]| {
+        surfaces.iter().any(|surface| surface.distance_to(point).abs() <= tolerance * 10.0)
+    };
+    let mut parent: HashMap<FaceKey, FaceKey> =
+        body.face_keys().map(|face| (face, face)).collect();
+    fn root(parent: &mut HashMap<FaceKey, FaceKey>, mut face: FaceKey) -> FaceKey {
+        while parent[&face] != face {
+            let up = parent[&parent[&face]];
+            parent.insert(face, up);
+            face = up;
+        }
+        face
+    }
+    for (_, edge) in body.edges.iter() {
+        let [first, second] = edge.coedges[..] else { continue };
+        let (Some(one), Some(other_face)) = (owner_face(body, first), owner_face(body, second))
+        else {
+            continue;
+        };
+        let Some(curve) = body.curves.get(edge.curve) else { continue };
+        let span = edge.end_parameter - edge.start_parameter;
+        let crosses = [0.25, 0.5, 0.75]
+            .into_iter()
+            .any(|at| near(curve.point_at(edge.start_parameter + span * at)));
+        if !crosses {
+            let (a, b) = (root(&mut parent, one), root(&mut parent, other_face));
+            parent.insert(a, b);
+        }
+    }
+    let faces: Vec<FaceKey> = body.face_keys().collect();
+    let mut ids: HashMap<FaceKey, usize> = HashMap::new();
+    let mut groups = HashMap::new();
+    for face in faces {
+        let top = root(&mut parent, face);
+        let next = ids.len();
+        groups.insert(face, *ids.entry(top).or_insert(next));
+    }
+    groups
 }
 
 /// Gives each body its own copy of an edge the two only touch along: two
@@ -769,15 +894,10 @@ pub(super) fn regroup_shells(body: &mut Body, tolerance: f64) -> Result<(), Snag
         for face in faces {
             copy_face_with_tolerance(&mut piece, body, *face, shell, false, tolerance)?;
         }
-        let mesh = super::mesh::tessellate(&piece, super::mesh::TessellationTolerance::new(0.3, tolerance));
-        if !mesh.missing_faces.is_empty() || mesh.mesh.is_empty() { return Err(Snag::CutRefused); }
-        let pivot = Vec3::from(mesh.mesh.positions[0]);
-        let volume = mesh.mesh.triangles.iter().map(|triangle| {
-            let a = Vec3::from(mesh.mesh.positions[triangle[0]]) - pivot;
-            let b = Vec3::from(mesh.mesh.positions[triangle[1]]) - pivot;
-            let c = Vec3::from(mesh.mesh.positions[triangle[2]]) - pivot;
-            a.dot(b.cross(c)) / 6.0
-        }).sum::<f64>();
+        let volume = match shell_sense(&piece, tolerance) {
+            Some(volume) => volume,
+            None => meshed_volume(&piece, tolerance)?,
+        };
         if !volume.is_finite() || volume.abs() <= tolerance.powi(3) { return Err(Snag::CutRefused); }
         pieces.push((piece, volume));
     }
@@ -907,11 +1027,17 @@ fn coincident_twin(
     body: &Body,
     other: &Body,
     face: FaceKey,
+    other_boxes: &HashMap<FaceKey, Option<super::Aabb>>,
     tolerance: f64,
 ) -> Option<FaceKey> {
     let surface = body.surfaces.get(body.faces.get(face)?.surface)?;
+    // Faces whose boxes stay apart are no twins; asked first, it spares the
+    // surface comparison against every face of the other body.
+    let own = super::face_bounds(body, face).map(|bounds| bounds.grown(tolerance * 10.0));
     other.face_keys().find(|candidate| {
-        other
+        own.is_none_or(|own| {
+            other_boxes.get(candidate).copied().flatten().is_none_or(|theirs| own.overlaps(&theirs))
+        }) && other
             .faces
             .get(*candidate)
             .and_then(|node| other.surfaces.get(node.surface))
@@ -1419,6 +1545,9 @@ fn find_edge(
         .find(|(key, edge)| {
             let ends_match = (edge.start == start && edge.end == end)
                 || (edge.start == end && edge.end == start);
+            if !ends_match {
+                return false;
+            }
             // One stretch of a spline between two corners is one edge,
             // though each solid's cut ended it a fit apart along the spline.
             // A closed spline has two stretches between the same corners;
@@ -1451,7 +1580,7 @@ fn find_edge(
                     let on = existing.point_at(existing.parameter_at(middle));
                     Vec3::from(on).distance(Vec3::from(middle)) <= tolerance
                 });
-            ends_match && (same_spline || same_middle || same_loop)
+            same_spline || same_middle || same_loop
         })
         .map(|(key, _)| key)
 }
