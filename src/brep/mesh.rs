@@ -4614,7 +4614,9 @@ fn fill_scheduled(
         .iter()
         .map(|ring| ring.iter().map(|point| point.parameters).collect())
         .collect();
-    let mut domain = ConstrainedMesh::new(&parameters)?;
+    let Some(mut domain) = ConstrainedMesh::new(&parameters) else {
+        return fill_crossing_planar_ring(body, face, surface, rings, max_angle, tolerance);
+    };
     let additions = seed_surface_grid(&mut domain, surface, &parameters, max_angle)?;
     let pins: Vec<BoundaryPoint> = rings.iter().flatten().cloned().collect();
     let flat = matches!(surface, super::geometry::Surface::Plane(_));
@@ -4715,6 +4717,208 @@ fn fill_scheduled(
         );
     }
     (!mesh.triangles.is_empty()).then_some(mesh)
+}
+
+/// A planar face whose only loop meets itself once: two of its edges cross, as
+/// in a "bow-tie" quadrilateral, or one of its corners lies on an edge it does
+/// not bound (to rounding, often just across it). The constrained triangulation
+/// refuses such a boundary, so the face would be missing. Its region is the
+/// even-odd fill of the loop, which is exactly the two simple loops the
+/// boundary splits into at that contact. Each is meshed on its own, with the
+/// loop's own points (plus the crossing point), so nothing is drawn outside the
+/// boundary.
+///
+/// Reached only after the triangulation has refused the face. Anything else is
+/// left as before: a curved surface, more than one loop, a hairline face, a
+/// loop that runs along itself, more than one contact, or two pieces one
+/// inside the other (where the even-odd fill is not their union).
+fn fill_crossing_planar_ring(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+    rings: &[Vec<BoundaryPoint>],
+    max_angle: f64,
+    tolerance: f64,
+) -> Option<Mesh> {
+    // A loop whose lobes cancel to a sliver is a hairline face, which the mesh
+    // leaves out on purpose (`hairline_face`); it stays so.
+    if !matches!(surface, super::geometry::Surface::Plane(_))
+        || rings.len() != 1
+        || hairline_face(body, face)
+    {
+        return None;
+    }
+    let pieces = split_at_crossings(surface, &rings[0])?;
+    let mut mesh = Mesh::default();
+    for piece in pieces {
+        mesh.absorb(fill_scheduled(
+            body,
+            face,
+            surface,
+            std::slice::from_ref(&piece),
+            max_angle,
+            tolerance,
+        )?);
+    }
+    (!mesh.triangles.is_empty()).then_some(mesh)
+}
+
+/// The two simple loops a loop splits into at its one self-contact: a corner
+/// lying on a segment it does not bound (split at that corner, no new point),
+/// or else one proper crossing (split at the crossing point). `None` when there
+/// is no such contact, more than one (their pieces can border an even-odd
+/// hole), a degenerate piece, or one piece inside the other (then the inner one
+/// is a hole of the even-odd fill, not part of it).
+fn split_at_crossings(
+    surface: &super::geometry::Surface,
+    ring: &[BoundaryPoint],
+) -> Option<Vec<Vec<BoundaryPoint>>> {
+    let mut ring = ring.to_vec();
+    if ring.len() > 1 && same_corner(ring[0].parameters, ring[ring.len() - 1].parameters) {
+        ring.pop();
+    }
+    let n = ring.len();
+    let eps = 1e-8 * ring_size(&ring);
+    let (touching, crossing) = (touches(&ring, eps), crossings(&ring, eps));
+    let (inner, outer) = if let ([(i, k)], []) = (touching.as_slice(), crossing.as_slice()) {
+        let (i, k) = (*i, *k);
+        // A corner on a segment it does not bound pinches the loop there: with
+        // that segment rotated to the end, the loop is the corner's two sides.
+        let rotated: Vec<BoundaryPoint> = ring[i + 1..].iter().chain(&ring[..=i]).cloned().collect();
+        let k = (k + n - (i + 1)) % n;
+        (rotated[..=k].to_vec(), rotated[k..].to_vec())
+    } else if let ([], [(i, j, at)]) = (touching.as_slice(), crossing.as_slice()) {
+        let (i, j, at) = (*i, *j, *at);
+        let crossing = BoundaryPoint {
+            parameters: at,
+            position: surface.point_at(at[0], at[1]),
+        };
+        let mut inner = vec![crossing.clone()];
+        inner.extend_from_slice(&ring[i + 1..=j]);
+        let mut outer = ring[..=i].to_vec();
+        outer.push(crossing);
+        outer.extend_from_slice(&ring[j + 1..]);
+        (inner, outer)
+    } else {
+        return None;
+    };
+    let simple = |piece: &[BoundaryPoint]| {
+        let eps = 1e-8 * ring_size(piece);
+        piece.len() >= 3 && crossings(piece, eps).is_empty() && touches(piece, eps).is_empty()
+    };
+    // A two-point piece is a needle: the loop running out along the segment the
+    // corner touches and straight back. It has no area, so the face is the
+    // other piece alone.
+    let pieces: Vec<Vec<BoundaryPoint>> = [inner, outer].into_iter().filter(|piece| piece.len() >= 3).collect();
+    if pieces.is_empty() || !pieces.iter().all(|piece| simple(piece)) {
+        return None;
+    }
+    let nested = pieces.iter().enumerate().any(|(a, piece)| {
+        pieces.iter().enumerate().any(|(b, other)| {
+            a != b
+                && piece.iter().any(|point| {
+                    !other
+                        .iter()
+                        .any(|corner| same_corner(corner.parameters, point.parameters))
+                        && inside_ring(other, point.parameters)
+                })
+        })
+    });
+    (!nested).then_some(pieces)
+}
+
+/// Every pair of non-adjacent segments of a closed loop that cross properly
+/// (each strictly separates the other's ends), with where they cross. A pair
+/// with an end within `eps` of the other segment is a corner touching it, not
+/// a crossing, and is left to [`touches`].
+fn crossings(ring: &[BoundaryPoint], eps: f64) -> Vec<(usize, usize, [f64; 2])> {
+    let n = ring.len();
+    let cross = |o: [f64; 2], a: [f64; 2], b: [f64; 2]| {
+        (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    };
+    let mut out = Vec::new();
+    for i in 0..n {
+        for j in i + 2..n {
+            if i == 0 && j == n - 1 {
+                continue;
+            }
+            let (a, b) = (ring[i].parameters, ring[i + 1].parameters);
+            let (c, d) = (ring[j].parameters, ring[(j + 1) % n].parameters);
+            if [(a, c, d), (b, c, d), (c, a, b), (d, a, b)]
+                .iter()
+                .any(|(p, s, e)| distance_to_segment(*p, *s, *e) <= eps)
+            {
+                continue;
+            }
+            let (o1, o2) = (cross(a, b, c), cross(a, b, d));
+            let (o3, o4) = (cross(c, d, a), cross(c, d, b));
+            if o1 * o2 < 0.0 && o3 * o4 < 0.0 {
+                let t = o3 / (o3 - o4);
+                out.push((i, j, [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]));
+            }
+        }
+    }
+    out
+}
+
+/// Every segment `i` and corner `k` that does not bound it but lies on it,
+/// within `eps` and away from its ends.
+fn touches(ring: &[BoundaryPoint], eps: f64) -> Vec<(usize, usize)> {
+    let n = ring.len();
+    let distance = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).hypot(p[1] - q[1]);
+    let mut out = Vec::new();
+    for i in 0..n {
+        let (a, b) = (ring[i].parameters, ring[(i + 1) % n].parameters);
+        for (k, corner) in ring.iter().enumerate() {
+            if k == i || k == (i + 1) % n {
+                continue;
+            }
+            let p = corner.parameters;
+            if distance(p, a) > eps && distance(p, b) > eps && distance_to_segment(p, a, b) <= eps {
+                out.push((i, k));
+            }
+        }
+    }
+    out
+}
+
+fn distance_to_segment(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+    let ab = [b[0] - a[0], b[1] - a[1]];
+    let length2 = ab[0] * ab[0] + ab[1] * ab[1];
+    let t = if length2 > 0.0 {
+        (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / length2).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p[0] - a[0] - ab[0] * t).hypot(p[1] - a[1] - ab[1] * t)
+}
+
+/// The diagonal of a loop's parameter box.
+fn ring_size(ring: &[BoundaryPoint]) -> f64 {
+    let mut low = [f64::INFINITY; 2];
+    let mut high = [f64::NEG_INFINITY; 2];
+    for point in ring {
+        for axis in 0..2 {
+            low[axis] = low[axis].min(point.parameters[axis]);
+            high[axis] = high[axis].max(point.parameters[axis]);
+        }
+    }
+    (high[0] - low[0]).hypot(high[1] - low[1])
+}
+
+/// Whether `point` lies inside a closed loop (even-odd rule).
+fn inside_ring(ring: &[BoundaryPoint], point: [f64; 2]) -> bool {
+    let mut inside = false;
+    for k in 0..ring.len() {
+        let (a, b) = (ring[k].parameters, ring[(k + 1) % ring.len()].parameters);
+        if (a[1] > point[1]) != (b[1] > point[1]) {
+            let x = a[0] + (point[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+            if point[0] < x {
+                inside = !inside;
+            }
+        }
+    }
+    inside
 }
 
 fn surface_grid_values(
@@ -6238,5 +6442,186 @@ mod tests {
         for triangle in &mesh.triangles {
             assert!(triangle.iter().all(|i| *i < mesh.positions.len()));
         }
+    }
+}
+
+#[cfg(test)]
+mod crossing_planar_ring_tests {
+    use super::*;
+    use crate::brep::geometry::{Curve3, Line3, Surface};
+    use crate::brep::{Coedge, Edge, Face, Loop, Lump, Provenance, Shell, Vertex};
+    use crate::space::Plane;
+
+    /// One planar face in z = 0 bounded by straight edges through `corners`,
+    /// in order, closed back to the first.
+    fn planar_sheet(corners: &[[f64; 2]]) -> Body {
+        let made = Provenance::Synthesized;
+        let mut body = Body::new();
+        let lump = body.lumps.insert(Lump {
+            shells: Vec::new(),
+            provenance: made.clone(),
+        });
+        body.roots.push(lump);
+        let shell = body.shells.insert(Shell {
+            faces: Vec::new(),
+            owner: lump,
+            provenance: made.clone(),
+        });
+        body.lumps.get_mut(lump).unwrap().shells.push(shell);
+        let surface = body.surfaces.insert(Surface::Plane(Plane {
+            origin: [0.0; 3],
+            x_axis: [1.0, 0.0, 0.0],
+            y_axis: [0.0, 1.0, 0.0],
+        }));
+        let face = body.faces.insert(Face {
+            surface,
+            forward: true,
+            loops: Vec::new(),
+            owner: shell,
+            provenance: made.clone(),
+        });
+        body.shells.get_mut(shell).unwrap().faces.push(face);
+        let ring = body.loops.insert(Loop {
+            coedges: Vec::new(),
+            owner: face,
+            provenance: made.clone(),
+        });
+        body.faces.get_mut(face).unwrap().loops.push(ring);
+        let vertices: Vec<_> = corners
+            .iter()
+            .map(|c| {
+                body.vertices.insert(Vertex {
+                    point: [c[0], c[1], 0.0],
+                    provenance: made.clone(),
+                })
+            })
+            .collect();
+        let n = corners.len();
+        for i in 0..n {
+            let (a, b) = (corners[i], corners[(i + 1) % n]);
+            let curve = body.curves.insert(Curve3::Line(Line3 {
+                origin: [a[0], a[1], 0.0],
+                direction: [b[0] - a[0], b[1] - a[1], 0.0],
+            }));
+            let edge = body.edges.insert(Edge {
+                curve,
+                start_parameter: 0.0,
+                end_parameter: 1.0,
+                start: vertices[i],
+                end: vertices[(i + 1) % n],
+                coedges: Vec::new(),
+                provenance: made.clone(),
+            });
+            let coedge = body.coedges.insert(Coedge {
+                edge,
+                forward: true,
+                pcurve: None,
+                owner: ring,
+                provenance: made.clone(),
+            });
+            body.edges.get_mut(edge).unwrap().coedges.push(coedge);
+            body.loops.get_mut(ring).unwrap().coedges.push(coedge);
+        }
+        body
+    }
+
+    /// The constrained fill of the sheet's face over its corner loop: the step
+    /// a refused boundary used to leave the face missing at.
+    fn fill(corners: &[[f64; 2]]) -> Option<Mesh> {
+        let body = planar_sheet(corners);
+        let face = body.face_keys().next().unwrap();
+        let surface = body.surfaces.get(body.faces.get(face).unwrap().surface).unwrap();
+        let ring: Vec<BoundaryPoint> = corners
+            .iter()
+            .map(|c| BoundaryPoint {
+                parameters: *c,
+                position: [c[0], c[1], 0.0],
+            })
+            .collect();
+        fill_scheduled(&body, face, surface, &[ring], crate::tessellation::DEFAULT_ANGLE, 1e-3)
+    }
+
+    fn in_triangle(p: [f64; 2], t: [[f64; 2]; 3]) -> bool {
+        let side = |a: [f64; 2], b: [f64; 2]| (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+        let s = [side(t[0], t[1]), side(t[1], t[2]), side(t[2], t[0])];
+        s.iter().all(|v| *v >= -1e-9) || s.iter().all(|v| *v <= 1e-9)
+    }
+
+    /// Every triangle's centre lies in one of `lobes`.
+    fn within(mesh: &Mesh, lobes: &[[[f64; 2]; 3]]) -> bool {
+        mesh.triangles.iter().all(|t| {
+            let [a, b, c] = t.map(|i| mesh.positions[i]);
+            let centre = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0];
+            lobes.iter().any(|lobe| in_triangle(centre, *lobe))
+        })
+    }
+
+    fn area(mesh: &Mesh) -> f64 {
+        mesh.triangles
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| Vec3::from(mesh.positions[i]));
+                0.5 * (b - a).cross(c - a).length()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn a_bow_tie_planar_face_is_meshed_as_its_two_lobes() {
+        // Edges (0,0)-(4,4) and (4,0)-(0,2) cross at (4/3, 4/3): a right lobe of
+        // area 48/9 and a left one of 12/9; nothing between them.
+        let mesh = fill(&[[0.0, 0.0], [4.0, 4.0], [4.0, 0.0], [0.0, 2.0]]).expect("drawn");
+        assert!((area(&mesh) - 60.0 / 9.0).abs() < 1e-9, "area {}", area(&mesh));
+        let x = [4.0 / 3.0, 4.0 / 3.0];
+        assert!(within(&mesh, &[[x, [4.0, 4.0], [4.0, 0.0]], [x, [0.0, 2.0], [0.0, 0.0]]]));
+    }
+
+    #[test]
+    fn a_planar_face_whose_corner_lies_on_another_edge_is_meshed_as_its_two_sides() {
+        // The corner (2, -1e-10) lies on the bottom edge (0,0)-(4,0), just
+        // across it: a right triangle of area 3 and a left quadrilateral of 3.5.
+        let corners = [[0.0, 0.0], [4.0, 0.0], [4.0, 3.0], [2.0, -1e-10], [1.0, 2.0], [0.0, 3.0]];
+        let mesh = fill(&corners).expect("drawn");
+        assert!((area(&mesh) - 6.5).abs() < 1e-6, "area {}", area(&mesh));
+        let c = [2.0, 0.0];
+        assert!(within(
+            &mesh,
+            &[[c, [4.0, 0.0], [4.0, 3.0]], [[0.0, 0.0], c, [1.0, 2.0]], [[0.0, 0.0], [1.0, 2.0], [0.0, 3.0]]]
+        ));
+    }
+
+    #[test]
+    fn a_planar_face_with_a_needle_back_along_an_edge_is_meshed_without_it() {
+        // Up the right edge to (4,4) and straight back down to (4+1e-10, 2): a
+        // needle with no area. The face is (0,0) (4,0) (4,2) (2,3) (0,3).
+        let corners = [[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [4.0 + 1e-10, 2.0], [2.0, 3.0], [0.0, 3.0]];
+        let mesh = fill(&corners).expect("drawn");
+        assert!((area(&mesh) - 11.0).abs() < 1e-6, "area {}", area(&mesh));
+        assert!(within(
+            &mesh,
+            &[[[0.0, 0.0], [4.0, 0.0], [4.0, 2.0]], [[0.0, 0.0], [4.0, 2.0], [2.0, 3.0]], [[0.0, 0.0], [2.0, 3.0], [0.0, 3.0]]]
+        ));
+    }
+
+    #[test]
+    fn faces_the_triangulation_accepts_or_cannot_split_are_as_before() {
+        // A plain square: two triangles, area 4.
+        let square = fill(&[[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]]).expect("drawn");
+        assert_eq!(square.triangles.len(), 2);
+        assert!((area(&square) - 4.0).abs() < 1e-9);
+        // A star with five crossings: more than one contact stays refused.
+        let star: Vec<[f64; 2]> = (0..5)
+            .map(|k| {
+                let angle = std::f64::consts::FRAC_PI_2 + k as f64 * 4.0 * std::f64::consts::PI / 5.0;
+                [angle.cos(), angle.sin()]
+            })
+            .collect();
+        assert!(fill(&star).is_none());
+        // A symmetric bow-tie: its lobes cancel, so it is a hairline face by the
+        // mesh's own rule, and it stays left out as before.
+        let symmetric = [[0.0, 0.0], [2.0, 2.0], [2.0, 0.0], [0.0, 2.0]];
+        let sheet = planar_sheet(&symmetric);
+        assert!(hairline_face(&sheet, sheet.face_keys().next().unwrap()));
+        assert!(fill(&symmetric).is_none());
     }
 }
