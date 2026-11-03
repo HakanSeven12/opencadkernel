@@ -2005,6 +2005,14 @@ impl Turn {
         )
     }
 
+    /// Whether an arc off the axis sweeps a spindle torus: its circle's
+    /// centre across the axis from the arc, or no farther from the axis than
+    /// the circle's radius. A centre on the axis is a sphere, not a spindle.
+    fn spindle(&self, plane: &Plane, arc: &crate::geom2d::Arc) -> bool {
+        let centre = self.station(plane, arc.centre).radius;
+        centre.abs() > self.tolerance && (centre < 0.0 || centre <= arc.radius + self.tolerance)
+    }
+
     /// The rectangular surface parameters traced by one circular profile arc.
     ///
     /// A circle centre on the negative side of the axis is represented by a
@@ -2412,7 +2420,14 @@ impl Turn {
                     ))
                 }
             }
-            Curve2::Arc(arc) => {
+            // A circle whose centre lies across the axis, or nearer it than
+            // its radius, sweeps a spindle torus: two sheets in one radial
+            // half-plane, which its parameters cannot tell apart. Such an
+            // arc (a nearly straight one always is) goes round as the exact
+            // rational surface of revolution instead.
+            Curve2::Arc(arc)
+                if !self.spindle(plane, arc) =>
+            {
                 let centre = self.station(plane, arc.centre);
                 if centre.radius.abs() <= self.tolerance {
                     Some(PieceSurface::Surface(
@@ -2433,7 +2448,7 @@ impl Turn {
                     ))
                 }
             }
-            Curve2::Ellipse(_) | Curve2::Nurbs(_) => {
+            Curve2::Arc(_) | Curve2::Ellipse(_) | Curve2::Nurbs(_) => {
                 let profile = RationalCurve2::from_curve(piece)?;
                 let angular = RationalCurve2::unit_arc(self.angle)?;
                 let around = self.axis.cross(self.radial);
