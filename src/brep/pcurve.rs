@@ -39,6 +39,42 @@ use std::f64::consts::TAU;
 /// `None` when the curve does not lie on the surface, and when the shape it
 /// traces there is not one this kernel can write down.
 pub fn project(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curve> {
+    // A boolean projects one cutter onto one surface over and over — on
+    // every face it tries, every round — and off a plane the image is
+    // sampled or inverted point by point. The last few are kept: a curve
+    // and a surface equal to ones seen give the image found then.
+    type Projection = (Surface, Curve3, u64, Option<Curve>);
+    thread_local! {
+        static SEEN: std::cell::RefCell<Vec<Projection>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if matches!(surface, Surface::Plane(_)) && !matches!(curve, Curve3::Nurbs(_)) {
+        return project_afresh(surface, curve, tolerance);
+    }
+    let bits = tolerance.to_bits();
+    let known = SEEN.with(|seen| {
+        seen.borrow()
+            .iter()
+            .find(|(s, c, t, _)| *t == bits && s == surface && c == curve)
+            .map(|(_, _, _, image)| image.clone())
+    });
+    if let Some(image) = known {
+        return image;
+    }
+    let image = project_afresh(surface, curve, tolerance);
+    SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        // ponytail: a short list searched in turn; a map keyed by a hash if
+        // booleans ever carry hundreds of cutters.
+        if seen.len() >= 32 {
+            seen.remove(0);
+        }
+        seen.push((surface.clone(), curve.clone(), bits, image.clone()));
+    });
+    image
+}
+
+fn project_afresh(surface: &Surface, curve: &Curve3, tolerance: f64) -> Option<Curve> {
     // A curve that is not on the surface has no image in its parameter
     // space, and projecting it anyway would produce a plausible shape in the
     // wrong place. Sampled rather than reasoned about per pair: the check is

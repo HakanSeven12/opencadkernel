@@ -94,7 +94,12 @@ pub fn shell(
     } else if let Some(result) = shell_revolved(body, &removed, distance) {
         result?
     } else {
-        shell_polyhedral(body, &removed, distance)?
+        match shell_polyhedral(body, &removed, distance) {
+            Err(ShellError::UnsupportedSolid) => {
+                shell_by_offset(body, &removed, distance).ok_or(ShellError::UnsupportedSolid)?
+            }
+            result => result?,
+        }
     };
     if result.face_keys().next().is_none() || result.roots.is_empty() {
         return Err(ShellError::NoMaterial);
@@ -1310,6 +1315,326 @@ fn recognize_sphere(body: &Body) -> Option<SphereShape> {
         radius: sphere.radius,
         face,
     })
+}
+
+/// Any solid of planes, cylinders, cones, spheres and tori hollowed by
+/// taking its own offset away from it: the same faces, edges and corners,
+/// each surface moved `distance` in — a removed face's out, so the cavity
+/// runs through it. A corner goes where its moved surfaces meet again, an
+/// edge along the moved pair's own meeting. `None` where an offset changes
+/// the solid's shape — a face shrinking to nothing, a pair no longer meeting
+/// — or a surface has no exact offset here.
+fn shell_by_offset(body: &Body, removed: &HashSet<FaceKey>, distance: f64) -> Option<Body> {
+    if distance <= 0.0 {
+        return None;
+    }
+    let tolerance = super::operation_tolerance(&[body]);
+    let inner = offset_inward(body, removed, distance, tolerance)?;
+    let volume = |body: &Body| super::mass_properties(body).map(|mass| mass.volume);
+    let (outer, cavity) = (volume(body)?, volume(&inner)?);
+    if !(cavity > 0.0) || removed.is_empty() && cavity >= outer {
+        return None;
+    }
+    let hollow = super::combine(body.clone(), inner, Operation::Difference, tolerance).ok()?;
+    let left = volume(&hollow)?;
+    (hollow.validate().is_empty() && left > 0.0 && left < outer).then_some(hollow)
+}
+
+/// `body` with every face moved `distance` along its inward normal, those
+/// in `opened` outward, and its corners and edges found again where the
+/// moved surfaces meet.
+fn offset_inward(
+    body: &Body,
+    opened: &HashSet<FaceKey>,
+    distance: f64,
+    tolerance: f64,
+) -> Option<Body> {
+    use super::geometry::{Circle3, Curve3, Ellipse3, Line3};
+    let mut inner = body.clone();
+    // Each face's surface moved; a surface two faces share moves once, the
+    // same way for both or not at all.
+    let mut moved: HashMap<super::SurfaceKey, Surface> = HashMap::new();
+    for (key, face) in body.faces.iter() {
+        let along = if opened.contains(&key) { distance } else { -distance };
+        let sense = if face.forward { 1.0 } else { -1.0 };
+        let surface = moved_surface(body.surfaces.get(face.surface)?, along * sense)?;
+        if moved.get(&face.surface).is_some_and(|known| *known != surface) {
+            return None;
+        }
+        moved.insert(face.surface, surface);
+    }
+    for (key, surface) in &moved {
+        *inner.surfaces.get_mut(*key)? = surface.clone();
+    }
+    let faces_at = |vertex: super::VertexKey| -> Vec<super::SurfaceKey> {
+        let mut out: Vec<super::SurfaceKey> = Vec::new();
+        for (_, edge) in body.edges.iter() {
+            if edge.start != vertex && edge.end != vertex {
+                continue;
+            }
+            for coedge in &edge.coedges {
+                let face = body
+                    .coedges
+                    .get(*coedge)
+                    .and_then(|coedge| body.loops.get(coedge.owner))
+                    .and_then(|ring| body.faces.get(ring.owner));
+                if let Some(face) = face {
+                    if !out.contains(&face.surface) {
+                        out.push(face.surface);
+                    }
+                }
+            }
+        }
+        out
+    };
+    // Each corner settled onto its moved surfaces by Gauss–Newton, the step
+    // the shortest that meets them all: a corner on two surfaces moves
+    // square to both, not along their meeting.
+    for (key, vertex) in body.vertices.iter() {
+        let surfaces: Vec<&Surface> =
+            faces_at(key).iter().filter_map(|surface| moved.get(surface)).collect();
+        if surfaces.is_empty() {
+            return None;
+        }
+        let mut point = Vec3::from(vertex.point);
+        for _ in 0..32 {
+            let mut rows: Vec<(Vec3, f64)> = Vec::with_capacity(surfaces.len());
+            for surface in &surfaces {
+                let gap = surface.distance_to(point.to_array());
+                let (u, v) = surface.parameters_at(point.to_array())?;
+                let normal = Vec3::from(surface.normal_at(u, v)?).normalize()?;
+                // Two patches of one surface ask the same thing once.
+                let same = rows.iter().any(|(seen, was)| {
+                    seen.dot(normal).abs() > 1.0 - 1e-12 && (was.abs() - gap.abs()).abs() <= 1e-12
+                });
+                if !same {
+                    rows.push((normal, gap));
+                }
+            }
+            if rows.iter().all(|(_, gap)| gap.abs() <= tolerance * 1e-3) {
+                break;
+            }
+            point = point - least_norm_step(&rows)?;
+        }
+        if surfaces.iter().any(|surface| surface.distance_to(point.to_array()).abs() > tolerance) {
+            return None;
+        }
+        inner.vertices.get_mut(key)?.point = point.to_array();
+    }
+    // Each edge along where its two moved surfaces meet, nearest where it
+    // was; a seam, one surface on both sides, along its own ruling.
+    for (key, edge) in body.edges.iter() {
+        let start = Vec3::from(inner.vertices.get(edge.start)?.point);
+        let end = Vec3::from(inner.vertices.get(edge.end)?.point);
+        let curve = body.curves.get(edge.curve)?;
+        let sides: Vec<super::SurfaceKey> = edge
+            .coedges
+            .iter()
+            .filter_map(|coedge| {
+                let ring = body.loops.get(body.coedges.get(*coedge)?.owner)?;
+                Some(body.faces.get(ring.owner)?.surface)
+            })
+            .collect();
+        let guess = start.lerp(end, 0.5);
+        let new_curve = match curve {
+            Curve3::Line(_) => {
+                let along = end - start;
+                if along.length() <= tolerance {
+                    return None;
+                }
+                Curve3::Line(Line3 { origin: start.to_array(), direction: along.to_array() })
+            }
+            Curve3::Circle(_) | Curve3::Ellipse(_) => {
+                let [one, other] = sides[..] else { return None };
+                let (first, second) = (moved.get(&one)?, moved.get(&other)?);
+                let found = match super::intersect::surfaces(first, second, tolerance) {
+                    super::intersect::Meeting::Curves(found) => found,
+                    // Two patches of one sphere: the line between them is
+                    // only where the sphere was divided, its corners going
+                    // wherever the real edges took them. A great circle runs
+                    // on through its two corners round the moved sphere; a
+                    // lesser one shrinks about the centre.
+                    super::intersect::Meeting::Coincident => {
+                        let (Surface::Sphere(was), Surface::Sphere(now), Curve3::Circle(circle)) =
+                            (body.surfaces.get(one)?, first, curve)
+                        else {
+                            return None;
+                        };
+                        let (centre, moved_centre) =
+                            (Vec3::from(was.frame.origin), Vec3::from(now.frame.origin));
+                        let mut circle = *circle;
+                        let great = Vec3::from(circle.plane.origin).distance(centre)
+                            <= was.radius * 1e-9;
+                        let normal = Vec3::from(circle.plane.normal()?);
+                        let through = (start - moved_centre).cross(end - moved_centre);
+                        match through.normalize() {
+                            Some(across) if great && edge.start != edge.end => {
+                                let across =
+                                    if across.dot(normal) < 0.0 { -across } else { across };
+                                let x = (start - moved_centre).normalize()?;
+                                circle.plane = crate::space::Plane {
+                                    origin: moved_centre.to_array(),
+                                    x_axis: x.to_array(),
+                                    y_axis: across.cross(x).to_array(),
+                                };
+                            }
+                            _ => {
+                                let scale = now.radius / was.radius;
+                                circle.plane.origin = (moved_centre
+                                    + (Vec3::from(circle.plane.origin) - centre) * scale)
+                                    .to_array();
+                            }
+                        }
+                        circle.radius = if great {
+                            now.radius
+                        } else {
+                            circle.radius * now.radius / was.radius
+                        };
+                        vec![Curve3::Circle(circle)]
+                    }
+                    _ => return None,
+                };
+                // The meeting curve passing nearest the edge's own corner,
+                // or, round a closed edge, its middle moved alike.
+                let reference = if edge.start == edge.end { start } else { guess };
+                let nearest = found.into_iter().min_by(|a, b| {
+                    let gap = |c: &Curve3| {
+                        Vec3::from(c.point_at(c.parameter_at(reference.to_array())))
+                            .distance(reference)
+                    };
+                    gap(a).total_cmp(&gap(b))
+                })?;
+                // Turning the way the edge's own curve turned.
+                let normal_of = |c: &Curve3| match c {
+                    Curve3::Circle(Circle3 { plane, .. })
+                    | Curve3::Ellipse(Ellipse3 { plane, .. }) => plane.normal().map(Vec3::from),
+                    _ => None,
+                };
+                let flip = normal_of(curve)?.dot(normal_of(&nearest)?) < 0.0;
+                match nearest {
+                    Curve3::Circle(mut circle) => {
+                        if flip {
+                            circle.plane.y_axis = (-Vec3::from(circle.plane.y_axis)).to_array();
+                        }
+                        Curve3::Circle(circle)
+                    }
+                    Curve3::Ellipse(mut ellipse) => {
+                        if flip {
+                            ellipse.plane.y_axis = (-Vec3::from(ellipse.plane.y_axis)).to_array();
+                        }
+                        Curve3::Ellipse(ellipse)
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let (from, to) = match &new_curve {
+            Curve3::Line(_) => (0.0, 1.0),
+            _ => {
+                let from = new_curve.parameter_at(start.to_array());
+                let span = if edge.start == edge.end {
+                    std::f64::consts::TAU
+                } else {
+                    let to = new_curve.parameter_at(end.to_array());
+                    (to - from).rem_euclid(std::f64::consts::TAU)
+                };
+                (from, from + span)
+            }
+        };
+        let off = |point: &Vec3| {
+            let on = new_curve.point_at(new_curve.parameter_at(point.to_array()));
+            Vec3::from(on).distance(*point)
+        };
+        if [start, end].iter().any(|point| off(point) > tolerance * 10.0) {
+            return None;
+        }
+        let curve_key = inner.curves.insert(new_curve);
+        let node = inner.edges.get_mut(key)?;
+        node.curve = curve_key;
+        node.start_parameter = from;
+        node.end_parameter = to;
+    }
+    for key in inner.coedges.keys().collect::<Vec<_>>() {
+        inner.coedges.get_mut(key)?.pcurve = None;
+    }
+    inner.validate().is_empty().then_some(inner)
+}
+
+/// `surface` moved `along` its own normal: a plane shifted, a cylinder,
+/// sphere or torus tube grown, a cone widened square to its side. `None`
+/// for a spline, and for one moved past its own axis or centre.
+fn moved_surface(surface: &Surface, along: f64) -> Option<Surface> {
+    use super::geometry::{Cone, Cylinder, Sphere, Torus};
+    Some(match surface {
+        Surface::Plane(plane) => {
+            let normal = Vec3::from(plane.normal()?).normalize()?;
+            let mut plane = *plane;
+            plane.origin = (Vec3::from(plane.origin) + normal * along).to_array();
+            Surface::Plane(plane)
+        }
+        Surface::Cylinder(cylinder) => {
+            let radius = cylinder.radius + along;
+            (radius > 0.0).then_some(Surface::Cylinder(Cylinder { radius, ..*cylinder }))?
+        }
+        Surface::Sphere(sphere) => {
+            let radius = sphere.radius + along;
+            (radius > 0.0).then_some(Surface::Sphere(Sphere { radius, ..*sphere }))?
+        }
+        Surface::Cone(cone) => Surface::Cone(Cone {
+            radius: cone.radius + along / cone.half_angle.cos(),
+            ..*cone
+        }),
+        Surface::Torus(torus) => {
+            let minor_radius = torus.minor_radius + along;
+            (minor_radius > 0.0).then_some(Surface::Torus(Torus { minor_radius, ..*torus }))?
+        }
+        Surface::Nurbs(_) | Surface::Offset(_) => return None,
+    })
+}
+
+/// The shortest step taking a point onto every surface whose unit normal
+/// and signed gap are given: the gaps' combination of the normals that
+/// closes each, two or three of them; more read in the least-squares sense.
+fn least_norm_step(rows: &[(Vec3, f64)]) -> Option<Vec3> {
+    // Normal equations of J Jᵀ y = g, then the step Jᵀ y.
+    let n = rows.len();
+    let mut gram = vec![vec![0.0; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            gram[i][j] = rows[i].0.dot(rows[j].0);
+        }
+    }
+    let mut rhs: Vec<f64> = rows.iter().map(|(_, gap)| *gap).collect();
+    // Gauss–Jordan with partial pivoting; a normal the others already span
+    // gets no share of the step.
+    let mut solved = vec![false; n];
+    for column in 0..n {
+        let pivot = (column..n)
+            .max_by(|a, b| gram[*a][column].abs().total_cmp(&gram[*b][column].abs()))?;
+        if gram[pivot][column].abs() <= 1e-9 {
+            continue;
+        }
+        gram.swap(column, pivot);
+        rhs.swap(column, pivot);
+        for row in 0..n {
+            if row != column {
+                let factor = gram[row][column] / gram[column][column];
+                for k in 0..n {
+                    gram[row][k] -= factor * gram[column][k];
+                }
+                rhs[row] -= factor * rhs[column];
+            }
+        }
+        solved[column] = true;
+    }
+    let mut step = Vec3::new(0.0, 0.0, 0.0);
+    for column in 0..n {
+        if solved[column] {
+            step = step + rows[column].0 * (rhs[column] / gram[column][column]);
+        }
+    }
+    Some(step)
 }
 
 #[cfg(test)]

@@ -247,13 +247,21 @@ pub fn chamfer_edges(
     ) {
         return result;
     }
+    // Set back equally on both faces, a bevel does not care which is the
+    // base: edges off the base face — every edge of a block at once — are
+    // bevelled all the same, the base face only naming the distances.
+    let symmetric = base_distance == other_distance;
     let rim = LocalBlend::Chamfer { base_face, base: base_distance, other: other_distance };
-    if let Some(result) = blend_rims(body, &selected, rim) {
-        return result.map_err(|error| match error {
-            LocalError::TooLarge => ChamferError::DistanceTooLargeOrInteracting,
-            LocalError::OutsideBaseFace(edge) => ChamferError::EdgeOutsideBaseFace(edge),
-            LocalError::InvalidResult => ChamferError::InvalidResult,
-        });
+    match blend_rims(body, &selected, rim) {
+        Some(Err(LocalError::OutsideBaseFace(_))) if symmetric => {}
+        Some(result) => {
+            return result.map_err(|error| match error {
+                LocalError::TooLarge => ChamferError::DistanceTooLargeOrInteracting,
+                LocalError::OutsideBaseFace(edge) => ChamferError::EdgeOutsideBaseFace(edge),
+                LocalError::InvalidResult => ChamferError::InvalidResult,
+            });
+        }
+        None => {}
     }
     let prismatic = super::chamfer_prismatic::chamfer_prismatic(
         body,
@@ -324,7 +332,7 @@ fn chamfer_convex(
     for &edge in selected {
         validate_chamfer_edge(body, edge)?;
         let frame = edge_frame(body, edge).ok_or(ChamferError::DegenerateGeometry(edge))?;
-        if !frame.faces.contains(&base_face) {
+        if !frame.faces.contains(&base_face) && base_distance != other_distance {
             return Err(ChamferError::EdgeOutsideBaseFace(edge));
         }
         frames.push((edge, frame));
@@ -723,20 +731,33 @@ fn blend_by_cut(body: &Body, selected: &[EdgeKey], section: Section) -> Option<B
     let mut result = body.clone();
     for (start, end, ring) in marks {
         let near = |p: Vec3, q: Vec3| p.distance(q) <= tolerance * 10.0;
-        // A straight one: an arc may join the same two corners.
-        let edge = result.edges.iter().find_map(|(key, edge)| {
-            match (result.curves.get(edge.curve)?, ring) {
-                (curve, None) if straight(curve) => {}
-                (Curve3::Circle(circle), Some((centre, radius)))
-                    if near(Vec3::from(circle.plane.origin), centre)
-                        && (circle.radius - radius).abs() <= tolerance * 10.0 => {}
-                _ => return None,
-            }
-            let a = Vec3::from(result.vertices.get(edge.start)?.point);
-            let b = Vec3::from(result.vertices.get(edge.end)?.point);
-            ((near(a, start) && near(b, end)) || (near(a, end) && near(b, start)))
-                .then_some(key)
-        })?;
+        // A straight one: an arc may join the same two corners. A straight
+        // edge a round before shortened — two edges meeting at a corner,
+        // the first rounded — is what is left of it: the longest straight
+        // edge lying along the stretch it ran.
+        let along = |point: Vec3| point.distance_to_segment(start, end) <= tolerance * 10.0;
+        let edge = result
+            .edges
+            .iter()
+            .filter_map(|(key, edge)| {
+                let a = Vec3::from(result.vertices.get(edge.start)?.point);
+                let b = Vec3::from(result.vertices.get(edge.end)?.point);
+                match (result.curves.get(edge.curve)?, ring) {
+                    (curve, None) if straight(curve) => {
+                        (along(a) && along(b)).then_some((key, a.distance(b)))
+                    }
+                    (Curve3::Circle(circle), Some((centre, radius)))
+                        if near(Vec3::from(circle.plane.origin), centre)
+                            && (circle.radius - radius).abs() <= tolerance * 10.0 =>
+                    {
+                        ((near(a, start) && near(b, end)) || (near(a, end) && near(b, start)))
+                            .then_some((key, 0.0))
+                    }
+                    _ => None,
+                }
+            })
+            .max_by(|x, y| x.1.total_cmp(&y.1))
+            .map(|(key, _)| key)?;
         result = match ring {
             None => cut_along_edge(&result, edge, section, tolerance)
                 .or_else(|| cut_along_ruling(&result, edge, section, tolerance))?,
