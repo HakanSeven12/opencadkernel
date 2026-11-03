@@ -8,59 +8,72 @@
 //! two triangle sets further apart than both deviations together cannot hide
 //! a meeting of the surfaces they approximate.
 
-use super::mesh::{tessellate, TessellationTolerance};
+use super::mesh::{face_triangles, TessellationTolerance};
 use super::topology::{Body, FaceKey};
 use crate::space::Vec3;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 
 /// A body's faces as triangles, with how far each face's mesh strays from
 /// its surface. Per face: a plane beside a coarse spline is held to its own
-/// exact mesh, not to the spline's.
-pub(super) struct FaceSoups {
-    by_face: HashMap<FaceKey, Vec<[Vec3; 3]>>,
-    deviation: HashMap<FaceKey, f64>,
+/// exact mesh, not to the spline's. A face is meshed the first time it is
+/// asked for — a boolean tests a handful of a large body's faces, and
+/// meshing all of them each time was most of a long sequence's work.
+pub(super) struct FaceSoups<'a> {
+    body: &'a Body,
+    tolerance: f64,
+    by_face: HashMap<FaceKey, OnceCell<Option<Soup>>>,
 }
 
-impl FaceSoups {
-    pub(super) fn of(body: &Body, tolerance: f64) -> Self {
-        let chord = tolerance.max(1e-9);
-        let mesh = tessellate(body, TessellationTolerance::new(0.1, chord));
-        let mut by_face: HashMap<FaceKey, Vec<[Vec3; 3]>> = HashMap::new();
-        for (triangle, face) in mesh.mesh.triangles.iter().zip(&mesh.triangle_faces) {
-            let corners = triangle.map(|index| Vec3::from(mesh.mesh.positions[index]));
-            by_face.entry(*face).or_default().push(corners);
+struct Soup {
+    triangles: Vec<[Vec3; 3]>,
+    deviation: f64,
+}
+
+impl<'a> FaceSoups<'a> {
+    pub(super) fn of(body: &'a Body, tolerance: f64) -> Self {
+        let by_face = body.face_keys().map(|face| (face, OnceCell::new())).collect();
+        Self { body, tolerance, by_face }
+    }
+
+    fn soup(&self, face: FaceKey) -> Option<&Soup> {
+        self.by_face.get(&face)?.get_or_init(|| self.mesh(face)).as_ref()
+    }
+
+    /// A face the mesh could not draw has no soup: nothing can be proved
+    /// about it, and `apart` says so.
+    fn mesh(&self, face: FaceKey) -> Option<Soup> {
+        let chord = self.tolerance.max(1e-9);
+        let mesh = face_triangles(self.body, face, TessellationTolerance::new(0.1, chord))?;
+        let triangles: Vec<[Vec3; 3]> = mesh
+            .triangles
+            .iter()
+            .map(|triangle| triangle.map(|index| Vec3::from(mesh.positions[index])))
+            .collect();
+        if triangles.is_empty() {
+            return None;
         }
-        // How far each face's mesh strays, read at a few hundred of its
-        // triangles — half as much again where some went unread — and never
-        // below the chord it was meshed to: projecting every centroid onto a
-        // spline was most of a boolean's time.
-        let mut deviation: HashMap<FaceKey, f64> = HashMap::new();
-        for (face, triangles) in &by_face {
-            let Some(surface) =
-                body.faces.get(*face).and_then(|node| body.surfaces.get(node.surface))
-            else {
-                continue;
-            };
-            let stride = (triangles.len() / 256).max(1);
-            let worst = triangles
-                .iter()
-                .step_by(stride)
-                .map(|corners| {
-                    let centre = (corners[0] + corners[1] + corners[2]) * (1.0 / 3.0);
-                    surface.distance_to(centre.to_array()).abs()
-                })
-                .filter(|gap| gap.is_finite())
-                .fold(chord, f64::max);
-            deviation.insert(*face, if stride > 1 { worst * 1.5 } else { worst });
-        }
-        // A face the mesh could not draw has no soup: nothing can be proved
-        // about it, and `apart` says so.
-        let _ = mesh.missing_faces;
-        Self { by_face, deviation }
+        // How far the mesh strays, read at a few hundred of its triangles —
+        // half as much again where some went unread — and never below the
+        // chord it was meshed to: projecting every centroid onto a spline was
+        // most of a boolean's time.
+        let surface = self.body.surfaces.get(self.body.faces.get(face)?.surface)?;
+        let stride = (triangles.len() / 256).max(1);
+        let worst = triangles
+            .iter()
+            .step_by(stride)
+            .map(|corners| {
+                let centre = (corners[0] + corners[1] + corners[2]) * (1.0 / 3.0);
+                surface.distance_to(centre.to_array()).abs()
+            })
+            .filter(|gap| gap.is_finite())
+            .fold(chord, f64::max);
+        let deviation = if stride > 1 { worst * 1.5 } else { worst };
+        Some(Soup { triangles, deviation })
     }
 
     pub(super) fn triangles(&self, face: FaceKey) -> Option<&[[Vec3; 3]]> {
-        self.by_face.get(&face).map(Vec::as_slice)
+        self.soup(face).map(|soup| soup.triangles.as_slice())
     }
 }
 
@@ -68,21 +81,19 @@ impl FaceSoups {
 /// `tolerance`. `false` whenever it cannot be shown — a face with no mesh,
 /// or triangles that come that close.
 pub(super) fn apart(
-    one: &FaceSoups,
+    one: &FaceSoups<'_>,
     face: FaceKey,
-    other: &FaceSoups,
+    other: &FaceSoups<'_>,
     other_face: FaceKey,
     tolerance: f64,
 ) -> bool {
-    let (Some(first), Some(second)) = (one.by_face.get(&face), other.by_face.get(&other_face))
-    else {
+    let (Some(first), Some(second)) = (one.soup(face), other.soup(other_face)) else {
         return false;
     };
     // A centroid sample can miss the worst of a patch's bulge; twice the
     // measured deviation covers it.
-    let deviation =
-        |soups: &FaceSoups, face: FaceKey| soups.deviation.get(&face).copied().unwrap_or(0.0);
-    let margin = 2.0 * (deviation(one, face) + deviation(other, other_face)) + tolerance;
+    let margin = 2.0 * (first.deviation + second.deviation) + tolerance;
+    let (first, second) = (&first.triangles, &second.triangles);
     let boxes = |triangles: &[[Vec3; 3]]| -> Vec<(Vec3, Vec3)> {
         triangles
             .iter()

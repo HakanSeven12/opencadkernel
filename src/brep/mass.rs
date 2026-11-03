@@ -68,9 +68,18 @@ pub fn mass_properties(body: &Body) -> Option<MassProperties> {
             body,
             super::mesh::TessellationTolerance::new(angle, chord),
         );
-        mesh.missing_faces.is_empty().then(|| mesh.mesh.inertial_properties()).flatten()
+        mesh.missing_faces
+            .is_empty()
+            .then(|| Some((mesh.mesh.inertial_properties()?, mesh.crossed)))
+            .flatten()
     };
-    let fine = meshed(0.05).or_else(|| meshed(0.2))?;
+    let (fine, crossed) = meshed(0.05).or_else(|| meshed(0.2))?;
+    // A face filled across touching rings converges unevenly: measured finer
+    // rather than extrapolated.
+    if crossed {
+        return Some(meshed(0.0125).map_or(fine, |(finest, _)| finest));
+    }
+    let meshed = |angle: f64| meshed(angle).map(|(properties, _)| properties);
     // A face too fine to triangulate whole at the finer step still has its
     // properties at the coarser one.
     let Some(coarse) = meshed(0.1) else {

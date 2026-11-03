@@ -1,4 +1,22 @@
 use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation};
+use std::cell::Cell;
+
+thread_local! {
+    static SPLIT_CROSSINGS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `fill` with boundary chords that cross split where they cross,
+/// rather than the triangulation refused. Rings whose curves only touch — a
+/// hole tangent to its face's rim — cross as chords near the touch however
+/// finely they are sampled; split, the parity test still keeps the right
+/// side, a sliver at the touch aside. A last resort, for a face nothing else
+/// meshes.
+pub(crate) fn splitting_crossings<T>(fill: impl FnOnce() -> T) -> T {
+    let before = SPLIT_CROSSINGS.with(|flag| flag.replace(true));
+    let filled = fill();
+    SPLIT_CROSSINGS.with(|flag| flag.set(before));
+    filled
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ParameterVertex {
@@ -23,6 +41,9 @@ pub(crate) struct ConstrainedTriangle {
 pub(crate) struct ConstrainedMesh {
     triangulation: ConstrainedDelaunayTriangulation<ParameterVertex>,
     rings: Vec<Vec<[f64; 2]>>,
+    /// Each ring's box, `[min x, max x, min y, max y]`: a face with a hundred
+    /// holes tests a point against the one or two rings around it, not all.
+    ring_boxes: Vec<[f64; 4]>,
     origin: [f64; 2],
     scale: [f64; 2],
 }
@@ -51,6 +72,15 @@ impl ConstrainedMesh {
         let mut mesh = Self {
             triangulation: ConstrainedDelaunayTriangulation::new(),
             rings: rings.to_vec(),
+            ring_boxes: rings
+                .iter()
+                .map(|ring| {
+                    ring.iter().fold(
+                        [f64::INFINITY, f64::NEG_INFINITY, f64::INFINITY, f64::NEG_INFINITY],
+                        |b, p| [b[0].min(p[0]), b[1].max(p[0]), b[2].min(p[1]), b[3].max(p[1])],
+                    )
+                })
+                .collect(),
             origin,
             scale,
         };
@@ -73,11 +103,30 @@ impl ConstrainedMesh {
             }
             handles.push(ring_handles);
         }
+        let (origin, scale) = (mesh.origin, mesh.scale);
+        let splitting = SPLIT_CROSSINGS.with(Cell::get);
         for ring in handles {
             for index in 0..ring.len() {
                 let from = ring[index];
                 let to = ring[(index + 1) % ring.len()];
-                if from == to || mesh.triangulation.try_add_constraint(from, to).is_empty() {
+                if from == to {
+                    return None;
+                }
+                if !mesh.triangulation.try_add_constraint(from, to).is_empty() {
+                    continue;
+                }
+                if !splitting
+                    || mesh
+                        .triangulation
+                        .add_constraint_and_split(from, to, |position| ParameterVertex {
+                            parameters: [
+                                origin[0] + position.x * scale[0],
+                                origin[1] + position.y * scale[1],
+                            ],
+                            position,
+                        })
+                        .is_empty()
+                {
                     return None;
                 }
             }
@@ -150,7 +199,11 @@ impl ConstrainedMesh {
     fn inside(&self, point: [f64; 2]) -> bool {
         self.rings
             .iter()
-            .filter(|ring| ring_contains(ring, point))
+            .zip(&self.ring_boxes)
+            .filter(|(_, b)| {
+                point[0] >= b[0] && point[0] <= b[1] && point[1] >= b[2] && point[1] <= b[3]
+            })
+            .filter(|(ring, _)| ring_contains(ring, point))
             .count()
             % 2
             == 1

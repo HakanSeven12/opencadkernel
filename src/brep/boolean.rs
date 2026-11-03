@@ -31,7 +31,7 @@ use super::topology::{Body, CoedgeKey, EdgeKey, Face, FaceKey, Lump, Shell, Vert
 use super::{Placement, Provenance};
 use crate::geom2d::Curve;
 use crate::space::Vec3;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Which combination to take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,10 +204,15 @@ fn combine_here(
     result.roots = vec![lump];
 
     let mut kept = 0;
+    // The faces taken from the first body, once it is done.
+    let mut from_first = HashSet::new();
     for (body, other, classifier, wanted, flip, flip_other, first) in [
         (&a, &b, &original_b, keep_a, flip_a, flip_b, true),
         (&b, &a, &original_a, keep_b, flip_b, flip_a, false),
     ] {
+        if !first {
+            from_first = result.face_keys().collect();
+        }
         for face in body.face_keys() {
             // A shared wall is settled by the two normals rather than by
             // which side it is on: it is on both.
@@ -244,6 +249,7 @@ fn combine_here(
         // solids that do not touch, intersected.
         return Ok(Body::new());
     }
+    separate_touching_edges(&mut result, &from_first);
     orient_shell(&mut result)?;
     if result.edges.iter().any(|(_, edge)| {
         let uses = edge.coedges.len();
@@ -255,7 +261,147 @@ fn combine_here(
     }
     regroup_shells(&mut result, tolerance)?;
     merge_coplanar_faces(&mut result, tolerance);
+    split_pinched_loops(&mut result);
     Ok(result)
+}
+
+/// Parts a flat face's loop that passes through one vertex twice — a hole
+/// cut tangent to the face's rim, its circle and the rim's run one after the
+/// other through the point they share — into the rim and the hole, each a
+/// loop of its own: what a face with a hole is everywhere else, and what
+/// meshing and measuring it expect. The loop running counter-clockwise about
+/// the face's outward normal stays first. A body that would not validate
+/// afterwards is left as it was.
+fn split_pinched_loops(body: &mut Body) {
+    let mut parted = body.clone();
+    let mut changed = false;
+    for face in parted.face_keys().collect::<Vec<_>>() {
+        let Some(outward) = parted.faces.get(face).and_then(|node| {
+            let Surface::Plane(plane) = parted.surfaces.get(node.surface)? else {
+                return None;
+            };
+            Some(Vec3::from(plane.normal()?) * if node.forward { 1.0 } else { -1.0 })
+        }) else {
+            continue;
+        };
+        let mut index = 0;
+        while let Some(ring) =
+            parted.faces.get(face).and_then(|node| node.loops.get(index)).copied()
+        {
+            match part_loop(&mut parted, ring, outward) {
+                Some(()) => changed = true,
+                None => index += 1,
+            }
+        }
+    }
+    if changed && parted.validate().is_empty() {
+        *body = parted;
+    }
+}
+
+/// Moves the stretch of `ring` between two visits to one vertex into a new
+/// loop of the same face. `None` when no vertex repeats.
+fn part_loop(body: &mut Body, ring: super::LoopKey, outward: Vec3) -> Option<()> {
+    let coedges = body.loops.get(ring)?.coedges.clone();
+    let start_of = |coedge: CoedgeKey| -> Option<VertexKey> {
+        let coedge = body.coedges.get(coedge)?;
+        let edge = body.edges.get(coedge.edge)?;
+        Some(if coedge.forward { edge.start } else { edge.end })
+    };
+    let starts = coedges.iter().map(|coedge| start_of(*coedge)).collect::<Option<Vec<_>>>()?;
+    let (from, to) = (0..starts.len()).find_map(|from| {
+        (from + 1..starts.len()).find(|to| starts[*to] == starts[from]).map(|to| (from, to))
+    })?;
+    let inner: Vec<CoedgeKey> = coedges[from..to].to_vec();
+    let outer: Vec<CoedgeKey> = coedges[..from].iter().chain(&coedges[to..]).copied().collect();
+    // Which way each runs round the face's normal, from its edges' points.
+    let winding = |part: &[CoedgeKey]| -> Option<f64> {
+        let mut points = Vec::new();
+        for coedge in part {
+            let node = body.coedges.get(*coedge)?;
+            let mut along = super::edge_points(body, node.edge, 1e-3)?;
+            if !node.forward {
+                along.reverse();
+            }
+            points.extend(along.into_iter().map(Vec3::from));
+        }
+        let mut area = Vec3::new(0.0, 0.0, 0.0);
+        for (index, point) in points.iter().enumerate() {
+            area = area + point.cross(points[(index + 1) % points.len()]);
+        }
+        Some(area.dot(outward))
+    };
+    let (first, second) = match (winding(&outer)?, winding(&inner)?) {
+        (o, i) if o > 0.0 && i < 0.0 => (outer, inner),
+        (o, i) if i > 0.0 && o < 0.0 => (inner, outer),
+        _ => return None,
+    };
+    let face = body.loops.get(ring)?.owner;
+    let provenance = body.loops.get(ring)?.provenance.clone();
+    body.loops.get_mut(ring)?.coedges = first;
+    let hole = body.loops.insert(super::topology::Loop {
+        coedges: second.clone(),
+        owner: face,
+        provenance,
+    });
+    for coedge in second {
+        body.coedges.get_mut(coedge)?.owner = hole;
+    }
+    let loops = &mut body.faces.get_mut(face)?.loops;
+    let at = loops.iter().position(|key| *key == ring)?;
+    loops.insert(at + 1, hole);
+    Some(())
+}
+
+/// Gives each body its own copy of an edge the two only touch along: two
+/// boxes sharing an edge, two cylinders side by side, a hole tangent to the
+/// wall it is cut in. Sewn by position, such an edge carries two faces of
+/// each body; each pair already closes its own body's side, so each pair
+/// keeps an edge of its own, and the result is two solids touching, or one
+/// pinched, rather than four faces on one edge. An edge whose faces do not
+/// part two and two between the bodies, each pair running both ways along
+/// it, is left as it is.
+fn separate_touching_edges(body: &mut Body, from_first: &HashSet<FaceKey>) {
+    let touching: Vec<(EdgeKey, Vec<CoedgeKey>)> = body
+        .edges
+        .iter()
+        .filter(|(_, edge)| edge.coedges.len() == 4)
+        .filter_map(|(key, edge)| {
+            let second: Vec<CoedgeKey> = edge
+                .coedges
+                .iter()
+                .copied()
+                .filter(|coedge| {
+                    owner_face(body, *coedge).is_some_and(|face| !from_first.contains(&face))
+                })
+                .collect();
+            let first: Vec<CoedgeKey> =
+                edge.coedges.iter().copied().filter(|coedge| !second.contains(coedge)).collect();
+            let both_ways = |pair: &[CoedgeKey]| {
+                pair.len() == 2
+                    && pair
+                        .iter()
+                        .filter_map(|coedge| body.coedges.get(*coedge))
+                        .map(|coedge| coedge.forward)
+                        .collect::<HashSet<_>>()
+                        .len()
+                        == 2
+            };
+            (both_ways(&first) && both_ways(&second)).then_some((key, second))
+        })
+        .collect();
+    for (key, second) in touching {
+        let Some(edge) = body.edges.get_mut(key) else { continue };
+        edge.coedges.retain(|coedge| !second.contains(coedge));
+        let mut copy = edge.clone();
+        copy.coedges = second.clone();
+        let copy = body.edges.insert(copy);
+        for coedge in second {
+            if let Some(coedge) = body.coedges.get_mut(coedge) {
+                coedge.edge = copy;
+            }
+        }
+    }
 }
 
 /// Joins what the cut left split along a line it no longer needs: coplanar
@@ -876,15 +1022,21 @@ pub(super) fn face_side(body: &Body, other: &Body, face: FaceKey, tolerance: f64
         Some(point) => contains_point(other, point, tolerance),
         None => Containment::Unknown,
     };
-    if side != Containment::OnBoundary {
+    if !matches!(side, Containment::OnBoundary | Containment::Unknown) {
         return side;
     }
     // The point found may sit on a cut the other body made across the face —
-    // a strip's middle on the curve dividing it from the next. Another point
-    // of the face, clear of the other body's boundary, settles which side
-    // it is; a face lying on that boundary throughout has none.
-    let clear =
-        |point: [f64; 3]| contains_point(other, point, tolerance) != Containment::OnBoundary;
+    // a strip's middle on the curve dividing it from the next — or where the
+    // other body only touches it, a ball resting on the face's middle, where
+    // no ray settles anything. Another point of the face, clear of the other
+    // body's boundary, settles which side it is; a face lying on that
+    // boundary throughout has none.
+    let clear = |point: [f64; 3]| {
+        !matches!(
+            contains_point(other, point, tolerance),
+            Containment::OnBoundary | Containment::Unknown
+        )
+    };
     interior_point_where(body, face, tolerance, &clear)
         .map_or(side, |point| contains_point(other, point, tolerance))
 }

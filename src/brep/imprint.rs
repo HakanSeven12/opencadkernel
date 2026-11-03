@@ -1720,6 +1720,48 @@ fn copy_island(
 
 /// The stretch of a line inside both boxes, widened a little so it still
 /// crosses the faces' edges, as a straight spline. `None` when it misses.
+/// Whether a few points of one of `curves` lie on both faces — proof that
+/// the faces meet, found without meshing either to prove they do not. Silent
+/// on a spline, and on a meeting short enough to fall between the points:
+/// [`super::near::apart`] still settles those.
+fn seen_meeting(
+    a: &Body,
+    one: FaceKey,
+    b: &Body,
+    other: FaceKey,
+    curves: &[Curve3],
+    boxes: [Option<Aabb>; 2],
+    tolerance: f64,
+) -> bool {
+    let on = |body: &Body, face: FaceKey, point: [f64; 3]| {
+        super::classify::face_distance(body, face, point, tolerance)
+            .is_some_and(|gap| gap <= tolerance)
+    };
+    curves.iter().any(|curve| {
+        let points: Vec<[f64; 3]> = match curve {
+            Curve3::Circle(_) | Curve3::Ellipse(_) => (0..8)
+                .map(|step| curve.point_at(step as f64 * std::f64::consts::TAU / 8.0))
+                .collect(),
+            Curve3::Line(line) => match boxes {
+                [Some(near), Some(far)] => match clipped_line(line, &near, &far) {
+                    Some(Curve3::Nurbs(piece)) => {
+                        let (start, end) = piece.domain();
+                        (1..8)
+                            .map(|step| {
+                                piece.point_at_knot(start + (end - start) * step as f64 / 8.0)
+                            })
+                            .collect()
+                    }
+                    _ => Vec::new(),
+                },
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
+        points.into_iter().any(|point| on(b, other, point) && on(a, one, point))
+    })
+}
+
 fn clipped_line(line: &super::geometry::Line3, near: &Aabb, far: &Aabb) -> Option<Curve3> {
     let low: [f64; 3] = std::array::from_fn(|axis| near.min[axis].max(far.min[axis]));
     let high: [f64; 3] = std::array::from_fn(|axis| near.max[axis].min(far.max[axis]));
@@ -1855,14 +1897,18 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64, reach: bool) -> Result<Vec<
                     // round many pairs whose faces stay well apart, and the
                     // whole curves of those would cut both bodies for
                     // nothing.
-                    let soups = soups.get_or_insert_with(|| {
-                        (
-                            super::near::FaceSoups::of(a, tolerance),
-                            super::near::FaceSoups::of(b, tolerance),
-                        )
-                    });
-                    if super::near::apart(&soups.0, *one, &soups.1, *other, tolerance) {
-                        continue;
+                    let pair = [*one_box, *other_box];
+                    let seen = seen_meeting(a, *one, b, *other, &curves, pair, tolerance);
+                    if !seen {
+                        let soups = soups.get_or_insert_with(|| {
+                            (
+                                super::near::FaceSoups::of(a, tolerance),
+                                super::near::FaceSoups::of(b, tolerance),
+                            )
+                        });
+                        if super::near::apart(&soups.0, *one, &soups.1, *other, tolerance) {
+                            continue;
+                        }
                     }
                     let curved = !matches!(one_surface, Surface::Plane(_))
                         || !matches!(other_surface, Surface::Plane(_));

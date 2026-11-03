@@ -355,6 +355,10 @@ pub struct BodyMesh {
     pub precision: f64,
     pub missing_faces: Vec<FaceKey>,
     analytic_cones: Vec<AnalyticConeFace>,
+    /// Some face was filled with its boundary chords split where they cross
+    /// (see `crossing_face`): its error no longer falls as the square of the
+    /// angle, so no extrapolation from it holds.
+    pub(super) crossed: bool,
 }
 
 /// Display-only body curves, without a face triangle mesh or silhouette data.
@@ -954,6 +958,12 @@ pub fn tessellate(body: &Body, tolerance: TessellationTolerance) -> BodyMesh {
         let max_angle = face_chordal_angle(body, face_key, tolerance.angle, tolerance.chordal);
         match scheduled_face(body, face_key, max_angle, tolerance.linear, &schedules)
             .or_else(|| finer_face(body, face_key, max_angle, tolerance.linear))
+            .or_else(|| {
+                let mesh =
+                    crossing_face(body, face_key, max_angle, tolerance.linear, &schedules)?;
+                out.crossed = true;
+                Some(mesh)
+            })
         {
             Some(mesh) => {
                 if let Some(cone) = analytic_cone_face(body, face_key, &mesh) {
@@ -1034,7 +1044,51 @@ fn body_edge_schedules(
     body: &Body,
     tolerance: TessellationTolerance,
 ) -> HashMap<EdgeKey, Vec<super::place::EdgeSample>> {
-    body.edge_keys()
+    edge_schedules(body, body.edge_keys(), tolerance)
+}
+
+/// One face's triangles, from the same shared edge schedules [`tessellate`]
+/// uses — each edge's depends only on it and its own faces — so the face
+/// comes out as it does there, without meshing the rest of the body.
+pub(super) fn face_triangles(
+    body: &Body,
+    face: FaceKey,
+    tolerance: TessellationTolerance,
+) -> Option<Mesh> {
+    let _normals = SplineNormals::open();
+    let edges: HashSet<EdgeKey> = body
+        .face_coedges(face)
+        .iter()
+        .filter_map(|coedge| Some(body.coedges.get(*coedge)?.edge))
+        .collect();
+    let schedules = edge_schedules(body, edges.into_iter(), tolerance);
+    let max_angle = face_chordal_angle(body, face, tolerance.angle, tolerance.chordal);
+    scheduled_face(body, face, max_angle, tolerance.linear, &schedules)
+        .or_else(|| finer_face(body, face, max_angle, tolerance.linear))
+        .or_else(|| crossing_face(body, face, max_angle, tolerance.linear, &schedules))
+}
+
+/// A face whose boundary rings cross as chords where their curves only
+/// touch, filled with the crossings split (see
+/// [`crate::geom2d::constrained::splitting_crossings`]).
+fn crossing_face(
+    body: &Body,
+    face: FaceKey,
+    max_angle: f64,
+    tolerance: f64,
+    schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+) -> Option<Mesh> {
+    crate::geom2d::constrained::splitting_crossings(|| {
+        scheduled_face(body, face, max_angle, tolerance, schedules)
+    })
+}
+
+fn edge_schedules(
+    body: &Body,
+    edges: impl Iterator<Item = EdgeKey>,
+    tolerance: TessellationTolerance,
+) -> HashMap<EdgeKey, Vec<super::place::EdgeSample>> {
+    edges
         .filter_map(|edge| {
             // The faces fill against their own limit and cannot split a
             // boundary segment, so an edge is sampled at least as finely as
@@ -4019,6 +4073,7 @@ pub fn face(body: &Body, face: FaceKey, max_angle: f64, tolerance: f64) -> Optio
         .collect();
     scheduled_face(body, face, max_angle, tolerance, &schedules)
         .or_else(|| finer_face(body, face, max_angle, tolerance))
+        .or_else(|| crossing_face(body, face, max_angle, tolerance, &schedules))
 }
 
 /// A face whose boundary, sampled as its neighbours need, crosses itself:
@@ -4699,7 +4754,13 @@ fn fill_scheduled(
     let triangles = complete?;
 
     let mut mesh = Mesh::default();
-    let mut point_cache = ParameterMap::default();
+    // The boundary's own points first, so a corner on the boundary is found
+    // by its key rather than by searching every pin: a face with a hundred
+    // holes has thousands. The first pin at a parameter wins, as the search.
+    let mut point_cache: ParameterMap<[f64; 3]> = ParameterMap::default();
+    for pin in pins.iter().rev() {
+        point_cache.insert(parameter_key(pin.parameters), pin.position);
+    }
     for triangle in triangles {
         if parameter_triangle_degenerate(triangle.parameters) {
             continue;
@@ -5517,10 +5578,8 @@ fn canonical_point_cached(
     pins: &[BoundaryPoint],
     cache: Option<&mut ParameterMap<[f64; 3]>>,
 ) -> [f64; 3] {
-    if let Some(pin) = pins.iter().find(|pin| pin.parameters == parameters) {
-        return pin.position;
-    }
-    let key = parameters.map(f64::to_bits);
+    // A cache holds the pins already (see `fill_scheduled`).
+    let key = parameter_key(parameters);
     if let Some(cache) = cache {
         if let Some(point) = cache.get(&key) {
             return *point;
@@ -5529,7 +5588,15 @@ fn canonical_point_cached(
         cache.insert(key, point);
         return point;
     }
+    if let Some(pin) = pins.iter().find(|pin| pin.parameters == parameters) {
+        return pin.position;
+    }
     surface.point_at(parameters[0], parameters[1])
+}
+
+/// A parameter pair as a map key; `-0.0` and `0.0` are one parameter.
+fn parameter_key(parameters: [f64; 2]) -> [u64; 2] {
+    parameters.map(|value| (value + 0.0).to_bits())
 }
 
 /// The band a tube covers, as a ring in `(u, v)`.

@@ -40,26 +40,33 @@ pub fn display_angle_for_resolution(resolution: f64) -> f64 {
 
 /// Angle between two directions. A zero direction cannot satisfy a bound.
 pub(crate) fn direction_angle<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
+    direction_cosine(a, b).acos()
+}
+
+/// The cosine [`direction_angle`] takes the arc cosine of: `-1` for a zero
+/// direction.
+fn direction_cosine<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
     let dot = (0..N).map(|axis| a[axis] * b[axis]).sum::<f64>();
     let aa = (0..N).map(|axis| a[axis] * a[axis]).sum::<f64>();
     let bb = (0..N).map(|axis| b[axis] * b[axis]).sum::<f64>();
     let length = (aa * bb).sqrt();
     if !length.is_finite() || length <= f64::MIN_POSITIVE {
-        PI
+        -1.0
     } else {
-        (dot / length).clamp(-1.0, 1.0).acos()
+        (dot / length).clamp(-1.0, 1.0)
     }
 }
 
-/// Largest separation between any two sampled directions.
+/// Largest separation between any two sampled directions. The arc cosine
+/// falls as the cosine rises, so it is taken once, of the smallest cosine.
 pub(crate) fn max_direction_angle<const N: usize>(directions: &[[f64; N]]) -> f64 {
-    let mut largest: f64 = 0.0;
+    let mut smallest: f64 = 1.0;
     for from in 0..directions.len() {
         for to in from + 1..directions.len() {
-            largest = largest.max(direction_angle(directions[from], directions[to]));
+            smallest = smallest.min(direction_cosine(directions[from], directions[to]));
         }
     }
-    largest
+    smallest.acos()
 }
 
 /// Samples a parametric space curve by tangent rotation.
