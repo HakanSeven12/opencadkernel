@@ -85,11 +85,9 @@ enum Divide {
 /// face meshes, and with a cylinder divided too where neither does.
 fn combine_dividing(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
     let meshes = |body: &Body| {
-        let mesh = super::mesh::tessellate(
-            body,
-            super::mesh::TessellationTolerance::new(crate::tessellation::DEFAULT_ANGLE, 1e-9),
-        );
-        mesh.missing_faces.is_empty() && !mesh.mesh.is_empty()
+        let tolerance =
+            super::mesh::TessellationTolerance::new(crate::tessellation::DEFAULT_ANGLE, 1e-9);
+        body.face_keys().all(|face| super::mesh::face_meshes(body, face, tolerance))
     };
     // The first result made stands where none meshes whole.
     let mut first: Option<Result<Body, Snag>> = None;

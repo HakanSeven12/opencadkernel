@@ -694,6 +694,11 @@ impl NurbsCurve3 {
         let narrow = |below: f64, above: f64| {
             let mut low = from + (to - from) * below / steps as f64;
             let mut high = from + (to - from) * above / steps as f64;
+            if let Some(found) = self.newton_nearest(target, low, high) {
+                if distance(found) <= distance(low).min(distance(high)) {
+                    return wrap_parameter(found, from, to, self.closed);
+                }
+            }
             for _ in 0..64 {
                 let third = (high - low) / 3.0;
                 let one = low + third;
@@ -720,6 +725,43 @@ impl NurbsCurve3 {
             }
         }
         found
+    }
+
+    /// The parameter nearest `target` between `low` and `high`, by Newton's
+    /// method on the squared distance from the bracket's middle: a few
+    /// evaluations where a search takes a hundred. `None` where it does not
+    /// settle — the distance not convex there, or a step leaving the bracket
+    /// twice — for the caller's search to take over.
+    fn newton_nearest(&self, target: Vec3, low: f64, high: f64) -> Option<f64> {
+        let step = (high - low) * 1e-3;
+        let mut parameter = 0.5 * (low + high);
+        let mut clamped = 0;
+        for _ in 0..16 {
+            let behind = Vec3::from(self.point_at_knot(parameter - step));
+            let here = Vec3::from(self.point_at_knot(parameter));
+            let ahead = Vec3::from(self.point_at_knot(parameter + step));
+            let first = (ahead - behind) / (2.0 * step);
+            let second = (ahead - here * 2.0 + behind) / (step * step);
+            let offset = here - target;
+            let slope = offset.dot(first);
+            let curvature = first.dot(first) + offset.dot(second);
+            if !(curvature > 0.0) {
+                return None;
+            }
+            let mut next = parameter - slope / curvature;
+            if next < low || next > high {
+                clamped += 1;
+                if clamped > 1 {
+                    return None;
+                }
+                next = next.clamp(low, high);
+            }
+            if (next - parameter).abs() <= (high - low) * 1e-14 {
+                return Some(next);
+            }
+            parameter = next;
+        }
+        None
     }
 
     /// Solve tangency from an external point near a knot-parameter seed.

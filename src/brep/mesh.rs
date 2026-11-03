@@ -1083,6 +1083,76 @@ fn crossing_face(
     })
 }
 
+/// Whether one face meshes as [`tessellate`] would mesh it — triangles, or
+/// a hairline sliver it leaves out without counting it missing — remembered
+/// for a face exactly like one asked about before: the faces a boolean
+/// leaves untouched come back unchanged from one operation to the next, and
+/// a part cut a hundred times was meshed whole a hundred times over.
+pub(super) fn face_meshes(body: &Body, face: FaceKey, tolerance: TessellationTolerance) -> bool {
+    use std::hash::{Hash, Hasher};
+    thread_local! {
+        static MESHED: std::cell::RefCell<HashMap<u64, bool>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+    let meshes_now = || {
+        face_triangles(body, face, tolerance).is_some_and(|mesh| !mesh.triangles.is_empty())
+            || hairline_face(body, face)
+    };
+    // A chordal limit reads the neighbours' curves too; asked fresh.
+    if tolerance.chordal.is_some() {
+        return meshes_now();
+    }
+    // The face's surface and boundary, and the surfaces and parameter
+    // curves across each of its edges, which its edges' schedules read too.
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let Some(node) = body.faces.get(face) else {
+        return false;
+    };
+    let surface = body.surfaces.get(node.surface);
+    let mut written = format!("{tolerance:?}{:?}{surface:?}", node.forward);
+    for coedge in body.face_coedges(face) {
+        let Some(use_) = body.coedges.get(coedge) else {
+            return false;
+        };
+        let Some(edge) = body.edges.get(use_.edge) else {
+            return false;
+        };
+        let ends = [edge.start, edge.end].map(|vertex| body.vertices.get(vertex).map(|v| v.point));
+        written += &format!(
+            "|{}{:?}{:?}{:?}{:?}{:?}",
+            use_.forward,
+            use_.pcurve,
+            body.curves.get(edge.curve),
+            [edge.start_parameter, edge.end_parameter],
+            ends,
+            edge.coedges.len()
+        );
+        for other in &edge.coedges {
+            let across = body.coedges.get(*other).map(|other| {
+                let face = body.loops.get(other.owner).and_then(|ring| body.faces.get(ring.owner));
+                let surface = face.map(|face| (face.forward, body.surfaces.get(face.surface)));
+                (other.forward, &other.pcurve, surface)
+            });
+            written += &format!("{across:?}");
+        }
+    }
+    written.hash(&mut hasher);
+    let key = hasher.finish();
+    if let Some(known) = MESHED.with(|cache| cache.borrow().get(&key).copied()) {
+        return known;
+    }
+    let meshes = meshes_now();
+    MESHED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        // ponytail: whole cache dropped when full; an LRU if hit rates matter.
+        if cache.len() >= 1 << 14 {
+            cache.clear();
+        }
+        cache.insert(key, meshes);
+    });
+    meshes
+}
+
 fn edge_schedules(
     body: &Body,
     edges: impl Iterator<Item = EdgeKey>,
@@ -1721,6 +1791,7 @@ fn shared_edge_samples(
         &mut samples,
         &directions,
         &mut budget,
+        normals_follow_circle(body, edge_key),
     )
     .is_some()
     {
@@ -1973,6 +2044,7 @@ fn refine_edge(
     samples: &mut Vec<super::place::EdgeSample>,
     coedge_directions: &HashMap<super::topology::CoedgeKey, bool>,
     budget: &mut usize,
+    normals_follow: bool,
 ) -> Option<()> {
     *budget = budget.checked_sub(1)?;
     let edge = body.edges.get(edge_key)?;
@@ -1985,7 +2057,10 @@ fn refine_edge(
         crate::tessellation::max_direction_angle(&directions),
         max_angle,
     );
-    'coedges: for coedge_key in &edge.coedges {
+    // Where the faces' normals turn no faster than the curve, the curve's
+    // own turn decides alone.
+    let faces = if normals_follow { &[][..] } else { &edge.coedges[..] };
+    'coedges: for coedge_key in faces {
         let Some((surface, pcurve)) = coedge_geometry(body, *coedge_key) else {
             continue;
         };
@@ -2050,6 +2125,7 @@ fn refine_edge(
             samples,
             coedge_directions,
             budget,
+            normals_follow,
         )?;
         samples.push(super::place::EdgeSample {
             parameter: middle,
@@ -2066,9 +2142,49 @@ fn refine_edge(
             samples,
             coedge_directions,
             budget,
+            normals_follow,
         )?;
     }
     Some(())
+}
+
+/// Whether a circular edge's faces turn their normals along it no faster
+/// than the circle turns its tangent: a plane it lies in, a sphere, and a
+/// cylinder or cone round the circle's own axis. There the normals can never
+/// ask for a finer division than the tangent does, and checking them at every
+/// step of every circle was most of a perforated plate's meshing.
+fn normals_follow_circle(body: &Body, edge_key: EdgeKey) -> bool {
+    use super::geometry::{Curve3, Surface};
+    let Some(edge) = body.edges.get(edge_key) else {
+        return false;
+    };
+    let Some(Curve3::Circle(circle)) = body.curves.get(edge.curve) else {
+        return false;
+    };
+    let (Some(normal), centre) = (circle.plane.normal(), Vec3::from(circle.plane.origin)) else {
+        return false;
+    };
+    let normal = Vec3::from(normal);
+    let size = circle.radius.max(1.0);
+    let round_axis = |frame: &crate::space::Plane| {
+        frame.normal().is_some_and(|axis| {
+            let axis = Vec3::from(axis);
+            let off = centre - Vec3::from(frame.origin);
+            axis.cross(normal).length() <= 1e-12 && axis.cross(off).length() <= 1e-9 * size
+        })
+    };
+    !edge.coedges.is_empty()
+        && edge.coedges.iter().all(|coedge| {
+            coedge_geometry(body, *coedge).is_some_and(|(surface, _)| match surface {
+                Surface::Plane(plane) => plane
+                    .normal()
+                    .is_some_and(|axis| Vec3::from(axis).cross(normal).length() <= 1e-12),
+                Surface::Sphere(_) => true,
+                Surface::Cylinder(cylinder) => round_axis(&cylinder.base),
+                Surface::Cone(cone) => round_axis(&cone.base),
+                _ => false,
+            })
+        })
 }
 
 fn coedge_geometry<'a>(
