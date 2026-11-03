@@ -2082,7 +2082,9 @@ fn scheduled_face(
         let rings = align_rings(rings, periods(surface));
         return fill_scheduled(body, face, surface, &rings, max_angle, tolerance);
     }
-    let rings = face_rings(body, face, surface, schedules, tolerance)?;
+    // No band: the search above has already run, so go straight to the
+    // rings [`face_rings`] would fall back to.
+    let rings = unbanded_face_rings(body, face, surface, schedules, tolerance)?;
     fill_scheduled(body, face, surface, &rings, max_angle, tolerance)
 }
 
@@ -2102,6 +2104,18 @@ fn face_rings(
         rings.extend(band.holes);
         return Some(align_rings(rings, periods(surface)));
     }
+    unbanded_face_rings(body, face, surface, schedules, tolerance)
+}
+
+/// A face's boundary rings from its edge schedules, for a face no band
+/// search covers.
+fn unbanded_face_rings(
+    body: &Body,
+    face: FaceKey,
+    surface: &super::geometry::Surface,
+    schedules: &HashMap<EdgeKey, Vec<super::place::EdgeSample>>,
+    tolerance: f64,
+) -> Option<Vec<Vec<BoundaryPoint>>> {
     if let Some(rings) = scheduled_rings(body, face, surface, schedules, tolerance) {
         if rings.iter().any(|ring| boundary_area(ring)) {
             return Some(align_rings(rings, periods(surface)));
