@@ -1746,6 +1746,55 @@ fn clipped_line(line: &super::geometry::Line3, near: &Aabb, far: &Aabb) -> Optio
         .map(Curve3::Nurbs)
 }
 
+/// A face's box in its surface's parameters, from its boundary.
+fn face_parameter_box(body: &Body, face: FaceKey, tolerance: f64) -> Option<[[f64; 2]; 2]> {
+    let mut low = [f64::INFINITY; 2];
+    let mut high = [f64::NEG_INFINITY; 2];
+    for curve in super::pcurve::face_boundary(body, face, tolerance)? {
+        for step in 0..=32 {
+            let point = curve.point_at(step as f64 / 32.0);
+            for axis in 0..2 {
+                low[axis] = low[axis].min(point[axis]);
+                high[axis] = high[axis].max(point[axis]);
+            }
+        }
+    }
+    (low.iter().chain(&high).all(|value| value.is_finite()) && low[0] < high[0] && low[1] < high[1])
+        .then_some([low, high])
+}
+
+/// The curves two faces share, from the full surface/surface intersection of
+/// their bounded pieces, fitted as the march's are. `None` when either face
+/// has no box or the intersection is refused.
+fn bounded_meeting(
+    a: &Body,
+    one: FaceKey,
+    one_surface: &Surface,
+    b: &Body,
+    other: FaceKey,
+    other_surface: &Surface,
+    tolerance: f64,
+) -> Option<Vec<Curve3>> {
+    let ([u0, v0], [u1, v1]) = face_parameter_box(a, one, tolerance).map(|[l, h]| (l, h))?;
+    let ([s0, t0], [s1, t1]) = face_parameter_box(b, other, tolerance).map(|[l, h]| (l, h))?;
+    let first = super::ssi::Bounded { surface: one_surface, u: [u0, u1], v: [v0, v1] };
+    let second = super::ssi::Bounded { surface: other_surface, u: [s0, s1], v: [t0, t1] };
+    let found = super::ssi::meet(&first, &second, tolerance.max(1e-9)).ok()?;
+    found
+        .branches
+        .iter()
+        .map(|branch| {
+            let points: Vec<[f64; 3]> = branch.points.iter().map(|shared| shared.point).collect();
+            if branch.closed {
+                NurbsCurve3::interpolate_periodic(&points, crate::space::Parameterization::Chord)
+            } else {
+                NurbsCurve3::interpolate_fit(&points, None, None, crate::space::Parameterization::Chord)
+            }
+            .map(Curve3::Nurbs)
+        })
+        .collect()
+}
+
 /// Every curve the two bodies' faces share.
 fn shared_curves(a: &Body, b: &Body, tolerance: f64, reach: bool) -> Result<Vec<Shared>, Snag> {
     let near: Vec<(FaceKey, Option<Aabb>)> =
@@ -1944,6 +1993,12 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64, reach: bool) -> Result<Vec<
                                 tolerance,
                             )
                         });
+                    // Where the march cannot follow the crossing (a tangency
+                    // on the way, a branch point), the faces' bounded pieces
+                    // go through the full surface/surface intersection.
+                    let curves = curves.or_else(|| {
+                        bounded_meeting(a, *one, one_surface, b, *other, other_surface, tolerance)
+                    });
                     // Faces that come near without a crossing to start from
                     // are settled once every pair is done: a meeting traced
                     // from another pair of the same surfaces already runs

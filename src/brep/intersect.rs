@@ -19,12 +19,12 @@
 //! produce a shape with a hole in it, while one told "I cannot say" can
 //! refuse. Silence about ignorance is the expensive failure here.
 //!
-//! # What is not here yet
+//! # Where there is no closed form
 //!
 //! The general quartic cases — two cylinders at an angle, a sphere against a
-//! cone — need a marching intersector with a bounded step and a way to find
-//! every branch. That is a piece of its own; until it exists those pairs say
-//! `Unknown`.
+//! cone — and every spline pair say `Unknown` here. Bounded pieces of any two
+//! surfaces meet through [`ssi`](super::ssi), which finds their crossing and
+//! tangent curves, touch points and branch points.
 
 use super::geometry::{Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, Sphere, Surface, Torus};
 use crate::space::{Plane, Vec3};

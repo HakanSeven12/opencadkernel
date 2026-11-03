@@ -53,6 +53,7 @@ pub mod place;
 pub mod presspull;
 pub mod recognize;
 pub mod slice;
+pub mod ssi;
 pub mod shell;
 pub mod split;
 pub mod sweep;

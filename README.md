@@ -133,6 +133,24 @@ decomposition is ever genuinely needed — fitting a surface through a mesh, say
 One decision is still open: whether the ACIS bridge depends on the codec crate
 directly, or inverts so the codec stays unaware of the kernel.
 
+## Surface/surface intersection
+
+`brep::ssi` meets two bounded surfaces of any kind: crossing and tangent
+curves, touch points, and the points where branches cross. Booleans fall back
+on it where a pair has no closed form and the march cannot follow the
+crossing. The engine under it is `crates/opencadkernel-ssi`, Solidcore's
+`ssi` crate (MIT OR Apache-2.0) taken as it is.
+
+On [jyviko's SSI corpus](https://github.com/jyviko/ssi-corpus), run through
+the kernel's own surfaces, it passes 118 of 119 cases at 1e-6 (SMLib: 81):
+
+```sh
+cargo build --release --features brep --example ssi_corpus
+SSI_ENGINE=opencadkernel SSI_RUNNER=target/release/examples/ssi_corpus \
+    python3 -I <ssi-corpus>/scoring/score.py fs 1e-6
+```
+
 ## Licence
 
-MPL-2.0.
+MPL-2.0, except `crates/opencadkernel-ssi`, which keeps its MIT OR Apache-2.0
+licence.
