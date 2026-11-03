@@ -108,7 +108,9 @@ impl Curve {
         }
         let start = self.point_at(0.0);
         let end = self.point_at(1.0);
-        let signed = self.enclosed_area() + line_moments(end, start).0;
+        // `chain_area`: an open polyline's own integral already closes it,
+        // and adding the chord on top would count the closing edge twice.
+        let signed = self.chain_area() + line_moments(end, start).0;
         Some(match covered_area(self) {
             Some(covered) => covered.copysign(signed),
             None => signed,
@@ -466,6 +468,15 @@ mod tests {
         // A loop that leaves a hole the curve does not wind round.
         let hole = [[0.0, 0.0], [100.0, 0.0], [100.0, 100.0], [40.0, 100.0], [40.0, -50.0], [70.0, -50.0], [70.0, 20.0], [0.0, 20.0]];
         assert!((measured(&hole) - 8300.0).abs() < 1e-6);
+        // An open chain is closed by its chord once, not twice.
+        let open = Curve::Polyline(Polyline {
+            vertices: [[10.0, 10.0], [20.0, 10.0], [20.0, 30.0]]
+                .into_iter()
+                .map(|position| PolylineVertex { position, bulge: 0.0 })
+                .collect(),
+            closed: false,
+        });
+        assert!((open.chord_closed_area().unwrap().abs() - 100.0).abs() < 1e-9);
         // A simple square is untouched.
         assert!((measured(&[[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]) - 100.0).abs() < 1e-9);
     }
