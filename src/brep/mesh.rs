@@ -6366,32 +6366,23 @@ mod tests {
     fn a_mesh_within_its_budget_is_the_mesh_without_one() {
         // Triangle count and a hash of every vertex, normal and index of the
         // default tessellation, measured on 003eee3 before budgets existed.
-        let fingerprint = |mesh: &Mesh| {
-            let mut hash = 0xcbf2_9ce4_8422_2325u64;
-            let mut eat = |word: u64| {
-                for byte in word.to_le_bytes() {
-                    hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
-                }
-            };
-            for point in mesh.positions.iter().chain(&mesh.normals) {
-                point.iter().for_each(|value| eat(value.to_bits()));
-            }
-            for triangle in &mesh.triangles {
-                triangle.iter().for_each(|index| eat(*index as u64));
-            }
-            (mesh.triangles.len(), hash)
-        };
-        let bodies = [
+        type Fingerprint = fn(&Mesh) -> (usize, u64);
+        let bodies: [(Body, Fingerprint, (usize, u64)); 2] = [
+            // The cylinder's flat caps are cocircular points, so their
+            // triangulation is not unique and the tie breaks per platform:
+            // it gets the triangulation-independent fingerprint.
             (
                 crate::brep::make::cylinder([0.0; 3], 5.0, 10.0).unwrap(),
-                (508, 1_333_669_161_794_906_415),
+                shape_fingerprint,
+                (508, 6_030_817_377_226_346_326),
             ),
             (
                 crate::brep::make::torus([0.0; 3], 5.0, 1.0).unwrap(),
-                (23_762, 10_981_196_527_690_234_293),
+                quantized_fingerprint,
+                (23_762, 3_222_715_392_039_835_452),
             ),
         ];
-        for (body, before) in bodies {
+        for (body, fingerprint, before) in bodies {
             let plain = tessellate(&body, budget_tolerance());
             assert_eq!(fingerprint(&plain.mesh), before);
             for budget in [usize::MAX, 2 * plain.mesh.triangles.len()] {
@@ -7182,9 +7173,17 @@ mod tests {
         assert!(fine > coarse, "{fine} against {coarse} triangles");
     }
 
-    /// Triangle count and a hash of every vertex and index, bit for bit.
-    fn mesh_fingerprint(body: &Body) -> (usize, u64) {
-        let mesh = tessellate(body, fold_tolerance()).mesh;
+    /// Coordinates are hashed on a grid of this step, so the last-bit
+    /// differences that `sin`, `cos`, `atan2` and `powf` show between
+    /// platforms do not reach the hash. It is far coarser than that noise
+    /// (about 1e-14 at these sizes), so a value sits near a rounding boundary
+    /// only about once in 1e8, and far finer than any tolerance the tests mesh
+    /// with (1e-4 and up).
+    const FINGERPRINT_STEP: f64 = 1e-6;
+
+    /// Triangle count and a hash of every vertex and normal, quantized to
+    /// [`FINGERPRINT_STEP`], and every index, exactly.
+    fn quantized_fingerprint(mesh: &Mesh) -> (usize, u64) {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         let mut eat = |word: u64| {
             for byte in word.to_le_bytes() {
@@ -7192,12 +7191,63 @@ mod tests {
             }
         };
         for point in mesh.positions.iter().chain(&mesh.normals) {
-            point.iter().for_each(|value| eat(value.to_bits()));
+            point
+                .iter()
+                .for_each(|value| eat((value / FINGERPRINT_STEP).round() as i64 as u64));
         }
         for triangle in &mesh.triangles {
             triangle.iter().for_each(|index| eat(*index as u64));
         }
         (mesh.triangles.len(), hash)
+    }
+
+    /// For a mesh whose triangulation is not unique: triangle count, then a
+    /// hash of the total area and the sorted set of distinct vertex positions,
+    /// both quantized to [`FINGERPRINT_STEP`]. It still changes when the
+    /// count, the covered area or the vertices change, but not when a
+    /// cocircular tie is triangulated the other way.
+    fn shape_fingerprint(mesh: &Mesh) -> (usize, u64) {
+        let area: f64 = mesh
+            .triangles
+            .iter()
+            .map(|triangle| {
+                let [a, b, c] = triangle.map(|index| mesh.positions[index]);
+                let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+                let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+                let cross = [
+                    ab[1] * ac[2] - ab[2] * ac[1],
+                    ab[2] * ac[0] - ab[0] * ac[2],
+                    ab[0] * ac[1] - ab[1] * ac[0],
+                ];
+                0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt()
+            })
+            .sum();
+        let mut vertices: Vec<[i64; 3]> = mesh
+            .positions
+            .iter()
+            .map(|point| point.map(|value| (value / FINGERPRINT_STEP).round() as i64))
+            .collect();
+        vertices.sort_unstable();
+        vertices.dedup();
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |word: u64| {
+            for byte in word.to_le_bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+        };
+        eat((area / FINGERPRINT_STEP).round() as i64 as u64);
+        for vertex in vertices {
+            vertex.iter().for_each(|value| eat(*value as u64));
+        }
+        (mesh.triangles.len(), hash)
+    }
+
+    fn mesh_fingerprint(body: &Body) -> (usize, u64) {
+        quantized_fingerprint(&tessellate(body, fold_tolerance()).mesh)
+    }
+
+    fn shape_of(body: &Body) -> (usize, u64) {
+        shape_fingerprint(&tessellate(body, fold_tolerance()).mesh)
     }
 
     #[test]
@@ -7241,7 +7291,7 @@ mod tests {
         let ribbon = bilinear_sheet(&[ribbon], false);
         assert_eq!(
             [
-                mesh_fingerprint(&cylinder),
+                shape_of(&cylinder),
                 mesh_fingerprint(&torus),
                 mesh_fingerprint(&saddle),
                 mesh_fingerprint(&dome),
@@ -7251,14 +7301,17 @@ mod tests {
         );
     }
 
-    /// Cylinder, torus, saddle, dome and ribbon, measured on upstream 003eee3
-    /// before the fold stop.
+    /// Cylinder, torus, saddle, dome and ribbon, as meshed on upstream 003eee3
+    /// before the fold stop, hashed by [`quantized_fingerprint`]. The cylinder
+    /// is hashed by [`shape_fingerprint`] instead: its flat caps are cocircular
+    /// points, so their triangulation is not unique and the tie breaks per
+    /// platform.
     const SMOOTH_MESHES: [(usize, u64); 5] = [
-        (508, 1_333_669_161_794_906_415),
-        (23_762, 10_981_196_527_690_234_293),
-        (98, 6_178_329_717_795_730_539),
-        (984, 4_908_670_366_701_469_945),
-        (537, 8_201_182_210_090_886_518),
+        (508, 6_030_817_377_226_346_326),
+        (23_762, 3_222_715_392_039_835_452),
+        (98, 10_157_540_559_343_846_255),
+        (984, 12_070_472_126_132_433_869),
+        (537, 5_912_244_891_144_382_325),
     ];
 }
 
