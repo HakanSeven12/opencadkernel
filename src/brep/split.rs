@@ -948,6 +948,44 @@ fn split_face_in_place(
         body.edges.get_mut(cut)?.coedges = vec![hole, inner];
         return Some([face, other]);
     }
+    // The two uses of a seam edge each land the cutter where it crosses
+    // the seam, at one point and one parameter, so which of the two a sort
+    // puts first says nothing, and the two uses' images in the face can read
+    // the same. A face lies to the left of each use walking along it, seen
+    // from outside; a cut leaves from the use whose left it runs into. The
+    // other joins it to the face's far side, and a cut that should take a
+    // lens off one side of the seam then left the rest of the face wrapped
+    // over the lens.
+    let leftward = |landing: &Landing, into: f64, ahead: bool| -> f64 {
+        let point = landing.point;
+        let Some((u, v)) = surface.parameters_at(point) else {
+            return f64::NEG_INFINITY;
+        };
+        let Some(normal) = surface.normal_at(u, v).and_then(|n| Vec3::from(n).normalize()) else {
+            return f64::NEG_INFINITY;
+        };
+        let outward = if node.forward { normal } else { -normal };
+        let departing = Vec3::from(cutter.tangent_at(into)) * if ahead { 1.0 } else { -1.0 };
+        let Some(coedge) = body.coedges.get(landing.coedge) else {
+            return f64::NEG_INFINITY;
+        };
+        let Some(curve) = body.edges.get(landing.edge).and_then(|e| body.curves.get(e.curve))
+        else {
+            return f64::NEG_INFINITY;
+        };
+        let walking = Vec3::from(curve.tangent_at(curve.parameter_at(point)))
+            * if coedge.forward { 1.0 } else { -1.0 };
+        walking.cross(departing).dot(outward)
+    };
+    let side = |all: &[Landing], landing: &Landing, into: f64, ahead: bool| -> Landing {
+        all.iter()
+            .filter(|other| {
+                other.edge == landing.edge
+                    && Vec3::from(other.point).distance(Vec3::from(landing.point)) <= tolerance
+            })
+            .max_by(|a, b| leftward(a, into, ahead).total_cmp(&leftward(b, into, ahead)))
+            .map_or_else(|| landing.clone(), Landing::clone)
+    };
     let mut selected_span = None;
     if landings.len() > 2 {
         // Split one interior span; the caller retries both resulting faces.
@@ -984,7 +1022,10 @@ fn split_face_in_place(
                 ))
         });
         let (pair, span) = pair?;
-        landings = pair.to_vec();
+        landings = vec![
+            side(&landings, &pair[0], span.0, true),
+            side(&landings, &pair[1], span.1, false),
+        ];
         selected_span = Some(span);
     }
     if landings.len() != 2 {
@@ -1039,6 +1080,27 @@ fn split_face_in_place(
         }
         // Two landings on the boundary bound a stretch that may run through
         // a hole of the face rather than across it.
+        // An open cutter from a seam corner back to it, landing on the
+        // seam's two uses, runs once round the surface: a loop of a curve
+        // that crossed itself there, cut free at the crossing. It divides
+        // the band from the use it leaves into to the other.
+        (None, None)
+            if same_vertex_landing
+                && landings[0].edge == landings[1].edge
+                && landings[0].coedge != landings[1].coedge
+                && matches!(cutter, Curve3::Nurbs(_)) =>
+        {
+            let Curve3::Nurbs(spline) = cutter else {
+                return None;
+            };
+            let (from, to) = spline.domain();
+            if !inside(0.5 * (from + to))? {
+                return None;
+            }
+            let first_leaves =
+                leftward(&landings[0], from, true) > leftward(&landings[1], from, true);
+            if first_leaves { (0, 1, from, to) } else { (1, 0, from, to) }
+        }
         (None, None) => {
             // An open cutter landing twice on one corner spans nothing.
             if same_vertex_landing || !inside(0.5 * (low_parameter + high_parameter))? {
@@ -1101,8 +1163,12 @@ fn split_face_in_place(
         }
     }
 
-    // An open cut that ends where it starts encloses nothing.
+    // An open cut that ends where it starts encloses nothing — unless it
+    // goes from one use of a seam to the other, once round the surface.
+    let round_seam =
+        landings[0].edge == landings[1].edge && landings[0].coedge != landings[1].coedge;
     if closed_period(cutter).is_none()
+        && !round_seam
         && Vec3::from(cutter.point_at(start_parameter))
             .distance(Vec3::from(cutter.point_at(end_parameter)))
             <= tolerance
@@ -1254,7 +1320,56 @@ fn split_face_in_place(
         body.coedge_vertices(coedge)
             .is_some_and(|(from, _)| from == vertex)
     };
-    let landing_index = |landing: &Landing, vertex: VertexKey| {
+    // Where the cut leaves each of its ends, along the surface.
+    let departing = |end: usize| -> Option<Vec3> {
+        let (parameter, sign) =
+            if end == start_landing { (start_parameter, 1.0) } else { (end_parameter, -1.0) };
+        Some(Vec3::from(cutter.tangent_at(parameter)) * sign)
+    };
+    // A corner the ring passes more than once — where the cut meets a seam
+    // and an earlier cut at one point, say — joins the cut at the pass
+    // whose corner of the face the cut runs into: between the edge leaving
+    // and the edge arriving there, turning left about the face's outward
+    // normal.
+    let passing = |vertex: VertexKey, toward: Vec3| -> Option<usize> {
+        let starts: Vec<usize> =
+            (0..ring.len()).filter(|index| begins_at(body, ring[*index], vertex)).collect();
+        if starts.len() < 2 {
+            return None;
+        }
+        let point = body.vertices.get(vertex)?.point;
+        let (u, v) = surface.parameters_at(point)?;
+        let normal = Vec3::from(surface.normal_at(u, v)?).normalize()?;
+        let outward = if node.forward { normal } else { -normal };
+        let walking = |coedge: CoedgeKey, leaving: bool| -> Option<Vec3> {
+            let node = body.coedges.get(coedge)?;
+            let edge = body.edges.get(node.edge)?;
+            let curve = body.curves.get(edge.curve)?;
+            let at =
+                if node.forward == leaving { edge.start_parameter } else { edge.end_parameter };
+            Some(Vec3::from(curve.tangent_at(at)) * if node.forward { 1.0 } else { -1.0 })
+        };
+        let flat = |direction: Vec3| direction - outward * direction.dot(outward);
+        let angle = |from: Vec3, to: Vec3| {
+            let (from, to) = (flat(from), flat(to));
+            let turn = from.cross(to).dot(outward).atan2(from.dot(to));
+            if turn < 0.0 { turn + std::f64::consts::TAU } else { turn }
+        };
+        starts.into_iter().find(|index| {
+            let leaving = walking(ring[*index], true);
+            let arriving = walking(ring[(*index + ring.len() - 1) % ring.len()], false);
+            match (leaving, arriving) {
+                (Some(leaving), Some(arriving)) => {
+                    angle(leaving, toward) < angle(leaving, -arriving)
+                }
+                _ => false,
+            }
+        })
+    };
+    let landing_index = |landing: &Landing, vertex: VertexKey, end: usize| {
+        if let Some(index) = departing(end).and_then(|toward| passing(vertex, toward)) {
+            return Some(index);
+        }
         let at = ring.iter().position(|coedge| *coedge == landing.coedge)?;
         if begins_at(body, ring[at], vertex) {
             return Some(at);
@@ -1264,11 +1379,38 @@ fn split_face_in_place(
             return Some(next);
         }
         // Both ends landed on one edge, and splitting it at the first moved
-        // the second onto a piece further round.
+        // the second onto a piece further round: a piece of the same use
+        // of that edge, beside it in the ring. A seam's other use passes
+        // the same corner on the face's far side, and joining the cut there
+        // divided the face across rather than on the cut's own side.
+        let curve_of = |coedge: CoedgeKey| {
+            body.coedges.get(coedge).and_then(|node| body.edges.get(node.edge)).map(|e| e.curve)
+        };
+        let own = curve_of(ring[at]);
+        let count = ring.len();
+        for toward in [1, count - 1] {
+            let mut index = at;
+            for _ in 1..count {
+                index = (index + toward) % count;
+                if curve_of(ring[index]) != own {
+                    break;
+                }
+                if begins_at(body, ring[index], vertex) {
+                    return Some(index);
+                }
+            }
+        }
         ring.iter().position(|coedge| begins_at(body, *coedge, vertex))
     };
-    let at_first = landing_index(&landings[0], first)?;
-    let at_second = landing_index(&landings[1], second)?;
+    let at_first = landing_index(&landings[0], first, 0)?;
+    let at_second = landing_index(&landings[1], second, 1)?;
+    // Both ends placed by the corner they run into: the near arc, from the
+    // first landing round to the second, closes along the cut from the
+    // second back to the first.
+    let placed = same_vertex_landing
+        && [(first, 0), (second, 1)].iter().all(|(vertex, end)| {
+            departing(*end).and_then(|toward| passing(*vertex, toward)).is_some()
+        });
     // The stretch of the ring from one index round to the other, not
     // including where it stops.
     let arc = |from: usize, to: usize| -> Vec<CoedgeKey> {
@@ -1293,7 +1435,9 @@ fn split_face_in_place(
     let sense = |from: VertexKey| start == from;
     // A cut starting and ending at one vertex gives no ends to go by; the
     // near arc has to be on the face's side of the cut instead.
-    let near_forward = if same_vertex_landing {
+    let near_forward = if placed {
+        start_landing == 1
+    } else if same_vertex_landing {
         // Round a surface closed both ways the side test cannot tell the
         // halves apart; the cut has to close the near arc's walk in (u, v),
         // and only one way round does.

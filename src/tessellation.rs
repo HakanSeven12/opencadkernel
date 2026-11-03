@@ -38,13 +38,8 @@ pub fn display_angle_for_resolution(resolution: f64) -> f64 {
     angle(DISPLAY_ANGLE / resolution.max(1.0).sqrt()).max(FINE_ANGLE)
 }
 
-/// Angle between two directions. A zero direction cannot satisfy a bound.
-pub(crate) fn direction_angle<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
-    direction_cosine(a, b).acos()
-}
-
-/// The cosine [`direction_angle`] takes the arc cosine of: `-1` for a zero
-/// direction.
+/// The cosine of the angle between two directions; `-1` for a zero
+/// direction, which cannot satisfy a bound.
 fn direction_cosine<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
     let dot = (0..N).map(|axis| a[axis] * b[axis]).sum::<f64>();
     let aa = (0..N).map(|axis| a[axis] * a[axis]).sum::<f64>();

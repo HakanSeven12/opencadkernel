@@ -199,6 +199,7 @@ pub(super) fn imprint_reaching(
     let (more, boxes) = chained_meetings(a, b, &curves, &found, tolerance);
     curves.extend(more);
     found.extend(boxes);
+    let (curves, found) = crossing_loops_apart(curves, found, tolerance);
     // A curve cuts one body only where the other body's faces it was found
     // with are. A traced curve runs round its whole surface, and on a part
     // whose fillets share one torus it otherwise cut every fillet, wherever
@@ -1716,6 +1717,101 @@ fn copy_island(
     kept.loops.push(hole_ring);
     kept.provenance.soil();
     Some(island)
+}
+
+/// Each closed spline that crosses itself once, as its two loops from the
+/// crossing back to it: Viviani's curve, both loops through the point where
+/// the cylinder touches the sphere. Cut whole, its two passes through that
+/// point land on one seam corner at once; as two loops, each cuts the face
+/// it crosses from the corner round and back like any other.
+fn crossing_loops_apart(
+    curves: Vec<Curve3>,
+    found: Vec<[Option<Aabb>; 2]>,
+    tolerance: f64,
+) -> (Vec<Curve3>, Vec<[Option<Aabb>; 2]>) {
+    curves
+        .into_iter()
+        .zip(found)
+        .flat_map(|(curve, boxes)| {
+            let loops = match &curve {
+                Curve3::Nurbs(spline) if spline.periodicity() => {
+                    crossing_loops(spline, tolerance).unwrap_or_default()
+                }
+                _ => Vec::new(),
+            };
+            match loops.is_empty() {
+                true => vec![(curve, boxes)],
+                false => loops.into_iter().map(|piece| (Curve3::Nurbs(piece), boxes)).collect(),
+            }
+        })
+        .unzip()
+}
+
+/// A closed spline that crosses itself once, as its two loops from the
+/// crossing back to it. `None` where it does not cross itself, or crosses
+/// more than once.
+fn crossing_loops(spline: &NurbsCurve3, tolerance: f64) -> Option<Vec<NurbsCurve3>> {
+    const SAMPLES: usize = 256;
+    let (start, end) = spline.domain();
+    let at = |step: f64| start + (end - start) * step / SAMPLES as f64;
+    let points: Vec<Vec3> =
+        (0..SAMPLES).map(|step| Vec3::from(spline.point_at_knot(at(step as f64)))).collect();
+    let steps: Vec<f64> =
+        (0..SAMPLES).map(|index| points[index].distance(points[(index + 1) % SAMPLES])).collect();
+    let spacing = steps.iter().copied().fold(0.0, f64::max);
+    let fit = tolerance.max(steps.iter().sum::<f64>() * 1e-5);
+    let gap = |s: f64, t: f64| {
+        Vec3::from(spline.point_at_knot(s)).distance(Vec3::from(spline.point_at_knot(t)))
+    };
+    // Samples a few steps apart along the curve that come within a step of
+    // each other, each pair settled to the parameters nearest each other.
+    let mut crossings: Vec<(f64, f64)> = Vec::new();
+    for i in 0..SAMPLES {
+        for j in i + 8..SAMPLES {
+            if SAMPLES - (j - i) < 8 || points[i].distance(points[j]) > spacing {
+                continue;
+            }
+            let (mut s, mut t) = (at(i as f64), at(j as f64));
+            let mut step = (end - start) / SAMPLES as f64;
+            for _ in 0..60 {
+                let moves = [(step, 0.0), (-step, 0.0), (0.0, step), (0.0, -step)];
+                let best = moves
+                    .iter()
+                    .map(|(ds, dt)| (s + ds, t + dt))
+                    .filter(|(s, t)| *s >= start && *t <= end && s < t)
+                    .min_by(|x, y| gap(x.0, x.1).total_cmp(&gap(y.0, y.1)));
+                match best {
+                    Some(next) if gap(next.0, next.1) < gap(s, t) => (s, t) = next,
+                    _ => step *= 0.5,
+                }
+            }
+            let near = (end - start) * 2.0 / SAMPLES as f64;
+            if gap(s, t) <= fit
+                && !crossings.iter().any(|(a, b)| (a - s).abs() < near && (b - t).abs() < near)
+            {
+                crossings.push((s, t));
+            }
+        }
+    }
+    let [(first, second)] = crossings[..] else {
+        return None;
+    };
+    let open = spline.clone().with_periodicity(false);
+    // A curve traced from the crossing itself has it at an end already.
+    let near = (end - start) * 2.0 / SAMPLES as f64;
+    // Each loop is closed, round from the crossing and back, with a corner
+    // there: a face it runs through crosses it like any closed cut, and a
+    // face whose seam it starts on takes it as one cut round.
+    let loops = if first - start < near || end - second < near {
+        let at = if first - start < near { second } else { first };
+        let (one, other) = open.split_at(at)?;
+        vec![one, other]
+    } else {
+        let (head, rest) = open.split_at(first)?;
+        let (middle, tail) = rest.split_at(second)?;
+        vec![middle, tail.joined(&head)?]
+    };
+    Some(loops.into_iter().map(|piece| piece.with_periodicity(true)).collect())
 }
 
 /// Whether a circle or an ellipse runs over both faces at once: the
