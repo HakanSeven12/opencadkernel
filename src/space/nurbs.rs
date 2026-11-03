@@ -842,6 +842,12 @@ impl NurbsCurve3 {
             return None;
         }
         let step = span * 1e-4;
+        // A closed curve has no end to keep inside: a parameter a turn on
+        // — an edge's run past the seam — is the same place, and clamping
+        // it took the slope at the curve's end instead.
+        if self.closed {
+            return Some((wrap_parameter(u, from, to, true), step));
+        }
         Some((u.clamp(from + step, to - step), step))
     }
 

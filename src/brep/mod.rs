@@ -37,6 +37,7 @@ mod chamfer_profile;
 pub mod classify;
 mod fillet_circular;
 mod fillet_prismatic;
+mod fillet_rolling;
 pub mod geometry;
 pub mod imprint;
 pub mod intersect;

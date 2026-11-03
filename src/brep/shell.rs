@@ -1564,7 +1564,7 @@ fn offset_inward(
 /// `surface` moved `along` its own normal: a plane shifted, a cylinder,
 /// sphere or torus tube grown, a cone widened square to its side. `None`
 /// for a spline, and for one moved past its own axis or centre.
-fn moved_surface(surface: &Surface, along: f64) -> Option<Surface> {
+pub(super) fn moved_surface(surface: &Surface, along: f64) -> Option<Surface> {
     use super::geometry::{Cone, Cylinder, Sphere, Torus};
     Some(match surface {
         Surface::Plane(plane) => {
@@ -1596,7 +1596,7 @@ fn moved_surface(surface: &Surface, along: f64) -> Option<Surface> {
 /// The shortest step taking a point onto every surface whose unit normal
 /// and signed gap are given: the gaps' combination of the normals that
 /// closes each, two or three of them; more read in the least-squares sense.
-fn least_norm_step(rows: &[(Vec3, f64)]) -> Option<Vec3> {
+pub(super) fn least_norm_step(rows: &[(Vec3, f64)]) -> Option<Vec3> {
     // Normal equations of J Jᵀ y = g, then the step Jᵀ y.
     let n = rows.len();
     let mut gram = vec![vec![0.0; n]; n];

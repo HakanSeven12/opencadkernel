@@ -653,7 +653,12 @@ pub fn fillet_edges(
             | FilletError::RadiusTooLargeOrInteracting
             | FilletError::UnsupportedEdgeCurve(_)
             | FilletError::InvalidResult),
-        ) => blend_by_cut(body, &selected, Section::Round(radius)).ok_or(error),
+        ) => blend_by_cut(body, &selected, Section::Round(radius))
+            // Last of all, a ball rolled along a closed chain between two
+            // faces of any surfaces that offset exactly: the saddle where
+            // two cylinders join.
+            .or_else(|| super::fillet_rolling::fillet_rolling(body, &selected, radius))
+            .ok_or(error),
         result => result,
     }
 }
