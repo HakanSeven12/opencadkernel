@@ -609,7 +609,31 @@ fn pcurve_on_edge(
         let uv = curve.point_at(t);
         Vec3::from(surface.point_at(uv[0], uv[1]))
     };
+    let on_edge = |point: Vec3| {
+        along.windows(2).any(|pair| {
+            let (a, b) = (pair[0], pair[1]);
+            let ab = b - a;
+            let t = ((point - a).dot(ab) / ab.dot(ab).max(f64::MIN_POSITIVE)).clamp(0.0, 1.0);
+            point.distance(a + ab * t) <= tolerance
+        })
+    };
+    let accepted = |candidate: &NurbsCurve| {
+        (1..16).all(|i| on_edge(image_of(candidate, i as f64 / 16.0)))
+    };
     const STEPS: usize = 256;
+    let whole = |from: f64, to: f64| from < 1e-6 && to > 1.0 - 1e-6;
+    // Most pcurves are written exactly over their edge, and then the answer
+    // is the untrimmed pcurve. Whether the search below would offer it as a
+    // whole span is settled by the two runs of samples at the pcurve's ends
+    // alone, so those are walked first, with the search's own steps. When
+    // they offer it and it is accepted, the answer is the same as the
+    // search's; otherwise the search runs as before.
+    if whole_span_offered(STEPS, tolerance, along[0], along[along.len() - 1], |t| {
+        image_of(nurbs, t)
+    }) && accepted(nurbs)
+    {
+        return Some(Curve2::Nurbs(nurbs.clone()));
+    }
     let samples: Vec<Vec3> = (0..=STEPS)
         .map(|i| image_of(nurbs, i as f64 / STEPS as f64))
         .collect();
@@ -648,15 +672,6 @@ fn pcurve_on_edge(
             })
             .collect::<Vec<_>>()
     };
-    let on_edge = |point: Vec3| {
-        along.windows(2).any(|pair| {
-            let (a, b) = (pair[0], pair[1]);
-            let ab = b - a;
-            let t = ((point - a).dot(ab) / ab.dot(ab).max(f64::MIN_POSITIVE)).clamp(0.0, 1.0);
-            point.distance(a + ab * t) <= tolerance
-        })
-    };
-    let whole = |from: f64, to: f64| from < 1e-6 && to > 1.0 - 1e-6;
     let (starts, ends) = (landings(along[0]), landings(along[along.len() - 1]));
     let mut spans: Vec<(f64, f64)> = starts
         .iter()
@@ -671,10 +686,121 @@ fn pcurve_on_edge(
         } else {
             nurbs.trimmed(from, to)?
         };
-        (1..16)
-            .all(|i| on_edge(image_of(&trimmed, i as f64 / 16.0)))
-            .then_some(Curve2::Nurbs(trimmed))
+        accepted(&trimmed).then_some(Curve2::Nurbs(trimmed))
     })
+}
+
+/// Whether [`pcurve_on_edge`]'s search would offer the whole pcurve as a
+/// span: a landing on one end of the edge before `1e-6` and one on the other
+/// after `1 - 1e-6`, either way round. A landing stays within one sample of
+/// its run's closest sample, so such landings come only from the first run
+/// of samples within `tolerance` (when it holds sample 0 or 1) and the last
+/// (when it holds the last sample or the one before). Only those runs are
+/// walked, with the search's rules, and a refinement stops as soon as it is
+/// known on which side of the bound it ends. `image` is the pcurve's image
+/// at `0..=1`, sampled at `steps`.
+fn whole_span_offered(
+    steps: usize,
+    tolerance: f64,
+    first: Vec3,
+    last: Vec3,
+    image: impl Fn(f64) -> Vec3,
+) -> bool {
+    let distance = |i: usize, target: Vec3| image(i as f64 / steps as f64).distance(target);
+    // The closest sample of the first run, when that run starts at 0 or 1.
+    let head = |target: Vec3| -> Option<usize> {
+        let at_zero = distance(0, target);
+        let (start, nearest) = if at_zero <= tolerance {
+            (0, at_zero)
+        } else {
+            let at_one = distance(1, target);
+            if at_one > tolerance {
+                return None;
+            }
+            (1, at_one)
+        };
+        let mut best = (start, nearest);
+        for i in start + 1..=steps {
+            let d = distance(i, target);
+            if d > tolerance {
+                break;
+            }
+            if d < best.1 {
+                best = (i, d);
+            }
+        }
+        Some(best.0)
+    };
+    // The closest sample of the last run, when that run ends at the last
+    // sample or the one before; the first of equals, as the search keeps.
+    let tail = |target: Vec3| -> Option<usize> {
+        let mut end = steps;
+        let mut back = vec![distance(end, target)];
+        if back[0] > tolerance {
+            end = steps - 1;
+            back[0] = distance(end, target);
+            if back[0] > tolerance {
+                return None;
+            }
+        }
+        let mut start = end;
+        while start > 0 {
+            let d = distance(start - 1, target);
+            if d > tolerance {
+                break;
+            }
+            back.push(d);
+            start -= 1;
+        }
+        let mut best = (start, back[back.len() - 1]);
+        for (k, d) in back.iter().rev().enumerate() {
+            if *d < best.1 {
+                best = (start + k, *d);
+            }
+        }
+        Some(best.0)
+    };
+    // The search's refinement of sample `i` towards `target`: whether it
+    // ends before `1e-6` (`at_start`) or after `1 - 1e-6`.
+    let lands = |i: usize, target: Vec3, at_start: bool| -> bool {
+        let (mut low, mut high) = (
+            i.saturating_sub(1) as f64 / steps as f64,
+            (i + 1).min(steps) as f64 / steps as f64,
+        );
+        for _ in 0..40 {
+            // The result is the middle of an interval inside this one.
+            if at_start {
+                if low >= 1e-6 {
+                    return false;
+                }
+                if high < 1e-6 {
+                    return true;
+                }
+            } else {
+                if low > 1.0 - 1e-6 {
+                    return true;
+                }
+                if high <= 1.0 - 1e-6 {
+                    return false;
+                }
+            }
+            let (a, b) = (low + (high - low) / 3.0, high - (high - low) / 3.0);
+            if image(a).distance(target) < image(b).distance(target) {
+                high = b;
+            } else {
+                low = a;
+            }
+        }
+        let landing = (low + high) / 2.0;
+        if at_start {
+            landing < 1e-6
+        } else {
+            landing > 1.0 - 1e-6
+        }
+    };
+    let starts_at = |target: Vec3| head(target).is_some_and(|i| lands(i, target, true));
+    let ends_at = |target: Vec3| tail(target).is_some_and(|i| lands(i, target, false));
+    (starts_at(first) && ends_at(last)) || (ends_at(first) && starts_at(last))
 }
 
 fn read_pcurve(
@@ -1378,4 +1504,309 @@ pub fn lift_wire(document: &SatDocument) -> Option<Vec<WireSpan>> {
         }
     }
     (!spans.is_empty()).then_some(spans)
+}
+
+#[cfg(test)]
+mod pcurve_on_edge_tests {
+    use super::*;
+    use std::f64::consts::FRAC_PI_2;
+
+    /// `pcurve_on_edge` before the end-run shortcut, kept verbatim as the
+    /// reference the shortcut must agree with.
+    fn reference(
+        body: &Body,
+        surface: SurfaceKey,
+        edge: EdgeKey,
+        pcurve: &Curve2,
+    ) -> Option<Curve2> {
+        let surface = body.surfaces.get(surface)?;
+        let edge = body.edges.get(edge)?;
+        let curve = body.curves.get(edge.curve)?;
+        let Curve2::Nurbs(nurbs) = pcurve else {
+            return None;
+        };
+        let span = edge.end_parameter - edge.start_parameter;
+        let along: Vec<Vec3> = (0..=64)
+            .map(|i| Vec3::from(curve.point_at(edge.start_parameter + span * i as f64 / 64.0)))
+            .collect();
+        let size = along
+            .iter()
+            .step_by(8)
+            .flat_map(|a| along.iter().step_by(8).map(move |b| a.distance(*b)))
+            .fold(0.0, f64::max);
+        let tolerance = 1e-3 * size + 1e-6;
+        let image_of = |curve: &NurbsCurve, t: f64| {
+            let uv = curve.point_at(t);
+            Vec3::from(surface.point_at(uv[0], uv[1]))
+        };
+        const STEPS: usize = 256;
+        let samples: Vec<Vec3> = (0..=STEPS)
+            .map(|i| image_of(nurbs, i as f64 / STEPS as f64))
+            .collect();
+        let landings = |target: Vec3| {
+            let mut found = Vec::new();
+            let mut run: Option<(usize, f64)> = None;
+            for (i, sample) in samples.iter().enumerate() {
+                let distance = sample.distance(target);
+                if distance <= tolerance {
+                    if run.is_none_or(|(_, best)| distance < best) {
+                        run = Some((i, distance));
+                    }
+                } else if let Some((best, _)) = run.take() {
+                    found.push(best);
+                }
+            }
+            found.extend(run.map(|(best, _)| best));
+            found
+                .into_iter()
+                .map(|i| {
+                    let (mut low, mut high) = (
+                        i.saturating_sub(1) as f64 / STEPS as f64,
+                        (i + 1).min(STEPS) as f64 / STEPS as f64,
+                    );
+                    for _ in 0..40 {
+                        let (a, b) = (low + (high - low) / 3.0, high - (high - low) / 3.0);
+                        if image_of(nurbs, a).distance(target) < image_of(nurbs, b).distance(target)
+                        {
+                            high = b;
+                        } else {
+                            low = a;
+                        }
+                    }
+                    (low + high) / 2.0
+                })
+                .collect::<Vec<_>>()
+        };
+        let on_edge = |point: Vec3| {
+            along.windows(2).any(|pair| {
+                let (a, b) = (pair[0], pair[1]);
+                let ab = b - a;
+                let t = ((point - a).dot(ab) / ab.dot(ab).max(f64::MIN_POSITIVE)).clamp(0.0, 1.0);
+                point.distance(a + ab * t) <= tolerance
+            })
+        };
+        let whole = |from: f64, to: f64| from < 1e-6 && to > 1.0 - 1e-6;
+        let (starts, ends) = (landings(along[0]), landings(along[along.len() - 1]));
+        let mut spans: Vec<(f64, f64)> = starts
+            .iter()
+            .flat_map(|start| ends.iter().map(move |end| (start.min(*end), start.max(*end))))
+            .filter(|(from, to)| to - from > 1e-9)
+            .collect();
+        spans.sort_by_key(|(from, to)| !whole(*from, *to));
+        spans.into_iter().find_map(|(from, to)| {
+            let trimmed = if whole(from, to) {
+                nurbs.clone()
+            } else {
+                nurbs.trimmed(from, to)?
+            };
+            (1..16)
+                .all(|i| on_edge(image_of(&trimmed, i as f64 / 16.0)))
+                .then_some(Curve2::Nurbs(trimmed))
+        })
+    }
+
+    /// The plane `z = 0` and one edge on `curve` from `low` to `high`.
+    fn edge_on_plane(curve: Curve3, low: f64, high: f64) -> (Body, SurfaceKey, EdgeKey) {
+        let mut body = Body::new();
+        let surface = body.surfaces.insert(Surface::Plane(Plane {
+            origin: [0.0; 3],
+            x_axis: [1.0, 0.0, 0.0],
+            y_axis: [0.0, 1.0, 0.0],
+        }));
+        let mut vertex = |t: f64| {
+            body.vertices.insert(Vertex {
+                point: curve.point_at(t),
+                provenance: Provenance::Synthesized,
+            })
+        };
+        let start = vertex(low);
+        let end = if (high - low - TAU).abs() < 1e-12 {
+            start
+        } else {
+            vertex(high)
+        };
+        let curve = body.curves.insert(curve);
+        let edge = body.edges.insert(Edge {
+            curve,
+            start_parameter: low,
+            end_parameter: high,
+            start,
+            end,
+            coedges: Vec::new(),
+            provenance: Provenance::Synthesized,
+        });
+        (body, surface, edge)
+    }
+
+    fn polyline(points: &[[f64; 2]]) -> Curve2 {
+        let n = points.len();
+        let mut knots = vec![0.0; 2];
+        knots.extend((1..n - 1).map(|i| i as f64 / (n - 1) as f64));
+        knots.extend([1.0; 2]);
+        Curve2::Nurbs(NurbsCurve::new_strict(1, points.to_vec(), knots, vec![1.0; n]).unwrap())
+    }
+
+    /// The unit circle as a rational quadratic, starting and ending at (1, 0).
+    fn full_circle() -> Curve2 {
+        let w = std::f64::consts::FRAC_1_SQRT_2;
+        let points = vec![
+            [1.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 1.0],
+            [-1.0, 1.0],
+            [-1.0, 0.0],
+            [-1.0, -1.0],
+            [0.0, -1.0],
+            [1.0, -1.0],
+            [1.0, 0.0],
+        ];
+        let knots = vec![0.0, 0.0, 0.0, 0.25, 0.25, 0.5, 0.5, 0.75, 0.75, 1.0, 1.0, 1.0];
+        let weights = vec![1.0, w, 1.0, w, 1.0, w, 1.0, w, 1.0];
+        Curve2::Nurbs(NurbsCurve::new_strict(2, points, knots, weights).unwrap())
+    }
+
+    fn unit_circle() -> Curve3 {
+        Curve3::Circle(Circle3 {
+            plane: Plane {
+                origin: [0.0; 3],
+                x_axis: [1.0, 0.0, 0.0],
+                y_axis: [0.0, 1.0, 0.0],
+            },
+            radius: 1.0,
+        })
+    }
+
+    fn straight_edge() -> (Body, SurfaceKey, EdgeKey) {
+        edge_on_plane(
+            Curve3::Line(Line3 {
+                origin: [0.0; 3],
+                direction: [2.0, 0.0, 0.0],
+            }),
+            0.0,
+            1.0,
+        )
+    }
+
+    /// Whether the shortcut offers the whole pcurve for this edge.
+    fn offered(body: &Body, surface: SurfaceKey, edge: EdgeKey, pcurve: &Curve2) -> bool {
+        let surface = body.surfaces.get(surface).unwrap();
+        let edge = body.edges.get(edge).unwrap();
+        let curve = body.curves.get(edge.curve).unwrap();
+        let Curve2::Nurbs(nurbs) = pcurve else {
+            return false;
+        };
+        let span = edge.end_parameter - edge.start_parameter;
+        let along: Vec<Vec3> = (0..=64)
+            .map(|i| Vec3::from(curve.point_at(edge.start_parameter + span * i as f64 / 64.0)))
+            .collect();
+        let size = along
+            .iter()
+            .step_by(8)
+            .flat_map(|a| along.iter().step_by(8).map(move |b| a.distance(*b)))
+            .fold(0.0, f64::max);
+        whole_span_offered(256, 1e-3 * size + 1e-6, along[0], along[64], |t| {
+            let uv = nurbs.point_at(t);
+            Vec3::from(surface.point_at(uv[0], uv[1]))
+        })
+    }
+
+    #[test]
+    fn a_pcurve_written_over_its_edge_is_kept_whole_either_way_round() {
+        let (body, surface, edge) = straight_edge();
+        for pcurve in [
+            polyline(&[[0.0, 0.0], [2.0, 0.0]]),
+            polyline(&[[2.0, 0.0], [0.0, 0.0]]),
+            polyline(&[[0.0, 0.0], [0.7, 0.0], [2.0, 0.0]]),
+        ] {
+            assert!(offered(&body, surface, edge, &pcurve), "the shortcut answers");
+            let kept = pcurve_on_edge(&body, surface, edge, &pcurve);
+            assert_eq!(kept, Some(pcurve.clone()));
+            assert_eq!(kept, reference(&body, surface, edge, &pcurve));
+        }
+        // A closed edge under a closed pcurve.
+        let (body, surface, edge) = edge_on_plane(unit_circle(), 0.0, TAU);
+        let pcurve = full_circle();
+        assert!(offered(&body, surface, edge, &pcurve));
+        assert_eq!(pcurve_on_edge(&body, surface, edge, &pcurve), Some(pcurve.clone()));
+        assert_eq!(
+            pcurve_on_edge(&body, surface, edge, &pcurve),
+            reference(&body, surface, edge, &pcurve)
+        );
+    }
+
+    #[test]
+    fn a_whole_ellipse_under_an_arc_is_still_cut_down() {
+        let (body, surface, edge) = edge_on_plane(unit_circle(), 0.0, FRAC_PI_2);
+        let pcurve = full_circle();
+        assert!(!offered(&body, surface, edge, &pcurve), "only one end lands");
+        let cut = pcurve_on_edge(&body, surface, edge, &pcurve).expect("a quarter");
+        assert_eq!(Some(cut.clone()), reference(&body, surface, edge, &pcurve));
+        let Curve2::Nurbs(cut) = cut else {
+            unreachable!()
+        };
+        let ends = [cut.point_at(0.0), cut.point_at(1.0)];
+        let near = |p: [f64; 2], q: [f64; 2]| (p[0] - q[0]).hypot(p[1] - q[1]) < 1e-6;
+        assert!(
+            (near(ends[0], [1.0, 0.0]) && near(ends[1], [0.0, 1.0]))
+                || (near(ends[0], [0.0, 1.0]) && near(ends[1], [1.0, 0.0])),
+            "{ends:?}"
+        );
+    }
+
+    #[test]
+    fn ends_within_tolerance_are_not_enough_to_keep_a_pcurve_whole() {
+        // Tolerance is 2e-3 here. Running past an end by less than that, the
+        // pcurve is still cut where it crosses the end, as before.
+        let (body, surface, edge) = straight_edge();
+        let overshoot = polyline(&[[-1e-3, 0.0], [2.0, 0.0]]);
+        assert!(!offered(&body, surface, edge, &overshoot));
+        let cut = pcurve_on_edge(&body, surface, edge, &overshoot);
+        assert!(cut.is_some() && cut != Some(overshoot.clone()), "cut, not whole");
+        assert_eq!(cut, reference(&body, surface, edge, &overshoot));
+        // Both ends on the edge's ends but bulging away from it: refused.
+        let arch = Curve2::Nurbs(
+            NurbsCurve::new_strict(
+                2,
+                vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]],
+                vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+                vec![1.0; 3],
+            )
+            .unwrap(),
+        );
+        assert!(offered(&body, surface, edge, &arch), "the ends land");
+        assert_eq!(pcurve_on_edge(&body, surface, edge, &arch), None);
+        assert_eq!(reference(&body, surface, edge, &arch), None);
+    }
+
+    #[test]
+    fn the_shortcut_answers_as_the_search_did_across_end_offsets() {
+        let (body, surface, edge) = straight_edge();
+        let offsets = [-3e-3, -2.1e-3, -1.9e-3, -5e-4, -1e-7, 0.0, 1e-7, 5e-4, 1.9e-3, 3e-3];
+        let (mut whole, mut cut, mut none) = (0, 0, 0);
+        for a in offsets {
+            for b in offsets {
+                for reversed in [false, true] {
+                    let (p, q) = ([a, 0.0], [2.0 + b, 0.0]);
+                    let pcurve = if reversed {
+                        polyline(&[q, p])
+                    } else {
+                        polyline(&[p, q])
+                    };
+                    let expected = reference(&body, surface, edge, &pcurve);
+                    assert_eq!(
+                        pcurve_on_edge(&body, surface, edge, &pcurve),
+                        expected,
+                        "offsets {a} {b} reversed {reversed}"
+                    );
+                    match &expected {
+                        Some(found) if *found == pcurve => whole += 1,
+                        Some(_) => cut += 1,
+                        None => none += 1,
+                    }
+                }
+            }
+        }
+        // The sweep covers every outcome of the search.
+        assert!(whole > 0 && cut > 0 && none > 0, "{whole} {cut} {none}");
+    }
 }
