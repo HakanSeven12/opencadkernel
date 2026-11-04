@@ -1,4 +1,5 @@
-use super::{triangulate_rings, Curve};
+use super::triangulate::simple_rings;
+use super::Curve;
 use crate::tessellation::DEFAULT_ANGLE;
 
 const MAX_RECOVERY_POINTS: usize = 512;
@@ -21,7 +22,7 @@ pub fn refine_spline_boundary(
         return None;
     }
     let projected = ring.iter().copied().map(&project).collect();
-    if !triangulate_rings(&[projected]).1.is_empty() {
+    if !simple_rings(&[projected]).1.is_empty() {
         return None;
     }
     let limit = (ring.len() + MAX_EXTRA_POINTS).min(MAX_RECOVERY_POINTS);
@@ -54,7 +55,7 @@ pub fn refine_spline_boundary(
         if !marked.iter().any(|marked| *marked) {
             let ring = chain_samples(points)?;
             let projected = ring.iter().copied().map(&project).collect();
-            return (!triangulate_rings(&[projected]).1.is_empty()).then_some(ring);
+            return (!simple_rings(&[projected]).1.is_empty()).then_some(ring);
         }
         let mut next = Vec::new();
         let mut sampled = Vec::new();
@@ -257,9 +258,9 @@ mod tests {
         let spline = narrow(0.00001);
         let curve = Curve::Nurbs(spline.clone());
         let original = curve.tessellate_angle(DEFAULT_ANGLE);
-        assert!(triangulate_rings(std::slice::from_ref(&original)).1.is_empty());
+        assert!(simple_rings(std::slice::from_ref(&original)).1.is_empty());
         let refined = refine_spline_boundary(&original, || vec![curve], |point| point).unwrap();
-        assert!(!triangulate_rings(std::slice::from_ref(&refined)).1.is_empty());
+        assert!(!simple_rings(std::slice::from_ref(&refined)).1.is_empty());
         for index in 0..=6 {
             assert!(refined.contains(&spline.point_at(index as f64 / 6.0)));
         }
