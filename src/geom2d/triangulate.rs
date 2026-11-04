@@ -21,9 +21,12 @@
 //!
 //! # What it will not do
 //!
-//! A self-intersecting ring has no inside to fill, and no triangulation of it
-//! is right. That returns nothing rather than a plausible mesh, on the
-//! principle that a caller can draw nothing but cannot un-draw a wrong shape.
+//! A single self-intersecting ring given to [`polygon`] has no inside to
+//! fill, and no triangulation of it is right. That returns nothing rather
+//! than a plausible mesh, on the principle that a caller can draw nothing but
+//! cannot un-draw a wrong shape. [`rings`] fills rings by the even-odd rule
+//! instead, so a ring that crosses itself is first split into the faces it
+//! covers an odd number of times (see [`split_self_crossing`]).
 
 use super::vec::Vec2;
 
@@ -137,10 +140,22 @@ pub fn nesting_depths(input: &[Vec<[f64; 2]>]) -> Vec<usize> {
 /// Triangulates rings using even-odd containment.
 ///
 /// Disjoint outer rings, holes, and nested islands may be mixed in any order.
-/// Simple rings whose boundaries cross each other fill their even-odd region
-/// (see [`uncross`]); self-crossing rings and what they touch are omitted.
+/// A ring that crosses itself is split into the faces it covers an odd
+/// number of times (see [`split_self_crossing`]), and simple rings whose
+/// boundaries cross each other fill their even-odd region (see [`uncross`]).
+/// A ring that still cannot be filled, and what it touches, is omitted.
 pub fn rings(input: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
-    let input = uncross(input);
+    rings_from(uncross(&split_self_crossing(input)))
+}
+
+/// [`rings`] without splitting self-crossing rings: such a ring, and what it
+/// touches, is omitted. Boundary recovery uses it to tell a crossed sample
+/// ring, which it can resample, from one that fills as it is.
+pub(crate) fn simple_rings(input: &[Vec<[f64; 2]>]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
+    rings_from(uncross(input))
+}
+
+fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
     let mut rings = Vec::new();
     let mut invalid = Vec::new();
     for raw in &input {
@@ -444,6 +459,59 @@ fn simple(ring: &[[f64; 2]], tolerance: f64) -> bool {
     true
 }
 
+/// A point well inside a simple ring: the centre of the largest triangle of
+/// its triangulation. `None` when the ring does not triangulate.
+fn interior_sample(face: &[[f64; 2]]) -> Option<[f64; 2]> {
+    let (points, triangles) = polygon(face, &[]);
+    let corners = |t: &[usize; 3]| t.map(|vertex| Vec2::from(points[vertex]));
+    let area = |[a, b, c]: [Vec2; 3]| (b - a).cross(c - a).abs();
+    let [a, b, c] = triangles
+        .iter()
+        .map(corners)
+        .max_by(|p, q| area(*p).total_cmp(&area(*q)))?;
+    Some(((a + b + c) * (1.0 / 3.0)).to_array())
+}
+
+/// Each ring that crosses itself, replaced by the faces of its own
+/// arrangement that it covers an odd number of times: a bow tie becomes its
+/// two lobes. As one invalid ring it was dropped together with every ring it
+/// touched, so a hatch with a self-crossing island lost its whole fill. A
+/// ring whose arrangement gives no such face passes through unchanged, and
+/// so does every simple ring.
+fn split_self_crossing(input: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
+    use super::{bounded_faces, Line, Tolerance};
+    let mut out = Vec::with_capacity(input.len());
+    for raw in input {
+        let ring = sanitize(raw);
+        let crossing = ring.len() >= 4 && !simple(&ring, 0.0);
+        let Some(bounds) = RingBounds::of(&ring).filter(|_| crossing) else {
+            out.push(raw.clone());
+            continue;
+        };
+        let extent = (bounds.max - bounds.min).length();
+        if !(extent > 0.0) {
+            out.push(raw.clone());
+            continue;
+        }
+        let lines: Vec<Line> = (0..ring.len())
+            .map(|k| Line {
+                start: ring[k],
+                end: ring[(k + 1) % ring.len()],
+            })
+            .collect();
+        let faces: Vec<Vec<[f64; 2]>> = bounded_faces(&lines, Tolerance::new(extent * 1e-9))
+            .into_iter()
+            .filter(|face| interior_sample(face).is_some_and(|sample| ring_contains(&ring, sample)))
+            .collect();
+        if faces.is_empty() {
+            out.push(raw.clone());
+        } else {
+            out.extend(faces);
+        }
+    }
+    out
+}
+
 /// Each group of simple rings whose boundaries cross, replaced by the faces
 /// of their arrangement that an odd number of them cover: the region they
 /// fill under the even-odd rule, as rings that at most touch. A hatch whose
@@ -510,17 +578,9 @@ fn uncross(input: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
             continue;
         }
         for face in bounded_faces(&lines, Tolerance::new(extent * 1e-9)) {
-            let (points, triangles) = polygon(&face, &[]);
-            let corners = |t: &[usize; 3]| t.map(|vertex| Vec2::from(points[vertex]));
-            let area = |[a, b, c]: [Vec2; 3]| (b - a).cross(c - a).abs();
-            let Some([a, b, c]) = triangles
-                .iter()
-                .map(corners)
-                .max_by(|p, q| area(*p).total_cmp(&area(*q)))
-            else {
+            let Some(sample) = interior_sample(&face) else {
                 continue;
             };
-            let sample = ((a + b + c) * (1.0 / 3.0)).to_array();
             let cover = group
                 .iter()
                 .filter(|index| ring_contains(&rings[**index], sample))
@@ -1514,6 +1574,45 @@ mod tests {
             })
             .sum();
         assert!((area - 24.0).abs() < 1e-9, "{area}");
+    }
+
+    #[test]
+    fn a_self_crossing_ring_fills_its_lobes() {
+        // A bow tie covers its two triangular lobes once each.
+        let bowtie = vec![[0.0, 0.0], [10.0, 10.0], [10.0, 0.0], [0.0, 10.0]];
+        let (points, triangles) = rings(&[bowtie]);
+        let filled = area(&points, &triangles);
+        assert!((filled - 50.0).abs() < 1e-9, "{filled}");
+    }
+
+    #[test]
+    fn a_self_crossing_island_leaves_the_rest_of_the_fill() {
+        // As one invalid ring the bow tie took the square round it down too,
+        // and nothing was filled. Now its lobes are holes in the square.
+        let square = vec![[-5.0, -5.0], [15.0, -5.0], [15.0, 15.0], [-5.0, 15.0]];
+        let bowtie = vec![[0.0, 0.0], [10.0, 10.0], [10.0, 0.0], [0.0, 10.0]];
+        let (points, triangles) = rings(&[bowtie, square]);
+        let filled = area(&points, &triangles);
+        assert!((filled - 350.0).abs() < 1e-9, "{filled}");
+    }
+
+    #[test]
+    fn a_thin_self_crossing_island_at_survey_coordinates_leaves_the_fill() {
+        // The roof hatch of OpenCADStudio#2549: a 100 x 50 face with an
+        // island under four units high whose third edge crosses its first,
+        // all half a million units from the origin.
+        let (x, y) = (551_000.0, 4_246_500.0);
+        let face = vec![[x, y], [x + 100.0, y], [x + 100.0, y + 50.0], [x, y + 50.0]];
+        let island = vec![
+            [x + 20.0, y + 40.0],
+            [x + 55.0, y + 43.8],
+            [x + 80.0, y + 42.6],
+            [x + 0.5, y + 42.6],
+        ];
+        let (points, triangles) = rings(&[island, face]);
+        let filled = area(&points, &triangles);
+        // 5000 less the two lobes, 56.48 and 21.63.
+        assert!((filled - 4921.887).abs() < 1e-2, "{filled}");
     }
 
     #[test]
