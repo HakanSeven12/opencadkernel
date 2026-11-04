@@ -1073,6 +1073,13 @@ fn split_face_in_place(
             match (direct, wrapped) {
                 // A loop through two corners with both halves inside cuts
                 // the face in three; one half now, the other on the retry.
+                // The shorter half goes first, whichever way the ends' angles
+                // read: an end at a half turn reads as either sign, and the
+                // longer half first — a rounded corner's whole circle, not
+                // its quarter — left a piece on both sides of the other body.
+                (true, true) if low_parameter + period - high_parameter < high_parameter - low_parameter => {
+                    (high, low, high_parameter, low_parameter + period)
+                }
                 (true, _) => (low, high, low_parameter, high_parameter),
                 (false, true) => (high, low, high_parameter, low_parameter + period),
                 (false, false) => return None,
