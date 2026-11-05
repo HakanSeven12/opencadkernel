@@ -71,7 +71,7 @@ pub use intersect::{
     line_line,
 };
 #[cfg(feature = "offset")]
-pub use offset::offset_polyline;
+pub use offset::{offset_polyline, offset_polyline_with_gap, OffsetGap};
 pub use polyline::{
     BulgeArc, Polyline, PolylineRange, PolylineRangeSegment, PolylineVertex, RectangleFrame,
 };
