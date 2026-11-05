@@ -45,6 +45,29 @@ const JOIN_EPSILON: f64 = 1e-4;
 /// the offset, not to the drawing: a 0.1 mm offset and a 10 km one otherwise
 /// need different epsilons to behave the same way.
 pub fn offset_polyline(source: &Polyline, distance: f64, side: [f64; 2]) -> Vec<Polyline> {
+    offset_polyline_with_gap(source, distance, side, OffsetGap::Extend)
+}
+
+/// How an offset closes the gap that opens at a convex corner between two
+/// straight segments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OffsetGap {
+    /// Extend both segments to the point where they meet.
+    #[default]
+    Extend,
+    /// Join them with an arc of the offset radius, centred on the corner.
+    Fillet,
+    /// Join them with the straight line tangent to that arc at its midpoint.
+    Chamfer,
+}
+
+/// [`offset_polyline`] with a chosen way of closing the corner gaps.
+pub fn offset_polyline_with_gap(
+    source: &Polyline,
+    distance: f64,
+    side: [f64; 2],
+    gap: OffsetGap,
+) -> Vec<Polyline> {
     let distance = distance.abs();
     if distance < 1e-12 {
         return Vec::new();
@@ -73,7 +96,7 @@ pub fn offset_polyline(source: &Polyline, distance: f64, side: [f64; 2]) -> Vec<
     let cross = tangent.x * toward_pick.y - tangent.y * toward_pick.x;
     let signed_offset = if cross >= 0.0 { 1.0 } else { -1.0 };
 
-    parallel_offset(&normalised, signed_offset)
+    parallel_offset(&normalised, signed_offset, gap)
         .into_iter()
         .filter(|result| result.vertex_count() >= 2)
         .map(|result| Polyline {
@@ -152,7 +175,11 @@ fn normalise(source: &Polyline, distance: f64) -> Option<(CavPolyline<f64>, [f64
 
 /// The offset proper: raw offsets both ways, sharpened joins, then the slice
 /// pass that discards the parts the offset folded over.
-fn parallel_offset(source: &CavPolyline<f64>, signed_offset: f64) -> Vec<CavPolyline<f64>> {
+fn parallel_offset(
+    source: &CavPolyline<f64>,
+    signed_offset: f64,
+    gap: OffsetGap,
+) -> Vec<CavPolyline<f64>> {
     let options = PlineOffsetOptions {
         handle_self_intersects: true,
         pos_equal_eps: POSITION_EPSILON,
@@ -167,8 +194,18 @@ fn parallel_offset(source: &CavPolyline<f64>, signed_offset: f64) -> Vec<CavPoly
     }
     let mut dual: CavPolyline<f64> =
         create_raw_offset_polyline(source, -signed_offset, POSITION_EPSILON);
-    sharpen_joins(&mut raw, source);
-    sharpen_joins(&mut dual, source);
+    match gap {
+        OffsetGap::Extend => {
+            sharpen_joins(&mut raw, source);
+            sharpen_joins(&mut dual, source);
+        }
+        // The raw offset already joins with arcs of the offset radius.
+        OffsetGap::Fillet => {}
+        OffsetGap::Chamfer => {
+            chamfer_joins(&mut raw, source);
+            chamfer_joins(&mut dual, source);
+        }
+    }
 
     let slices = slices_from_dual_raw_offsets(source, &raw, &dual, &index, signed_offset, &options);
     stitch_slices_together::<_, f64, CavPolyline<f64>>(
@@ -270,6 +307,68 @@ fn sharpen_joins(raw: &mut CavPolyline<f64>, source: &CavPolyline<f64>) {
     }
 }
 
+/// Replaces each join arc (see [`sharpen_joins`]) with the straight line
+/// tangent to it at its midpoint: both neighbouring segments are extended by
+/// `tan(sweep / 4)` of the offset radius and meet that line there.
+fn chamfer_joins(raw: &mut CavPolyline<f64>, source: &CavPolyline<f64>) {
+    let count = raw.vertex_data.len();
+    if count < 3 {
+        return;
+    }
+    for index in 0..count {
+        let previous = if index > 0 {
+            index - 1
+        } else if raw.is_closed {
+            count - 1
+        } else {
+            continue;
+        };
+        let Some(next) = step(index, count, raw.is_closed) else {
+            continue;
+        };
+        let Some(after) = step(next, count, raw.is_closed) else {
+            continue;
+        };
+        let arc_start = raw.vertex_data[index];
+        let arc_end = raw.vertex_data[next];
+        if arc_start.bulge.abs() < POSITION_EPSILON
+            || raw.vertex_data[previous].bulge.abs() >= POSITION_EPSILON
+            || arc_end.bulge.abs() >= POSITION_EPSILON
+        {
+            continue;
+        }
+        let Some(connection) = BulgeArc::from_bulge(
+            [arc_start.x, arc_start.y],
+            [arc_end.x, arc_end.y],
+            arc_start.bulge,
+        ) else {
+            continue;
+        };
+        if (connection.radius - 1.0).abs() > JOIN_EPSILON {
+            continue;
+        }
+        let centre = Vec2::from(connection.center);
+        if !source.iter_vertexes().any(|vertex| {
+            Vec2::new(vertex.x, vertex.y).distance_squared(centre) <= JOIN_EPSILON * JOIN_EPSILON
+        }) {
+            continue;
+        }
+        let before = raw.vertex_data[previous];
+        let after_vertex = raw.vertex_data[after];
+        let incoming = Vec2::new(arc_start.x - before.x, arc_start.y - before.y).normalize();
+        let outgoing = Vec2::new(after_vertex.x - arc_end.x, after_vertex.y - arc_end.y).normalize();
+        let (Some(incoming), Some(outgoing)) = (incoming, outgoing) else {
+            continue;
+        };
+        let reach = (connection.sweep.abs() / 4.0).tan();
+        raw.vertex_data[index].x = arc_start.x + incoming.x * reach;
+        raw.vertex_data[index].y = arc_start.y + incoming.y * reach;
+        raw.vertex_data[index].bulge = 0.0;
+        raw.vertex_data[next].x = arc_end.x - outgoing.x * reach;
+        raw.vertex_data[next].y = arc_end.y - outgoing.y * reach;
+    }
+}
+
 /// The next index, wrapping only on a closed polyline.
 fn step(index: usize, count: usize, closed: bool) -> Option<usize> {
     if index + 1 < count {
@@ -308,6 +407,20 @@ mod tests {
             ],
             closed: true,
         }
+    }
+
+    #[test]
+    fn gap_types_close_a_square_corner_as_measured() {
+        let square = rectangle(100.0, 100.0);
+        let fillet = offset_polyline_with_gap(&square, 10.0, [50.0, -50.0], OffsetGap::Fillet);
+        assert_eq!(fillet[0].vertices.len(), 8);
+        assert!(fillet[0].vertices.iter().any(|v| (v.bulge.abs() - 0.414214).abs() < 1e-5));
+        let chamfer = offset_polyline_with_gap(&square, 10.0, [50.0, -50.0], OffsetGap::Chamfer);
+        assert_eq!(chamfer[0].vertices.len(), 8);
+        assert!(chamfer[0].vertices.iter().all(|v| v.bulge == 0.0));
+        assert!(chamfer[0].vertices.iter().any(|v| {
+            (v.position[0] - 104.142136).abs() < 1e-5 && (v.position[1] + 10.0).abs() < 1e-9
+        }));
     }
 
     #[test]
