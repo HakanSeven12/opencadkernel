@@ -3,7 +3,7 @@
 //! Clean provenance keeps original records; dirty and synthesized nodes are
 //! written from kernel geometry.
 
-use opencadcodec::entities::acis::types::{
+use document::entities::acis::types::{
     SatDocument, SatEdge, SatFace, SatPointer, SatRecord, SatToken, SatVertex,
 };
 use crate::brep::{Body, Curve3, Provenance, Surface};

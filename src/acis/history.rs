@@ -1,9 +1,9 @@
-use opencadcodec::entities::EmbeddedEntity;
-use opencadcodec::objects::{
+use document::entities::EmbeddedEntity;
+use document::objects::{
     SolidHistoryBoolean, SolidHistoryLoft, SolidHistoryOperation, SolidHistoryRevolve,
     SolidHistorySweep, SolidHistoryTree,
 };
-use opencadcodec::types::{Matrix3, Vector3};
+use document::types::{Matrix3, Vector3};
 
 use crate::brep::{self, Body, Placement};
 use crate::geom2d::{
@@ -133,7 +133,7 @@ fn straight_curve(
 }
 
 fn spline_curve(
-    value: &opencadcodec::entities::Spline,
+    value: &document::entities::Spline,
 ) -> Result<PlanarCurve, HistoryRebuildError> {
     let degree = value.degree.max(1) as usize;
     let fit_method = !value.fit_points.is_empty() && value.control_points.len() <= degree;
@@ -696,7 +696,7 @@ fn region_spline_pcurve(
 }
 
 fn region_sweep_profile(
-    region: &opencadcodec::entities::Region,
+    region: &document::entities::Region,
 ) -> Result<(Plane, Vec<Vec<Curve>>), HistoryRebuildError> {
     if region.acis_data.has_data() {
         let document = region.acis_data.parse().ok_or(HistoryRebuildError::InvalidBrep)?;
@@ -1639,7 +1639,7 @@ pub fn loft_path_geometry(entity: &EmbeddedEntity) -> Result<Vec<brep::Curve3>, 
 
 /// First creation, Properties changes and reload all use this same builder.
 pub fn rebuild_loft_with_options(value: &SolidHistoryLoft) -> Result<Body, String> {
-    let settings = value.parameters.clone().unwrap_or_else(|| opencadcodec::objects::SolidHistoryLoftParameters {
+    let settings = value.parameters.clone().unwrap_or_else(|| document::objects::SolidHistoryLoftParameters {
         normals: 0, ..Default::default()
     });
     let counts = if settings.section_counts.is_empty() { vec![1; value.cross_sections.len()] }
@@ -1867,7 +1867,7 @@ fn selected_edges<K: Copy>(edges: &[K], ordinals: &[i32]) -> Result<Vec<K>, Hist
 #[cfg(test)]
 mod tests {
     use super::*;
-    use opencadcodec::objects::{SolidHistoryBox, SolidHistoryNodeBase};
+    use document::objects::{SolidHistoryBox, SolidHistoryNodeBase};
 
     fn cube(id: i32, size: [f64; 3]) -> SolidHistoryTree {
         SolidHistoryTree {

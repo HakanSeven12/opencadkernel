@@ -2,8 +2,8 @@
 //!
 //! Records are allocated before their circular topology pointers are filled.
 
-use opencadcodec::entities::acis::types::{SatDocument, SatPointer, SatRecord, SatToken};
-use opencadcodec::entities::acis::SplineNet;
+use document::entities::acis::types::{SatDocument, SatPointer, SatRecord, SatToken};
+use document::entities::acis::SplineNet;
 use crate::brep::{
     Body, CoedgeKey, Curve3, CurveKey, EdgeKey, FaceKey, LoopKey, LumpKey, ShellKey, Surface,
     SurfaceKey, VertexKey,

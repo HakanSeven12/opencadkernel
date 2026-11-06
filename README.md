@@ -28,26 +28,16 @@ afterthought.
 ## Where this sits
 
 ```
-OpenCADStudio ──► opencadcodec      DWG/DXF/ACIS
-      ├─────────► opencadkernel
-      └─────────► acadifc       IFC ↔ CAD conversion
+OpenCADStudio ──► document       DWG/DXF/ACIS (opencaddocument)
+      ├─────────► kernel         (opencadkernel)
+      └─────────► graph          (opencadgraph)
 
-acadifc ──► opencadcodec
-       └──► opencadkernel
-
-opencadkernel ──► opencadcodec          under `acis` only
+kernel ──► document          under `acis` only
 ```
 
-Consumers depend on this crate directly rather than through each other, so
-an editor that never touches IFC does not build the IFC subsystem.
-
-`acadifc` is a sibling consumer, not a layer above. IFC conversion is
-geometry work — `IfcAdvancedBrep` carries NURBS surfaces, `IfcFacetedBrep`
-is polygonal, `IfcExtrudedAreaSolid` is a sweep, and profiles are 2D curves —
-so it reaches into `brep` and `geom2d` the same way an editor does.
-
-**This crate must not depend on `acadifc`.** That edge would close a cycle,
-and it is the one direction the graph above forbids.
+Consumers depend on this crate directly rather than through each other.
+The kernel reaches the drawing model only for ACIS, under `acis`; the
+document must never depend on the kernel, which would close a cycle.
 
 Conversion into CAD is also why `brep::Provenance` has a `Synthesized`
 variant: geometry arriving from IFC has no source record to fall back on, so
