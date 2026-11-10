@@ -38,12 +38,16 @@ pub fn display_angle_for_resolution(resolution: f64) -> f64 {
     angle(DISPLAY_ANGLE / resolution.max(1.0).sqrt()).max(FINE_ANGLE)
 }
 
-/// The cosine of the angle between two directions; `-1` for a zero
-/// direction, which cannot satisfy a bound.
+/// The cosine of the angle between two directions. Two stationary samples
+/// agree; a zero direction beside a nonzero one returns `-1`, since that can
+/// be a cusp and cannot satisfy an angular bound without further refinement.
 fn direction_cosine<const N: usize>(a: [f64; N], b: [f64; N]) -> f64 {
     let dot = (0..N).map(|axis| a[axis] * b[axis]).sum::<f64>();
     let aa = (0..N).map(|axis| a[axis] * a[axis]).sum::<f64>();
     let bb = (0..N).map(|axis| b[axis] * b[axis]).sum::<f64>();
+    if aa <= f64::MIN_POSITIVE && bb <= f64::MIN_POSITIVE {
+        return 1.0;
+    }
     let length = (aa * bb).sqrt();
     if !length.is_finite() || length <= f64::MIN_POSITIVE {
         -1.0
@@ -127,4 +131,19 @@ where
         &mut out,
     );
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stationary_tangents_agree_without_hiding_a_cusp() {
+        assert_eq!(max_direction_angle(&[[0.0, 0.0], [0.0, 0.0]]), 0.0);
+        assert_eq!(
+            max_direction_angle(&[[0.0, 0.0], [1.0, 0.0]]),
+            std::f64::consts::PI,
+            "a stationary point beside a moving one can be a cusp and still needs refinement"
+        );
+    }
 }
