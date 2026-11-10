@@ -2309,7 +2309,7 @@ struct Wire {
 }
 
 /// A planar path's curves traversed the other way, in chain order.
-pub(crate) fn reversed_path_curves(curves: &[Curve]) -> Option<Vec<Curve>> {
+pub fn reversed_path_curves(curves: &[Curve]) -> Option<Vec<Curve>> {
     let curves = expanded(curves)?;
     let senses = chain_senses(&curves)?;
     curves.iter().zip(senses).rev().map(|(curve, forward)| {

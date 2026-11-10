@@ -2,16 +2,18 @@ use crate::geom2d::{Curve, Ellipse, NurbsCurve};
 use crate::space::{NurbsCurve3, NurbsSurface3, Plane, Vec3};
 use std::f64::consts::{FRAC_PI_2, TAU};
 
+/// A 2D curve as a rational B-spline: lines, arcs, ellipses and NURBS alike.
 #[derive(Clone)]
-pub(crate) struct RationalCurve2 {
+pub struct RationalCurve2 {
     pub degree: usize,
     pub knots: Vec<f64>,
     pub points: Vec<[f64; 2]>,
     pub weights: Vec<f64>,
 }
 
+/// A [`RationalCurve2`] lifted into a plane in space.
 #[derive(Clone)]
-pub(crate) struct RationalCurve3 {
+pub struct RationalCurve3 {
     pub degree: usize,
     pub knots: Vec<f64>,
     pub points: Vec<[f64; 3]>,

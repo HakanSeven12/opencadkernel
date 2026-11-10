@@ -22,7 +22,8 @@
 //! math, and shifts results back to world coordinates on the way out. See
 //! [`geom2d::frame`] for why this is an invariant rather than a convenience.
 //!
-//! ACIS record conversion is available separately through the `acis` feature.
+//! The kernel reads no file format: converting ACIS records to and from its
+//! B-rep is the application's job (OpenCADStudio's `ocs_acis`).
 
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
@@ -38,5 +39,3 @@ pub mod geom2d;
 #[cfg(feature = "brep")]
 pub mod brep;
 
-#[cfg(feature = "acis")]
-pub mod acis;

@@ -95,7 +95,8 @@ pub use sweep::{
     extrude_region_tapered, extrude_surface_region_tapered, extrude_surface_tapered,
     extrude_tapered,
 };
-pub(crate) use sweep_path::reversed_path_curves;
+pub use nurbs_builder::{RationalCurve2, RationalCurve3};
+pub use sweep_path::reversed_path_curves;
 pub use sweep_path::{
     sweep_corner_refusal, sweep_path, sweep_path_has_corner, sweep_polyline_base, sweep_spatial_polyline, SweepRefusal, sweep_path_start, sweep_path_tangent, sweep_profile_base, sweep_profile_base_from,
     sweep_profile_group_base,
@@ -110,8 +111,8 @@ pub use topology::{
 /// A node's origin in the document it was lifted from.
 ///
 /// Opaque here on purpose: this layer knows a node came from record *n* of
-/// something, not what a record is. The format layer owns the mapping — see
-/// the `acis` module.
+/// something, not what a record is. The format layer that lifts a body owns
+/// the mapping.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SourceRef(u32);
 

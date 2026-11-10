@@ -417,7 +417,7 @@ pub fn face_boundary(
     )
 }
 
-pub(crate) fn face_boundary_parts(
+pub fn face_boundary_parts(
     body: &super::topology::Body,
     face: super::topology::FaceKey,
     tolerance: f64,

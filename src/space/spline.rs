@@ -143,7 +143,7 @@ pub enum Parameterization {
 /// The returned polynomial B-spline passes through every fit point; it is
 /// not a polyline approximation. Parameter spans use the full source-space
 /// distance, so a spatial fit never changes when viewed in another plane.
-pub(crate) fn interpolate_open<const N: usize>(
+pub fn interpolate_open<const N: usize>(
     points: &[[f64; N]],
     start_tangent: Option<[f64; N]>,
     end_tangent: Option<[f64; N]>,

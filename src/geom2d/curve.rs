@@ -202,7 +202,7 @@ impl Curve {
         matches!(self, Self::Line(_) | Self::Ray(_) | Self::XLine(_))
     }
 
-    pub(crate) fn rectangle_side(&self, bounds: [[f64; 2]; 2]) -> Option<usize> {
+    pub fn rectangle_side(&self, bounds: [[f64; 2]; 2]) -> Option<usize> {
         let endpoints = [self.point_at(0.0), self.point_at(1.0)];
         for fixed in 0..2 {
             let varying = 1 - fixed;

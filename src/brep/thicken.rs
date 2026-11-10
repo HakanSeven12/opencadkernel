@@ -1377,19 +1377,6 @@ mod tests {
             assert!(mesh_body(&solid, 0.03, 1e-7)
                 .mass_properties()
                 .is_some_and(|(volume, _)| volume > 0.1));
-
-            #[cfg(feature = "acis")]
-            if distance > 0.0 {
-                let mut sat = document::entities::acis::types::SatDocument::default();
-                crate::acis::append(&solid, &mut sat).unwrap();
-                let (bodies, loss) = crate::acis::lift(&sat);
-                assert_eq!(bodies.len(), 1, "{loss:?}");
-                assert!(bodies[0].validate().is_empty());
-                assert!(bodies[0]
-                    .edges
-                    .iter()
-                    .all(|(_, edge)| edge.coedges.len() == 2));
-            }
         }
     }
 
@@ -1457,19 +1444,5 @@ mod tests {
             thicken(&sheet, 0.15),
             Err(ThickenError::SelfIntersection)
         ));
-    }
-
-    #[cfg(feature = "acis")]
-    #[test]
-    fn thickened_sector_round_trips_through_acis() {
-        let solid = thicken(&cylinder_sheet(PI * 1.99), 0.5).unwrap();
-        let expected = analytic_mass_properties(&solid).unwrap();
-        let mut sat = document::entities::acis::types::SatDocument::default();
-        crate::acis::append(&solid, &mut sat).unwrap();
-        let (bodies, loss) = crate::acis::lift(&sat);
-        assert_eq!(bodies.len(), 1, "{loss:?}");
-        let restored = analytic_mass_properties(&bodies[0]).unwrap();
-        assert!((restored.volume - expected.volume).abs() < 1e-8);
-        assert!(Vec3::from(restored.centroid).distance(Vec3::from(expected.centroid)) < 1e-8);
     }
 }

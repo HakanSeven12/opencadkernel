@@ -9,8 +9,6 @@ are not written yet.
 ## Layering
 
 ```
-acis    lift a SatDocument into brep, lower it back        [feature = "acis"]
-  │
 brep    owned mutable topology, SSI, boolean, blends       [feature = "brep"]
   │
 geom2d  curves, intersection, containment, tessellation    [feature = "geom2d"]
@@ -30,14 +28,13 @@ afterthought.
 ```
 OpenCADStudio ──► document       DWG/DXF/ACIS (opencaddocument)
       ├─────────► kernel         (opencadkernel)
-      └─────────► graph          (opencadgraph)
-
-kernel ──► document          under `acis` only
-```
+      ├─────────► graph          (opencadgraph)
+      └─────────► ocs_acis       ACIS records ⇄ kernel B-rep
 
 Consumers depend on this crate directly rather than through each other.
-The kernel reaches the drawing model only for ACIS, under `acis`; the
-document must never depend on the kernel, which would close a cycle.
+The kernel reads no file format and depends on no drawing model: the
+application converts ACIS records to and from its B-rep, in its own
+`ocs_acis` crate.
 
 Conversion into CAD is also why `brep::Provenance` has a `Synthesized`
 variant: geometry arriving from IFC has no source record to fall back on, so
