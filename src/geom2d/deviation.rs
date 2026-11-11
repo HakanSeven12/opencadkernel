@@ -681,4 +681,38 @@ mod tests {
         });
         assert_eq!(arc.tessellate_within(0.1).len(), 112 + 1);
     }
+
+    #[test]
+    fn constant_nurbs_spans_do_not_explode_angular_tessellation() {
+        // The last two non-empty knot spans have four identical supporting
+        // control points apiece. Their derivative is zero everywhere, so the
+        // curve is stationary rather than bending at every sampled point.
+        let curve = NurbsCurve::new(
+            3,
+            vec![
+                [0.0, 0.0],
+                [0.0, 0.1],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+                [0.0, 1.0],
+            ],
+            vec![
+                0.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5, 0.5001, 1.0, 1.0, 1.0, 1.0,
+            ],
+            None,
+        )
+        .expect("valid cubic with two constant spans");
+        let points = Curve::Nurbs(curve).tessellate_angle(crate::tessellation::DEFAULT_ANGLE);
+
+        assert_eq!(points.first(), Some(&[0.0, 0.0]));
+        assert_eq!(points.last(), Some(&[0.0, 1.0]));
+        assert!(
+            points.len() <= 64,
+            "two stationary spans manufactured {} points",
+            points.len()
+        );
+    }
 }
