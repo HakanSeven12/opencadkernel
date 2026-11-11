@@ -83,9 +83,10 @@ pub fn polygon_frame(input: &[[f64; 2]], tolerance: super::Tolerance) -> Option<
     let limit = tolerance.linear();
     let mut points = Vec::with_capacity(input.len());
     for &point in input {
-        if points.last().is_none_or(|previous| {
-            Vec2::from(*previous).distance(Vec2::from(point)) > limit
-        }) {
+        if points
+            .last()
+            .is_none_or(|previous| Vec2::from(*previous).distance(Vec2::from(point)) > limit)
+        {
             points.push(point);
         }
     }
@@ -226,8 +227,8 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
     for index in 0..valid.len() {
         parent[index] = (0..valid.len())
             .filter(|other| {
-                    *other != index
-                        && valid[*other].area > valid[index].area
+                *other != index
+                    && valid[*other].area > valid[index].area
                     && ring_strictly_contains(&valid[*other].points, &valid[index].points)
             })
             .min_by(|a, b| valid[*a].area.total_cmp(&valid[*b].area));
@@ -253,7 +254,11 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
         let mut component_points = Vec::new();
         let mut component_triangles = Vec::new();
         let mut complete = true;
-        for outer in members.iter().copied().filter(|index| depth[*index] % 2 == 0) {
+        for outer in members
+            .iter()
+            .copied()
+            .filter(|index| depth[*index] % 2 == 0)
+        {
             let holes: Vec<Vec<[f64; 2]>> = members
                 .iter()
                 .copied()
@@ -261,7 +266,10 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
                 .map(|index| valid[index].points.clone())
                 .collect();
             let expected = valid[outer].area
-                - holes.iter().map(|hole| signed_area_arrays(hole).abs()).sum::<f64>();
+                - holes
+                    .iter()
+                    .map(|hole| signed_area_arrays(hole).abs())
+                    .sum::<f64>();
             let (local_points, local_triangles) = polygon(&valid[outer].points, &holes);
             if !triangulation_matches(&local_points, &local_triangles, expected) {
                 complete = false;
@@ -269,25 +277,31 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
             }
             let base = component_points.len();
             component_points.extend(local_points);
-            component_triangles.extend(local_triangles.into_iter().map(|triangle| {
-                [triangle[0] + base, triangle[1] + base, triangle[2] + base]
-            }));
+            component_triangles.extend(
+                local_triangles
+                    .into_iter()
+                    .map(|triangle| [triangle[0] + base, triangle[1] + base, triangle[2] + base]),
+            );
         }
         // Holes whose boundaries touch or overlap (a column against a beam)
         // defeat the polygon triangulator, and the whole component used to
         // be dropped. Fill it by the even-odd rule directly instead.
         if !complete {
-            let rings: Vec<&[[f64; 2]]> =
-                members.iter().map(|index| valid[*index].points.as_slice()).collect();
+            let rings: Vec<&[[f64; 2]]> = members
+                .iter()
+                .map(|index| valid[*index].points.as_slice())
+                .collect();
             (component_points, component_triangles) = even_odd_slabs(&rings);
             complete = !component_triangles.is_empty();
         }
         if complete {
             let base = points.len();
             points.extend(component_points);
-            triangles.extend(component_triangles.into_iter().map(|triangle| {
-                [triangle[0] + base, triangle[1] + base, triangle[2] + base]
-            }));
+            triangles.extend(
+                component_triangles
+                    .into_iter()
+                    .map(|triangle| [triangle[0] + base, triangle[1] + base, triangle[2] + base]),
+            );
         }
     }
     (points, triangles)
@@ -332,7 +346,8 @@ fn even_odd_slabs(rings: &[&[[f64; 2]]]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
     let mut xs: Vec<f64> = edges.iter().flat_map(|(a, b)| [a[0], b[0]]).collect();
     xs.sort_by(f64::total_cmp);
     xs.dedup_by(|a, b| (*a - *b).abs() <= tolerance);
-    let y_at = |(a, b): ([f64; 2], [f64; 2]), x: f64| a[1] + (x - a[0]) * (b[1] - a[1]) / (b[0] - a[0]);
+    let y_at =
+        |(a, b): ([f64; 2], [f64; 2]), x: f64| a[1] + (x - a[0]) * (b[1] - a[1]) / (b[0] - a[0]);
 
     let mut points = Vec::new();
     let mut triangles = Vec::new();
@@ -345,8 +360,10 @@ fn even_odd_slabs(rings: &[&[[f64; 2]]]) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
             next += 1;
         }
         active.retain(|edge| edges[*edge].1[0] >= x1 - tolerance);
-        let mut spans: Vec<(f64, f64)> =
-            active.iter().map(|edge| (y_at(edges[*edge], x0), y_at(edges[*edge], x1))).collect();
+        let mut spans: Vec<(f64, f64)> = active
+            .iter()
+            .map(|edge| (y_at(edges[*edge], x0), y_at(edges[*edge], x1)))
+            .collect();
         spans.sort_by(|a, b| (a.0 + a.1).total_cmp(&(b.0 + b.1)));
         for pair in spans.chunks_exact(2) {
             let ((b0, b1), (t0, t1)) = (pair[0], pair[1]);
@@ -382,32 +399,57 @@ fn sanitize(ring: &[[f64; 2]]) -> Vec<[f64; 2]> {
     while points.len() > 1 && points.first() == points.last() {
         points.pop();
     }
+    if points.len() < 3 {
+        return points;
+    }
     // A corner whose two edges fold back onto each other (a zero-area spike)
     // encloses nothing, but leaves the ring non-simple: drop it, and the
     // duplicate it may leave behind, until none remain.
-    let mut index = 0;
-    while points.len() >= 3 && index < points.len() {
-        let count = points.len();
-        let before = Vec2::from(points[(index + count - 1) % count]);
-        let here = Vec2::from(points[index]);
-        let after = Vec2::from(points[(index + 1) % count]);
-        let incoming = before - here;
-        let outgoing = after - here;
+    //
+    // The sweep is single-pass: each candidate pops the accepted points while
+    // they close over it as a spike, so a ring with millions of points and
+    // hundreds of thousands of folded-back spikes (GIS-exported parcel
+    // boundaries do exactly that) is processed in linear time. The old
+    // per-index `Vec::remove` scan was quadratic and took minutes per hatch.
+    let spike = |before: [f64; 2], here: [f64; 2], after: [f64; 2]| -> bool {
+        let incoming = Vec2::from(before) - Vec2::from(here);
+        let outgoing = Vec2::from(after) - Vec2::from(here);
         let length = incoming.length().max(outgoing.length()).max(1.0);
         let epsilon = 64.0 * f64::EPSILON * length * length;
-        if incoming.cross(outgoing).abs() > epsilon || incoming.dot(outgoing) <= 0.0 {
-            index += 1;
+        incoming.cross(outgoing).abs() <= epsilon && incoming.dot(outgoing) > 0.0
+    };
+    let mut out: Vec<[f64; 2]> = Vec::with_capacity(points.len());
+    for &point in &points {
+        while out.len() >= 2 && spike(out[out.len() - 2], out[out.len() - 1], point) {
+            out.pop();
+        }
+        if out.last() == Some(&point) {
+            // The duplicate a spike removal left behind: dropped.
             continue;
         }
-        points.remove(index);
-        let count = points.len();
-        let previous = (index + count - 1) % count;
-        if count > 1 && points[previous] == points[index % count] {
-            points.remove(index % count);
-        }
-        index = index.saturating_sub(1);
+        out.push(point);
     }
-    points
+    // The sweep above treats the ring as an open strip, so the head/tail seam
+    // can still hide spikes. Settle the junction with O(1) end removals.
+    let mut accepted = std::collections::VecDeque::from(out);
+    loop {
+        if accepted.len() < 3 {
+            break;
+        }
+        let tail = accepted[accepted.len() - 1];
+        let head = accepted[0];
+        let after_head = accepted[1];
+        if spike(accepted[accepted.len() - 2], tail, head) {
+            accepted.pop_back();
+            continue;
+        }
+        if spike(tail, head, after_head) {
+            accepted.pop_front();
+            continue;
+        }
+        break;
+    }
+    accepted.into_iter().collect()
 }
 
 fn signed_area_arrays(ring: &[[f64; 2]]) -> f64 {
@@ -420,9 +462,9 @@ fn simple(ring: &[[f64; 2]], tolerance: f64) -> bool {
         return false;
     }
     for first in 0..ring.len() {
-        if (first + 1..ring.len()).any(|second| {
-            Vec2::from(ring[first]).distance(Vec2::from(ring[second])) <= tolerance
-        }) {
+        if (first + 1..ring.len())
+            .any(|second| Vec2::from(ring[first]).distance(Vec2::from(ring[second])) <= tolerance)
+        {
             return false;
         }
     }
@@ -623,10 +665,12 @@ fn segments_properly_cross(a: [f64; 2], b: [f64; 2], c: [f64; 2], d: [f64; 2]) -
     let (a, b, c, d) = (Vec2::from(a), Vec2::from(b), Vec2::from(c), Vec2::from(d));
     let turn = |p: Vec2, q: Vec2, r: Vec2| (q - p).cross(r - p);
     let values = [turn(a, b, c), turn(a, b, d), turn(c, d, a), turn(c, d, b)];
-    let scale = (b - a).length_squared().max((d - c).length_squared()).max(1.0);
+    let scale = (b - a)
+        .length_squared()
+        .max((d - c).length_squared())
+        .max(1.0);
     let epsilon = 64.0 * f64::EPSILON * scale;
-    (values[0] > epsilon && values[1] < -epsilon
-        || values[0] < -epsilon && values[1] > epsilon)
+    (values[0] > epsilon && values[1] < -epsilon || values[0] < -epsilon && values[1] > epsilon)
         && (values[2] > epsilon && values[3] < -epsilon
             || values[2] < -epsilon && values[3] > epsilon)
 }
@@ -654,8 +698,7 @@ fn segments_intersect_with_tolerance(
             && r.y >= p.y.min(q.y) - tolerance
             && r.y <= p.y.max(q.y) + tolerance
     };
-    (values[0] > epsilon && values[1] < -epsilon
-        || values[0] < -epsilon && values[1] > epsilon)
+    (values[0] > epsilon && values[1] < -epsilon || values[0] < -epsilon && values[1] > epsilon)
         && (values[2] > epsilon && values[3] < -epsilon
             || values[2] < -epsilon && values[3] > epsilon)
         || on(a, b, c, values[0])
@@ -672,8 +715,7 @@ fn ring_contains(ring: &[[f64; 2]], point: [f64; 2]) -> bool {
             inside
                 ^ ((from[1] > point[1]) != (to[1] > point[1])
                     && point[0]
-                        < (to[0] - from[0]) * (point[1] - from[1]) / (to[1] - from[1])
-                            + from[0])
+                        < (to[0] - from[0]) * (point[1] - from[1]) / (to[1] - from[1]) + from[0])
         })
 }
 
@@ -711,11 +753,7 @@ fn root_of(mut index: usize, parent: &[Option<usize>]) -> usize {
     index
 }
 
-fn triangulation_matches(
-    points: &[[f64; 2]],
-    triangles: &[[usize; 3]],
-    expected: f64,
-) -> bool {
+fn triangulation_matches(points: &[[f64; 2]], triangles: &[[usize; 3]], expected: f64) -> bool {
     if triangles.is_empty() || !expected.is_finite() || expected <= 0.0 {
         return false;
     }
@@ -1295,6 +1333,168 @@ mod tests {
             .collect()
     }
 
+    /// The spike sweep as it was written before it became single-pass: an
+    /// index walk with a `Vec::remove` per spike and a one-step backtrack.
+    /// Kept as the parity reference for the linear sweep in [`super::sanitize`].
+    fn sanitize_reference(ring: &[[f64; 2]]) -> Vec<[f64; 2]> {
+        if ring.iter().flatten().any(|value| !value.is_finite()) {
+            return Vec::new();
+        }
+        let mut points = Vec::with_capacity(ring.len());
+        for point in ring {
+            if points.last() != Some(point) {
+                points.push(*point);
+            }
+        }
+        while points.len() > 1 && points.first() == points.last() {
+            points.pop();
+        }
+        if points.len() < 3 {
+            return points;
+        }
+        let spike = |before: [f64; 2], here: [f64; 2], after: [f64; 2]| -> bool {
+            let incoming = Vec2::from(before) - Vec2::from(here);
+            let outgoing = Vec2::from(after) - Vec2::from(here);
+            let length = incoming.length().max(outgoing.length()).max(1.0);
+            let epsilon = 64.0 * f64::EPSILON * length * length;
+            !(incoming.cross(outgoing).abs() <= epsilon && incoming.dot(outgoing) > 0.0)
+        };
+        let mut index = 0;
+        while points.len() >= 3 && index < points.len() {
+            let count = points.len();
+            let before = points[(index + count - 1) % count];
+            let here = points[index];
+            let after = points[(index + 1) % count];
+            if spike(before, here, after) {
+                index += 1;
+                continue;
+            }
+            points.remove(index);
+            let count = points.len();
+            let previous = (index + count - 1) % count;
+            if count > 1 && points[previous] == points[index % count] {
+                points.remove(index % count);
+            }
+            index = index.saturating_sub(1);
+        }
+        points
+    }
+
+    #[test]
+    fn linear_sanitize_matches_the_reference() {
+        // Plain shapes: no spikes, output equals input (modulo dedup).
+        for ring in [
+            vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]],
+            vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
+            // Consecutive duplicates and a closing duplicate.
+            vec![
+                [0.0, 0.0],
+                [0.0, 0.0],
+                [4.0, 0.0],
+                [4.0, 0.0],
+                [4.0, 4.0],
+                [0.0, 4.0],
+                [0.0, 4.0],
+                [0.0, 0.0],
+            ],
+            // Zero-area spikes in the middle.
+            vec![[0.0, 0.0], [2.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0]],
+            // A spike chain that crosses the seam.
+            vec![
+                [4.0, 4.0],
+                [4.0, 0.0],
+                [4.0, 0.0],
+                [6.0, 0.0],
+                [8.0, 0.0],
+                [8.0, 0.0],
+                [0.0, 0.0],
+                [0.0, 4.0],
+            ],
+            // A spike at the head and at the tail.
+            vec![[2.0, 0.0], [0.0, 0.0], [4.0, 0.0], [4.0, 4.0]],
+            // Degenerate: fewer than three distinct points.
+            vec![[0.0, 0.0], [1.0, 1.0]],
+            // Non-finite input.
+            vec![[0.0, 0.0], [f64::NAN, 0.0], [4.0, 4.0]],
+        ] {
+            assert_eq!(
+                super::sanitize(&ring),
+                sanitize_reference(&ring),
+                "mismatch on {ring:?}"
+            );
+        }
+
+        // Randomised shapes with injected folds. Each point is followed by a
+        // fold back to itself (…a, b, a…), so every second corner is a
+        // zero-area spike and the reference's quadratic sweep is exercised.
+        let mut random = Lcg(17);
+        for case in 0..200 {
+            let corners = 3 + (case * 7) % 400;
+            let clean = star(&mut random, [0.0, 0.0], 100.0, corners, 0.3);
+            let mut folded: Vec<[f64; 2]> = Vec::with_capacity(clean.len() * 3);
+            for index in 0..clean.len() {
+                let next = clean[(index + 1) % clean.len()];
+                folded.push(clean[index]);
+                folded.push(next);
+                folded.push(clean[index]);
+            }
+            assert_eq!(
+                super::sanitize(&folded),
+                sanitize_reference(&folded),
+                "mismatch on case {case} ring of {} points",
+                folded.len()
+            );
+        }
+
+        // A ring shaped like the cadastral parcel boundary that made opens
+        // take minutes: about a million points, a third of them folded-back
+        // spikes. The old sweep needs over two minutes on such a ring; the
+        // sweep in `sanitize` must answer in a bounded, near-linear time and
+        // keep the covered area.
+        let clean = star(&mut Lcg(31), [0.0, 0.0], 1000.0, 269, 0.2);
+        let mut spiky: Vec<[f64; 2]> = Vec::with_capacity(1_310_970);
+        for index in 0..clean.len() {
+            let step = (index + 1) % clean.len();
+            let [x0, y0] = clean[index];
+            let [x1, y1] = clean[step];
+            for sub in 0..1000usize {
+                let t = sub as f64 / 1000.0;
+                let point = [x0 + (x1 - x0) * t, y0 + (y1 - y0) * t];
+                let back = [
+                    x0 + (x1 - x0) * (t - 1.0 / 1000.0),
+                    y0 + (y1 - y0) * (t - 1.0 / 1000.0),
+                ];
+                spiky.push(point);
+                spiky.push(back);
+                spiky.push(point);
+            }
+        }
+        let started = std::time::Instant::now();
+        let sanitized = super::sanitize(&spiky);
+        let elapsed = started.elapsed();
+        assert!(elapsed.as_secs() < 6, "sanitize is not linear: {elapsed:?}");
+        // No spike and no duplicate survives.
+        for index in 0..sanitized.len() {
+            let count = sanitized.len();
+            let before = sanitized[(index + count - 1) % count];
+            let here = sanitized[index];
+            let after = sanitized[(index + 1) % count];
+            let incoming = Vec2::from(before) - Vec2::from(here);
+            let outgoing = Vec2::from(after) - Vec2::from(here);
+            assert!(incoming.dot(outgoing) <= 0.0 || incoming.cross(outgoing).abs() > 0.0);
+        }
+        // The spikes contributed no area: the sanitized ring covers the same
+        // region as the clean star it was built from.
+        let clean_area =
+            signed_area(&clean.iter().map(|p| Vec2::from(*p)).collect::<Vec<_>>()).abs();
+        let sanitized_area =
+            signed_area(&sanitized.iter().map(|p| Vec2::from(*p)).collect::<Vec<_>>()).abs();
+        assert!(
+            (clean_area - sanitized_area).abs() <= clean_area * 0.02,
+            "area changed: {clean_area} -> {sanitized_area}"
+        );
+    }
+
     #[test]
     fn faster_ear_clipping_cuts_the_same_ears_as_the_reference() {
         let mut random = Lcg(7);
@@ -1518,7 +1718,10 @@ mod tests {
             (0..24)
                 .map(|step| {
                     let angle = std::f64::consts::TAU * step as f64 / 24.0;
-                    [centre[0] + 0.08 * angle.cos(), centre[1] + 0.08 * angle.sin()]
+                    [
+                        centre[0] + 0.08 * angle.cos(),
+                        centre[1] + 0.08 * angle.sin(),
+                    ]
                 })
                 .collect::<Vec<_>>()
         };
@@ -1554,8 +1757,8 @@ mod tests {
                 + Vec2::from(points[triangle[1]])
                 + Vec2::from(points[triangle[2]]))
                 / 3.0;
-            let inside_l = (centre.x <= 10.0 && centre.y <= 4.0)
-                || (centre.x <= 4.0 && centre.y <= 10.0);
+            let inside_l =
+                (centre.x <= 10.0 && centre.y <= 4.0) || (centre.x <= 4.0 && centre.y <= 10.0);
             assert!(inside_l && centre.x >= 0.0 && centre.y >= 0.0, "{centre:?}");
         }
     }
