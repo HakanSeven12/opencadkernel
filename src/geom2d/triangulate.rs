@@ -30,6 +30,26 @@
 
 use super::vec::Vec2;
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has set one ring against another: to ask
+    /// whether one holds the other, whether their boundaries cross, or
+    /// which outer ring they hang from.
+    static RING_PAIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_ring_pairs(pairs: usize) {
+    RING_PAIRS.with(|count| count.set(count.get() + pairs));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`RingGrid::overlapping`] go through every ring, as the pair
+    /// loops did before the grid: the parity reference for it.
+    static EVERY_RING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 #[derive(Clone, Copy)]
 struct RingBounds {
     min: Vec2,
@@ -58,6 +78,129 @@ impl RingBounds {
             && other.max.x >= self.min.x
             && self.max.y >= other.min.y
             && other.max.y >= self.min.y
+    }
+}
+
+/// The boxes of a set of rings by place, for finding the rings whose box
+/// overlaps a given one without going through them all.
+///
+/// Whether one ring holds another and whether two boundaries cross were
+/// asked of every pair of rings. Both need the two boxes to overlap, so a
+/// fill of thousands of separate loops spent its time on pairs that are
+/// nowhere near each other.
+struct RingGrid<'a> {
+    bounds: &'a [Option<RingBounds>],
+    origin: Vec2,
+    cell: f64,
+    /// The rings with a box in each cell.
+    cells: std::collections::HashMap<(i64, i64), Vec<usize>>,
+    /// Rings whose box spans too many cells to be listed in each. Every
+    /// search reads these.
+    wide: Vec<usize>,
+}
+
+impl<'a> RingGrid<'a> {
+    /// A ring that spans more cells than this is read by every search.
+    const MAX_CELLS: i128 = 16;
+
+    fn new(bounds: &'a [Option<RingBounds>]) -> Self {
+        let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut placed = 0usize;
+        for ring in bounds.iter().flatten() {
+            placed += 1;
+            min.x = min.x.min(ring.min.x);
+            min.y = min.y.min(ring.min.y);
+            max.x = max.x.max(ring.max.x);
+            max.y = max.y.max(ring.max.y);
+        }
+        // About one ring to a cell when they are spread evenly.
+        let span = (max.x - min.x).max(max.y - min.y);
+        let per_side = (placed as f64).sqrt().ceil().max(1.0);
+        let cell = if span.is_finite() && span > 0.0 {
+            span / per_side
+        } else {
+            1.0
+        };
+        let mut grid = Self {
+            bounds,
+            origin: if placed == 0 {
+                Vec2::new(0.0, 0.0)
+            } else {
+                min
+            },
+            cell,
+            cells: std::collections::HashMap::new(),
+            wide: Vec::new(),
+        };
+        for (index, ring) in bounds.iter().enumerate() {
+            let Some(ring) = ring else {
+                continue;
+            };
+            let (x, y) = grid.cell_ranges(*ring);
+            if Self::cell_count(x, y) > Self::MAX_CELLS {
+                grid.wide.push(index);
+                continue;
+            }
+            for cell_x in x.0..=x.1 {
+                for cell_y in y.0..=y.1 {
+                    grid.cells.entry((cell_x, cell_y)).or_default().push(index);
+                }
+            }
+        }
+        grid
+    }
+
+    fn cell_ranges(&self, bounds: RingBounds) -> ((i64, i64), (i64, i64)) {
+        let cell = |value: f64, origin: f64| ((value - origin) / self.cell).floor() as i64;
+        (
+            (
+                cell(bounds.min.x, self.origin.x),
+                cell(bounds.max.x, self.origin.x),
+            ),
+            (
+                cell(bounds.min.y, self.origin.y),
+                cell(bounds.max.y, self.origin.y),
+            ),
+        )
+    }
+
+    fn cell_count(x: (i64, i64), y: (i64, i64)) -> i128 {
+        (i128::from(x.1) - i128::from(x.0) + 1) * (i128::from(y.1) - i128::from(y.0) + 1)
+    }
+
+    /// The rings whose box overlaps `bounds`, lowest index first.
+    fn overlapping(&self, bounds: RingBounds) -> Vec<usize> {
+        #[cfg(test)]
+        if EVERY_RING.with(std::cell::Cell::get) {
+            return (0..self.bounds.len())
+                .filter(|index| self.bounds[*index].is_some_and(|other| bounds.overlaps(other)))
+                .collect();
+        }
+        let mut found = self.wide.clone();
+        let (x, y) = self.cell_ranges(bounds);
+        if Self::cell_count(x, y) > self.cells.len() as i128 {
+            // A box over most of the rings: go by the cells there are.
+            for ((cell_x, cell_y), listed) in &self.cells {
+                if (x.0..=x.1).contains(cell_x) && (y.0..=y.1).contains(cell_y) {
+                    found.extend(listed);
+                }
+            }
+        } else {
+            for cell_x in x.0..=x.1 {
+                for cell_y in y.0..=y.1 {
+                    if let Some(listed) = self.cells.get(&(cell_x, cell_y)) {
+                        found.extend(listed);
+                    }
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        #[cfg(test)]
+        count_ring_pairs(found.len());
+        found.retain(|index| self.bounds[*index].is_some_and(|other| bounds.overlaps(other)));
+        found
     }
 }
 
@@ -121,17 +264,23 @@ pub fn nesting_depths(input: &[Vec<[f64; 2]>]) -> Vec<usize> {
         .map(|ring| signed_area_arrays(ring).abs())
         .collect();
 
+    // A ring is held only by rings whose box overlaps its own: the point of
+    // it that is tested lies in both.
+    let bounds: Vec<Option<RingBounds>> = rings.iter().map(|ring| RingBounds::of(ring)).collect();
+    let grid = RingGrid::new(&bounds);
     rings
         .iter()
         .enumerate()
         .map(|(index, ring)| {
-            rings
-                .iter()
-                .enumerate()
-                .filter(|(other, outer)| {
+            let Some(own) = bounds[index] else {
+                return 0;
+            };
+            grid.overlapping(own)
+                .into_iter()
+                .filter(|other| {
                     *other != index
                         && areas[*other] > areas[index]
-                        && ring_strictly_contains(outer, ring)
+                        && ring_strictly_contains(&rings[*other], ring)
                 })
                 .count()
         })
@@ -181,13 +330,17 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
     }
 
     let mut bad = vec![false; rings.len()];
-    for first in 0..rings.len() {
-        for second in first + 1..rings.len() {
-            if rings[first].bounds.overlaps(rings[second].bounds)
-                && ring_boundaries_properly_cross(&rings[first].points, &rings[second].points)
-            {
-                bad[first] = true;
-                bad[second] = true;
+    {
+        let bounds: Vec<Option<RingBounds>> = rings.iter().map(|ring| Some(ring.bounds)).collect();
+        let grid = RingGrid::new(&bounds);
+        for first in 0..rings.len() {
+            for second in grid.overlapping(rings[first].bounds) {
+                if second > first
+                    && ring_boundaries_properly_cross(&rings[first].points, &rings[second].points)
+                {
+                    bad[first] = true;
+                    bad[second] = true;
+                }
             }
         }
     }
@@ -224,14 +377,20 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
         .filter_map(|(ring, bad)| (!bad).then_some(ring))
         .collect();
     let mut parent = vec![None; valid.len()];
-    for index in 0..valid.len() {
-        parent[index] = (0..valid.len())
-            .filter(|other| {
-                *other != index
-                    && valid[*other].area > valid[index].area
-                    && ring_strictly_contains(&valid[*other].points, &valid[index].points)
-            })
-            .min_by(|a, b| valid[*a].area.total_cmp(&valid[*b].area));
+    {
+        let bounds: Vec<Option<RingBounds>> = valid.iter().map(|ring| Some(ring.bounds)).collect();
+        let grid = RingGrid::new(&bounds);
+        for index in 0..valid.len() {
+            parent[index] = grid
+                .overlapping(valid[index].bounds)
+                .into_iter()
+                .filter(|other| {
+                    *other != index
+                        && valid[*other].area > valid[index].area
+                        && ring_strictly_contains(&valid[*other].points, &valid[index].points)
+                })
+                .min_by(|a, b| valid[*a].area.total_cmp(&valid[*b].area));
+        }
     }
     let depth: Vec<usize> = (0..valid.len())
         .map(|index| {
@@ -247,10 +406,15 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
 
     let mut points = Vec::new();
     let mut triangles = Vec::new();
+    // The rings under each outermost ring, itself included.
+    let mut members_of: Vec<Vec<usize>> = vec![Vec::new(); valid.len()];
+    for index in 0..valid.len() {
+        #[cfg(test)]
+        count_ring_pairs(1);
+        members_of[root_of(index, &parent)].push(index);
+    }
     for root in (0..valid.len()).filter(|index| parent[*index].is_none()) {
-        let members: Vec<usize> = (0..valid.len())
-            .filter(|index| root_of(*index, &parent) == root)
-            .collect();
+        let members = std::mem::take(&mut members_of[root]);
         let mut component_points = Vec::new();
         let mut component_triangles = Vec::new();
         let mut complete = true;
@@ -573,12 +737,13 @@ fn uncross(input: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
         index
     };
     let mut group: Vec<usize> = (0..rings.len()).collect();
+    let grid = RingGrid::new(&bounds);
     for first in 0..rings.len() {
-        for second in first + 1..rings.len() {
-            let (Some(a), Some(b)) = (bounds[first], bounds[second]) else {
-                continue;
-            };
-            if a.overlaps(b) && ring_boundaries_properly_cross(&rings[first], &rings[second]) {
+        let Some(own) = bounds[first] else {
+            continue;
+        };
+        for second in grid.overlapping(own) {
+            if second > first && ring_boundaries_properly_cross(&rings[first], &rings[second]) {
                 let (a, b) = (root(&group, first), root(&group, second));
                 group[a.max(b)] = a.min(b);
             }
@@ -1290,6 +1455,37 @@ mod tests {
         vec![[0.0, 0.0], [size, 0.0], [size, size], [0.0, size]]
     }
 
+    /// Filling many separate rings sets each ring against its neighbours,
+    /// not against every other ring. Going through every pair made a fill
+    /// of ten thousand loops take seconds, and four times as long for twice
+    /// as many.
+    #[test]
+    fn separate_rings_are_set_against_their_neighbours_only() {
+        const RINGS: usize = 400;
+        let size = |index: usize| (4.0 + (index % 5) as f64, 3.0 + (index % 4) as f64);
+        let input: Vec<Vec<[f64; 2]>> = (0..RINGS)
+            .map(|index| {
+                let (x, y) = ((index % 20) as f64 * 10.0, (index / 20) as f64 * 10.0);
+                let (w, h) = size(index);
+                vec![[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+            })
+            .collect();
+        let pairs = || RING_PAIRS.with(std::cell::Cell::get);
+        let before = pairs();
+        let depths = nesting_depths(&input);
+        let (points, triangles) = rings(&input);
+        let compared = pairs() - before;
+
+        assert_eq!(depths, vec![0; RINGS]);
+        assert_eq!(triangles.len(), 2 * RINGS);
+        let expected: f64 = (0..RINGS).map(size).map(|(w, h)| w * h).sum();
+        assert!((area(&points, &triangles) - expected).abs() < 1.0e-6);
+        assert!(
+            compared <= 40 * RINGS,
+            "{compared} pairs of rings were compared to fill {RINGS} separate rings"
+        );
+    }
+
     /// Bridged ring for an outer ring and holes, as `polygon` builds it.
     fn bridged(outer: &[[f64; 2]], holes: &[Vec<[f64; 2]>]) -> (Vec<Vec2>, Vec<usize>) {
         let mut points: Vec<Vec2> = orient(outer, true);
@@ -1304,6 +1500,105 @@ mod tests {
             bridge(&mut points, &mut ring, hole);
         }
         (points, ring)
+    }
+
+    /// The pair loop [`nesting_depths`] ran before it asked [`RingGrid`]:
+    /// every ring against every other. Kept as its parity reference.
+    fn nesting_depths_reference(input: &[Vec<[f64; 2]>]) -> Vec<usize> {
+        let rings: Vec<Vec<[f64; 2]>> = input.iter().map(|ring| sanitize(ring)).collect();
+        let areas: Vec<f64> = rings
+            .iter()
+            .map(|ring| signed_area_arrays(ring).abs())
+            .collect();
+        rings
+            .iter()
+            .enumerate()
+            .map(|(index, ring)| {
+                rings
+                    .iter()
+                    .enumerate()
+                    .filter(|(other, outer)| {
+                        *other != index
+                            && areas[*other] > areas[index]
+                            && ring_strictly_contains(outer, ring)
+                    })
+                    .count()
+            })
+            .collect()
+    }
+
+    /// Rings of very different sizes dropped at random over the same patch:
+    /// some apart, some inside others, some across each other, and some
+    /// sharing a corner or an edge with the one before.
+    fn scattered_rings(random: &mut Lcg, count: usize) -> Vec<Vec<[f64; 2]>> {
+        let mut rings: Vec<Vec<[f64; 2]>> = Vec::with_capacity(count);
+        for index in 0..count {
+            let size = match index % 4 {
+                0 => 30.0 + 40.0 * random.next(),
+                1 => 5.0 + 10.0 * random.next(),
+                _ => 0.5 + 3.0 * random.next(),
+            };
+            let centre = [100.0 * random.next(), 100.0 * random.next()];
+            let ring = match index % 5 {
+                // A box that starts at a corner of the ring before it.
+                0 if index > 0 => {
+                    let [x, y] = rings[index - 1][0];
+                    vec![[x, y], [x + size, y], [x + size, y + size], [x, y + size]]
+                }
+                1 => star(random, centre, size, 7, 0.4),
+                _ => {
+                    let [x, y] = centre;
+                    let (w, h) = (size, size * (0.3 + random.next()));
+                    vec![[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+                }
+            };
+            rings.push(ring);
+        }
+        rings
+    }
+
+    #[test]
+    fn nesting_depths_match_the_pair_loop() {
+        let mut random = Lcg(0x2e5c_91d7);
+        let mut nested = 0;
+        for round in 0..200 {
+            let input = scattered_rings(&mut random, 4 + round % 60);
+            let depths = nesting_depths(&input);
+            assert_eq!(depths, nesting_depths_reference(&input), "round {round}");
+            nested += depths.iter().filter(|depth| **depth > 0).count();
+        }
+        assert!(nested > 1_000, "the rings must nest: {nested} did");
+        // Rings the grid cannot place, and none at all.
+        let odd = vec![
+            Vec::new(),
+            vec![[1.0, 1.0]],
+            vec![[0.0, 0.0], [f64::NAN, 1.0], [1.0, 1.0]],
+            vec![
+                [-1.0e300, -1.0e300],
+                [1.0e300, -1.0e300],
+                [1.0e300, 1.0e300],
+                [-1.0e300, 1.0e300],
+            ],
+            square(4.0),
+        ];
+        assert_eq!(nesting_depths(&odd), nesting_depths_reference(&odd));
+        assert_eq!(nesting_depths(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn the_fill_is_the_same_with_the_grid_as_over_every_ring() {
+        let mut random = Lcg(0x71c3_0b5f);
+        let mut filled = 0;
+        for round in 0..120 {
+            let input = scattered_rings(&mut random, 4 + round % 50);
+            let with_grid = rings(&input);
+            EVERY_RING.with(|every| every.set(true));
+            let over_every_ring = rings(&input);
+            EVERY_RING.with(|every| every.set(false));
+            assert_eq!(with_grid, over_every_ring, "round {round}");
+            filled += usize::from(!with_grid.1.is_empty());
+        }
+        assert!(filled > 100, "the rings must fill: {filled} rounds did");
     }
 
     struct Lcg(u64);
