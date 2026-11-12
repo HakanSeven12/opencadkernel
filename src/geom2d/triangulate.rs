@@ -30,6 +30,19 @@
 
 use super::vec::Vec2;
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has set one ring against another: to ask
+    /// whether one holds the other, whether their boundaries cross, or
+    /// which outer ring they hang from.
+    static RING_PAIRS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_ring_pairs(pairs: usize) {
+    RING_PAIRS.with(|count| count.set(count.get() + pairs));
+}
+
 #[derive(Clone, Copy)]
 struct RingBounds {
     min: Vec2,
@@ -129,6 +142,8 @@ pub fn nesting_depths(input: &[Vec<[f64; 2]>]) -> Vec<usize> {
                 .iter()
                 .enumerate()
                 .filter(|(other, outer)| {
+                    #[cfg(test)]
+                    count_ring_pairs(1);
                     *other != index
                         && areas[*other] > areas[index]
                         && ring_strictly_contains(outer, ring)
@@ -183,6 +198,8 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
     let mut bad = vec![false; rings.len()];
     for first in 0..rings.len() {
         for second in first + 1..rings.len() {
+            #[cfg(test)]
+            count_ring_pairs(1);
             if rings[first].bounds.overlaps(rings[second].bounds)
                 && ring_boundaries_properly_cross(&rings[first].points, &rings[second].points)
             {
@@ -227,6 +244,8 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
     for index in 0..valid.len() {
         parent[index] = (0..valid.len())
             .filter(|other| {
+                #[cfg(test)]
+                count_ring_pairs(1);
                 *other != index
                     && valid[*other].area > valid[index].area
                     && ring_strictly_contains(&valid[*other].points, &valid[index].points)
@@ -249,7 +268,11 @@ fn rings_from(input: Vec<Vec<[f64; 2]>>) -> (Vec<[f64; 2]>, Vec<[usize; 3]>) {
     let mut triangles = Vec::new();
     for root in (0..valid.len()).filter(|index| parent[*index].is_none()) {
         let members: Vec<usize> = (0..valid.len())
-            .filter(|index| root_of(*index, &parent) == root)
+            .filter(|index| {
+                #[cfg(test)]
+                count_ring_pairs(1);
+                root_of(*index, &parent) == root
+            })
             .collect();
         let mut component_points = Vec::new();
         let mut component_triangles = Vec::new();
@@ -575,6 +598,8 @@ fn uncross(input: &[Vec<[f64; 2]>]) -> Vec<Vec<[f64; 2]>> {
     let mut group: Vec<usize> = (0..rings.len()).collect();
     for first in 0..rings.len() {
         for second in first + 1..rings.len() {
+            #[cfg(test)]
+            count_ring_pairs(1);
             let (Some(a), Some(b)) = (bounds[first], bounds[second]) else {
                 continue;
             };
@@ -1288,6 +1313,37 @@ mod tests {
 
     fn square(size: f64) -> Vec<[f64; 2]> {
         vec![[0.0, 0.0], [size, 0.0], [size, size], [0.0, size]]
+    }
+
+    /// Filling many separate rings sets each ring against its neighbours,
+    /// not against every other ring. Going through every pair made a fill
+    /// of ten thousand loops take seconds, and four times as long for twice
+    /// as many.
+    #[test]
+    fn separate_rings_are_set_against_their_neighbours_only() {
+        const RINGS: usize = 400;
+        let size = |index: usize| (4.0 + (index % 5) as f64, 3.0 + (index % 4) as f64);
+        let input: Vec<Vec<[f64; 2]>> = (0..RINGS)
+            .map(|index| {
+                let (x, y) = ((index % 20) as f64 * 10.0, (index / 20) as f64 * 10.0);
+                let (w, h) = size(index);
+                vec![[x, y], [x + w, y], [x + w, y + h], [x, y + h]]
+            })
+            .collect();
+        let pairs = || RING_PAIRS.with(std::cell::Cell::get);
+        let before = pairs();
+        let depths = nesting_depths(&input);
+        let (points, triangles) = rings(&input);
+        let compared = pairs() - before;
+
+        assert_eq!(depths, vec![0; RINGS]);
+        assert_eq!(triangles.len(), 2 * RINGS);
+        let expected: f64 = (0..RINGS).map(size).map(|(w, h)| w * h).sum();
+        assert!((area(&points, &triangles) - expected).abs() < 1.0e-6);
+        assert!(
+            compared <= 40 * RINGS,
+            "{compared} pairs of rings were compared to fill {RINGS} separate rings"
+        );
     }
 
     /// Bridged ring for an outer ring and holes, as `polygon` builds it.
