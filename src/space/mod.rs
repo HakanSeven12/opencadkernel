@@ -13,6 +13,7 @@
 
 pub mod alignment;
 pub mod arclength;
+pub mod bernstein;
 pub mod arc_union;
 pub mod curve;
 pub mod dimension;

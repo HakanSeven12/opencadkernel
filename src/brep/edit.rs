@@ -94,20 +94,22 @@ pub fn offset_faces(body: &Body, faces: &[FaceKey], distance: f64) -> Option<Bod
     if !distance.is_finite() || distance == 0.0 {
         return None;
     }
+    let tolerance = super::operation_tolerance(&[body]);
     let mut changes = HashMap::new();
     for face in distinct(faces) {
         let node = body.faces.get(face)?;
         let surface = body.surfaces.get(node.surface)?;
         let along = if node.forward { distance } else { -distance };
-        let (surface, motion) = offset_surface(surface, along)?;
+        let (surface, motion) = offset_surface(surface, along, tolerance)?;
         changes.insert(face, Change { surface, motion });
     }
     tweak(body, &changes)
 }
 
-/// Tilts each planar face in `faces` by `angle` radians about the line where
-/// it crosses the plane through `base` square to `axis`. A positive angle
-/// leans the face into the solid going along the axis from `base`.
+/// Tilts each face in `faces` by `angle` radians about where it crosses the
+/// plane through `base` square to `axis`, pulling along `axis`: see
+/// [`draft_faces`]. A positive angle leans the face into the solid going
+/// along the axis from `base`.
 pub fn taper_faces(
     body: &Body,
     faces: &[FaceKey],
@@ -115,29 +117,148 @@ pub fn taper_faces(
     axis: [f64; 3],
     angle: f64,
 ) -> Option<Body> {
+    draft_faces(body, faces, base, axis, axis, angle)
+}
+
+/// Drafts each face in `faces` by `angle` radians against the `pull`
+/// direction, hinged on the neutral plane through `base` square to
+/// `neutral`, so that it leans in going along the pull.
+///
+/// A plane along the pull turns about its line on the neutral plane until
+/// it makes `angle` with the pull, whatever the neutral plane: with `α` the
+/// angle between that line and the pull, it turns by `φ`,
+/// `sin φ = sin θ / sin α`, and a draft steeper than the line allows is
+/// refused. With the neutral plane square to the pull a plane already
+/// slanted to it is turned by the angle itself.
+///
+/// A cylinder or a cone about the pull keeps its axis and is hinged on its
+/// circle on the neutral plane: with `R0` the radius there and `t` the slope
+/// of the radius along the pull, the radius at height `h` becomes
+/// `R0 + h tan(atan t − sθ)`, `s` 1 for a face looking away from its axis (a
+/// pin) and −1 for one looking towards it (a hole).
+///
+/// Adapted from Solidcore's `offset/draft.rs` (`plane_draft`, `cone_draft`).
+pub fn draft_faces(
+    body: &Body,
+    faces: &[FaceKey],
+    base: [f64; 3],
+    neutral: [f64; 3],
+    pull: [f64; 3],
+    angle: f64,
+) -> Option<Body> {
     if !angle.is_finite() || angle.abs() >= std::f64::consts::FRAC_PI_2 {
         return None;
     }
-    let axis = Vec3::from(axis).normalize()?;
+    let neutral = Vec3::from(neutral).normalize()?;
+    let pull = Vec3::from(pull).normalize()?;
+    // A pull in the neutral plane never crosses it.
+    if pull.dot(neutral).abs() < 1e-12 {
+        return None;
+    }
     let base = Vec3::from(base);
     let mut changes = HashMap::new();
     for face in distinct(faces) {
         let node = body.faces.get(face)?;
-        let Surface::Plane(plane) = body.surfaces.get(node.surface)? else {
-            return None;
+        let outward = if node.forward { 1.0 } else { -1.0 };
+        let change = match body.surfaces.get(node.surface)? {
+            Surface::Plane(plane) => {
+                let normal = Vec3::from(plane.normal()?) * outward;
+                let place = plane_draft(Vec3::from(plane.origin), normal, base, neutral, pull, angle)?;
+                let surface = super::place::move_surface(&Surface::Plane(*plane), &place, 1.0)?;
+                Change { surface, motion: Some(place) }
+            }
+            surface @ (Surface::Cylinder(_) | Surface::Cone(_)) => {
+                let surface = cone_draft(surface, outward, base, neutral, pull, angle)?;
+                Change { surface, motion: None }
+            }
+            _ => return None,
         };
-        let normal = Vec3::from(plane.normal()?) * if node.forward { 1.0 } else { -1.0 };
-        let hinge = axis.cross(normal).normalize()?;
-        // The point on the face's plane and on the plane square to the axis
-        // through `base`, nearest `base`.
-        let slant = axis.dot(normal);
-        let rise = (Vec3::from(plane.origin) - base).dot(normal) / (1.0 - slant * slant);
-        let pivot = base + normal * rise - axis * (rise * slant);
-        let place = rotation(pivot.to_array(), hinge.to_array(), -angle)?;
-        let surface = super::place::move_surface(&Surface::Plane(*plane), &place, 1.0)?;
-        changes.insert(face, Change { surface, motion: Some(place) });
+        changes.insert(face, change);
     }
     tweak(body, &changes)
+}
+
+/// The turn that drafts the plane through `origin` with outward unit normal
+/// `n`.
+fn plane_draft(origin: Vec3, n: Vec3, base: Vec3, neutral: Vec3, pull: Vec3, angle: f64) -> Option<Placement> {
+    let square = neutral.cross(pull).length() <= 1e-12;
+    if n.dot(pull).abs() > 1e-6 {
+        // Slanted to the pull: only where the neutral plane is square to
+        // it, by the angle itself about the pull's cross with the normal.
+        if !square {
+            return None;
+        }
+        let hinge = pull.cross(n).normalize()?;
+        let slant = pull.dot(n);
+        let rise = (origin - base).dot(n) / (1.0 - slant * slant);
+        let pivot = base + n * rise - pull * (rise * slant);
+        return rotation(pivot.to_array(), hinge.to_array(), -angle);
+    }
+    // The hinge: the line along n × N where the face's plane meets the
+    // neutral plane, reached from the face's origin along m, the neutral
+    // normal's part in the face's plane.
+    let m = neutral - n * n.dot(neutral);
+    let reach = m.dot(neutral);
+    if reach <= 1e-12 {
+        return None;
+    }
+    let hinge = origin + m * ((base - origin).dot(neutral) / reach);
+    let mut along = n.cross(neutral).normalize()?;
+    // Turned so that d × n runs with the pull: the side the face leans to.
+    let lean = along.cross(n).dot(pull);
+    if lean.abs() <= 1e-12 {
+        return None;
+    }
+    if lean < 0.0 {
+        along = along * -1.0;
+    }
+    let ratio = angle.sin() / along.cross(n).dot(pull);
+    if !(ratio.abs() <= 1.0) {
+        return None;
+    }
+    rotation(hinge.to_array(), along.to_array(), ratio.asin())
+}
+
+/// The cylinder or cone `surface` drafted about its circle on the neutral
+/// plane; `outward` is 1 where the face runs with the surface's normal.
+fn cone_draft(surface: &Surface, outward: f64, base: Vec3, neutral: Vec3, pull: Vec3, angle: f64) -> Option<Surface> {
+    let (frame, radius, half_angle) = match surface {
+        Surface::Cylinder(cylinder) => (cylinder.base, cylinder.radius, 0.0),
+        Surface::Cone(cone) => (cone.base, cone.radius, cone.half_angle),
+        _ => return None,
+    };
+    let z = Vec3::from(frame.normal()?).normalize()?;
+    let sense = z.dot(pull);
+    if (sense.abs() - 1.0).abs() > 1e-9 {
+        return None;
+    }
+    let sense = sense.signum();
+    let toward = z.dot(neutral);
+    if toward.abs() < 1e-12 {
+        return None;
+    }
+    let axis = Vec3::from(frame.origin);
+    // The hinge circle: the axis's height `v0` where it crosses the neutral
+    // plane, and the radius there.
+    let v0 = (base - axis).dot(neutral) / toward;
+    let r0 = radius - v0 * half_angle.tan();
+    // Both surfaces' normals point away from the axis where the radius is
+    // positive: a face with them is a pin.
+    let pin = outward * r0.signum();
+    let slope = -half_angle.tan() * sense;
+    let turned = (slope.atan() - pin * angle).tan();
+    if !(r0.abs() > 0.0 && turned.is_finite()) {
+        return None;
+    }
+    // Along the axis rather than the pull, and from the frame's origin.
+    let rate = turned * sense;
+    let at_origin = r0 - v0 * rate;
+    let mut frame = frame;
+    if rate.abs() <= 1e-15 {
+        return Some(Surface::Cylinder(super::Cylinder { base: frame, radius: at_origin }));
+    }
+    frame.origin = axis.to_array();
+    Some(Surface::Cone(super::Cone { base: frame, radius: at_origin, half_angle: (-rate).atan() }))
 }
 
 /// Extrudes each planar face in `faces` along its outward normal by
@@ -242,6 +363,7 @@ pub fn check(body: &Body) -> Vec<String> {
     if body.edges.iter().any(|(_, edge)| edge.coedges.len() != 2) {
         problems.push("the shell is open or not manifold".into());
     }
+    problems.extend(super::audit::geometry_flaws(body, tolerance * 100.0));
     if let Some(properties) = super::mass_properties(body) {
         if !(properties.volume > 0.0) {
             problems.push("the volume is not positive".into());
@@ -348,9 +470,39 @@ fn distinct(faces: &[FaceKey]) -> Vec<FaceKey> {
     faces.iter().copied().filter(|face| seen.insert(*face)).collect()
 }
 
+/// The largest distance `faces` can each be moved along their outward
+/// normals, the way `distance`'s sign says, before one of them folds over
+/// itself or closes up: the smallest radius of curvature bending that way.
+/// Infinite where nothing bends that way; `None` for a face whose surface
+/// cannot be measured.
+pub fn offset_limit(body: &Body, faces: &[FaceKey], distance: f64) -> Option<f64> {
+    let mut limit = f64::INFINITY;
+    for face in distinct(faces) {
+        let node = body.faces.get(face)?;
+        let along = if node.forward { distance } else { -distance };
+        let shrinking = along < 0.0;
+        let here = match body.surfaces.get(node.surface)? {
+            Surface::Plane(_) => f64::INFINITY,
+            Surface::Cylinder(cylinder) if shrinking => cylinder.radius.abs(),
+            Surface::Sphere(sphere) if shrinking => sphere.radius.abs(),
+            Surface::Torus(torus) if shrinking => torus.minor_radius.abs(),
+            // Grown past the major radius, the tube meets itself on the axis.
+            Surface::Torus(torus) => torus.major_radius.abs() - torus.minor_radius.abs(),
+            Surface::Cylinder(_) | Surface::Sphere(_) | Surface::Cone(_) => f64::INFINITY,
+            Surface::Nurbs(surface) => super::certified_offset::largest_offset(surface, along)?,
+            Surface::Offset(offset) => {
+                super::certified_offset::largest_offset(&offset.base, offset.distance + along)?
+                    - offset.distance.abs()
+            }
+        };
+        limit = limit.min(here);
+    }
+    Some(limit)
+}
+
 /// A surface moved along its own normal by `along`, with the motion when the
-/// move is a translation.
-fn offset_surface(surface: &Surface, along: f64) -> Option<(Surface, Option<Placement>)> {
+/// move is a translation. A spline's offset is certified within `tolerance`.
+fn offset_surface(surface: &Surface, along: f64, tolerance: f64) -> Option<(Surface, Option<Placement>)> {
     let grown = |radius: f64| (radius + along > 0.0).then_some(radius + along);
     Some(match surface {
         Surface::Plane(plane) => {
@@ -379,7 +531,16 @@ fn offset_surface(surface: &Surface, along: f64) -> Option<(Surface, Option<Plac
             moved.radius = cone.radius + along / cone.half_angle.cos();
             (Surface::Cone(moved), None)
         }
-        Surface::Nurbs(_) | Surface::Offset(_) => return None,
+        Surface::Nurbs(spline) => {
+            let offset = super::certified_offset::certified_offset(spline, along, tolerance).ok()?;
+            (Surface::Offset(super::OffsetSurface { base: spline.clone(), distance: along, approximation: offset.surface }), None)
+        }
+        Surface::Offset(offset) => {
+            let distance = offset.distance + along;
+            let approximation =
+                super::certified_offset::certified_offset(&offset.base, distance, tolerance).ok()?.surface;
+            (Surface::Offset(super::OffsetSurface { base: offset.base.clone(), distance, approximation }), None)
+        }
     })
 }
 
@@ -1016,6 +1177,76 @@ mod tests {
 
     fn volume(body: &Body) -> f64 {
         super::super::mass_properties(body).expect("mass properties").volume
+    }
+
+    #[test]
+    fn a_spline_face_has_a_certified_offset_and_a_limit() {
+        use crate::geom2d::{Curve as Curve2, Line, NurbsCurve};
+        let profile = vec![
+            Curve2::Nurbs(NurbsCurve::new(2, vec![[0.0, 0.0], [5.0, 5.0], [10.0, 0.0]], Vec::new(), None).unwrap()),
+            Curve2::Line(Line { start: [10.0, 0.0], end: [0.0, 0.0] }),
+        ];
+        let prism = super::super::sweep::extrude(crate::space::Plane::XY, &profile, [0.0, 0.0, 1.0]).unwrap();
+        let wall = prism
+            .face_keys()
+            .find(|face| prism.surfaces.get(prism.faces.get(*face).unwrap().surface).unwrap().is_spline())
+            .unwrap();
+        // y = x - x² / 10 bends inward most at its crown, 1 / κ = 5.
+        let limit = offset_limit(&prism, &[wall], -1.0).unwrap();
+        assert!((limit - 5.0).abs() < 1e-6, "{limit}");
+        assert!(offset_limit(&prism, &[wall], 1.0).unwrap().is_infinite());
+        // Its offset surface is the base pushed out, certified to the
+        // tolerance: the crown at y = 2.5 + 0.5.
+        let surface = prism.surfaces.get(prism.faces.get(wall).unwrap().surface).unwrap();
+        let along = if prism.faces.get(wall).unwrap().forward { 0.5 } else { -0.5 };
+        let (Surface::Offset(offset), None) = offset_surface(surface, along, 1e-7).unwrap() else {
+            panic!("an offset surface");
+        };
+        assert_eq!(offset.distance, along);
+        let crown = Surface::Offset(offset.clone()).parameters_at([5.0, 3.0, 0.5]).unwrap();
+        let point = Surface::Offset(offset).point_at(crown.0, crown.1);
+        assert!(Vec3::from(point).distance(Vec3::new(5.0, 3.0, 0.5)) < 1e-7);
+        // Pulled in past its crown's radius it folds, and is refused.
+        assert!(offset_surface(surface, -6.0 * along / 0.5, 1e-7).is_none());
+    }
+
+    #[test]
+    fn an_oblique_pull_drafts_a_side_to_the_angle_itself() {
+        let body = cube();
+        let side = face_at_point(&body, [10.0, 5.0, 5.0]).expect("the side");
+        let (tilt, angle) = (0.4_f64, 0.1_f64);
+        let pull = [0.0, tilt.sin(), tilt.cos()];
+        let drafted = draft_faces(&body, &[side], [0.0; 3], [0.0, 0.0, 1.0], pull, angle).expect("draft");
+        let face = face_at_point(&drafted, [9.9, 5.0, 5.0]).expect("the drafted side");
+        let node = drafted.faces.get(face).unwrap();
+        let Some(Surface::Plane(plane)) = drafted.surfaces.get(node.surface) else {
+            panic!("a plane");
+        };
+        let normal = Vec3::from(plane.normal().unwrap()) * if node.forward { 1.0 } else { -1.0 };
+        assert!((normal.dot(Vec3::from(pull)) - angle.sin()).abs() < 1e-12);
+        // Hinged on z = 0, turned by φ with sin φ = sin θ / cos(tilt).
+        let turn = (angle.sin() / tilt.cos()).asin();
+        assert!((volume(&drafted) - (1000.0 - 500.0 * turn.tan())).abs() < 1e-8);
+    }
+
+    #[test]
+    fn a_drafted_pin_becomes_a_frustum_and_a_drafted_hole_widens() {
+        let pin = super::super::make::cylinder([0.0; 3], 2.0, 4.0).expect("a pin");
+        let wall = face_at_point(&pin, [2.0, 0.0, 2.0]).expect("the wall");
+        let angle = 0.1_f64;
+        let drafted = taper_faces(&pin, &[wall], [0.0; 3], [0.0, 0.0, 1.0], angle).expect("draft");
+        let top = 2.0 - 4.0 * angle.tan();
+        let frustum = std::f64::consts::PI * 4.0 / 3.0 * (4.0 + 2.0 * top + top * top);
+        assert!((volume(&drafted) - frustum).abs() < 1e-8, "{}", volume(&drafted));
+
+        let block = super::super::make::cuboid([-5.0, -5.0, 0.0], [10.0, 10.0, 4.0]).unwrap();
+        let bore = super::super::make::cylinder([0.0, 0.0, -1.0], 2.0, 6.0).unwrap();
+        let holed = super::super::combine(block, bore, Operation::Difference, 1e-9).unwrap();
+        let wall = face_at_point(&holed, [2.0, 0.0, 2.0]).expect("the bore");
+        let drafted = taper_faces(&holed, &[wall], [0.0; 3], [0.0, 0.0, 1.0], angle).expect("draft");
+        let top = 2.0 + 4.0 * angle.tan();
+        let frustum = std::f64::consts::PI * 4.0 / 3.0 * (4.0 + 2.0 * top + top * top);
+        assert!((volume(&drafted) - (400.0 - frustum)).abs() < 1e-8, "{}", volume(&drafted));
     }
 
     #[test]

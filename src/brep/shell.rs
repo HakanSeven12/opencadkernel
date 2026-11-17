@@ -1329,6 +1329,11 @@ fn shell_by_offset(body: &Body, removed: &HashSet<FaceKey>, distance: f64) -> Op
         return None;
     }
     let tolerance = super::operation_tolerance(&[body]);
+    // A wall as thick as the body leaves no cavity to cut.
+    let open: Vec<FaceKey> = removed.iter().copied().collect();
+    if !matches!(super::wall_room::shell_wall_room(body, &open, distance), super::wall_room::WallRoom::Room(_)) {
+        return None;
+    }
     let inner = offset_inward(body, removed, distance, tolerance)?;
     let volume = |body: &Body| super::mass_properties(body).map(|mass| mass.volume);
     let (outer, cavity) = (volume(body)?, volume(&inner)?);

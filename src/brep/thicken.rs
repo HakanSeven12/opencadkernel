@@ -561,6 +561,11 @@ fn thicken_nurbs_patch(
         let offset_curve = offset
             .isocurve(axis, line.start[axis])
             .ok_or(ThickenError::UnsupportedSurface)?;
+        // A certified offset has knots of its own: the side wall is ruled
+        // between the two written alike.
+        let (source_curve, offset_curve) = source_curve
+            .made_compatible(&offset_curve)
+            .ok_or(ThickenError::UnsupportedSurface)?;
         let source_rational = rational_curve(&source_curve);
         let offset_rational = rational_curve(&offset_curve);
         let next = (index + 1) % lines.len();
@@ -754,7 +759,23 @@ fn circuit_pcurves(body: &Body, plane: &Plane, circuit: &[(EdgeKey, bool)]) -> O
         .collect()
 }
 
+/// The surface and its offset: certified within `tolerance` everywhere
+/// ([`super::certified_offset`]), refused where it folds, and sampled at the
+/// knot spans where no certificate is reached.
 fn offset_nurbs(
+    source: &NurbsSurface3,
+    distance: f64,
+    tolerance: f64,
+) -> Result<(NurbsSurface3, NurbsSurface3), ThickenError> {
+    use super::certified_offset::{certified_offset, OffsetRefusal};
+    match certified_offset(source, distance, tolerance) {
+        Ok(offset) => Ok((source.clone(), offset.surface)),
+        Err(OffsetRefusal::Folds { .. }) => Err(ThickenError::SelfIntersection),
+        Err(_) => sampled_offset_nurbs(source, distance, tolerance),
+    }
+}
+
+fn sampled_offset_nurbs(
     source: &NurbsSurface3,
     distance: f64,
     tolerance: f64,

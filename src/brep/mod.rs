@@ -27,10 +27,12 @@
 //! the blast radius of an edit is the edit.
 
 pub mod arena;
+pub mod audit;
 pub mod blend;
 mod blend_local;
 pub mod boolean;
 pub mod bounds;
+pub mod certified_offset;
 mod chamfer_circular;
 mod chamfer_prismatic;
 mod chamfer_profile;
@@ -63,6 +65,7 @@ pub mod sweep;
 pub mod sweep_path;
 pub mod thicken;
 pub mod topology;
+pub mod wall_room;
 
 pub use arena::{Arena, Key};
 pub use blend::{chamfer, chamfer_edges, fillet, fillet_edges, presspull, ChamferError, FilletError};
@@ -74,7 +77,7 @@ pub use geometry::{
 };
 pub use edit::{
     check, clean, delete_faces, extrude_faces, face_at_point, face_sheet, imprint_curve, move_faces,
-    offset_faces, rotation, separate, taper_faces,
+    draft_faces, offset_faces, offset_limit, rotation, separate, taper_faces,
 };
 pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};
