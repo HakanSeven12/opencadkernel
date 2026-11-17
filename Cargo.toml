@@ -50,3 +50,7 @@ required-features = ["brep"]
 [[example]]
 name = "boolean_bench"
 required-features = ["brep"]
+
+[[example]]
+name = "kernel_cases"
+required-features = ["brep"]

@@ -55,8 +55,6 @@ types (algorithms and constants adapted, not copied file for file):
 
 ### Blends: corners and sizes that fit
 
-### Sewing and trim-loop repair of imported bodies
-
 Ported from `crates/solidcore` at commit `e261b7d` onto the kernel's own
 types (algorithms adapted, not copied file for file):
 
@@ -91,6 +89,11 @@ onto the kernel's own types:
   their surfaces' Bézier pieces, nearest pair first with de Casteljau
   subdivision, after `src/query/distance_bound.rs` and `src/query/contact.rs`.
 
+### Sewing and trim-loop repair of imported bodies
+
+Ported from `crates/solidcore` at commit `e261b7d` onto the kernel's own
+types (algorithms adapted, not copied file for file):
+
 - `src/brep/heal.rs` (`sew`, `sew_into_solid`): the stitching of
   `src/heal/stitch/p2.rs` (`Stitch::do_stitching`, `stitch_into_solid`) as
   `docs/validity-and-tolerances.md` §7.3 describes it: vertices sorted along
@@ -100,3 +103,12 @@ onto the kernel's own types:
 - `src/brep/heal.rs` (`fix_loops`): `order_curves_into_loops`,
   `fix_trim_loop_order` and `fix_loop_orientation` of
   `src/topology/trimming_tools.rs`.
+
+### Kernel-case corpus runner
+
+- `examples/kernel_cases.rs` reads Solidcore's kernel-case corpus
+  (`crates/solidcore/tests/kernel_cases`) and its portable B-rep record
+  (`crates/solidcore-record/src/brep.rs`, whose documented parameterisations
+  the reader follows). The corpus is not part of this repository:
+  `scripts/fetch-kernel-cases.sh` unpacks it from a local Solidcore clone at
+  the pinned commit.
