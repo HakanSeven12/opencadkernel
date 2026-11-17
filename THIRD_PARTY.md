@@ -55,6 +55,8 @@ types (algorithms and constants adapted, not copied file for file):
 
 ### Blends: corners and sizes that fit
 
+### Sewing and trim-loop repair of imported bodies
+
 Ported from `crates/solidcore` at commit `e261b7d` onto the kernel's own
 types (algorithms adapted, not copied file for file):
 
@@ -88,3 +90,13 @@ onto the kernel's own types:
 - `src/brep/ssi.rs` (`apart`): proving two faces apart on the convex hulls of
   their surfaces' Bézier pieces, nearest pair first with de Casteljau
   subdivision, after `src/query/distance_bound.rs` and `src/query/contact.rs`.
+
+- `src/brep/heal.rs` (`sew`, `sew_into_solid`): the stitching of
+  `src/heal/stitch/p2.rs` (`Stitch::do_stitching`, `stitch_into_solid`) as
+  `docs/validity-and-tolerances.md` §7.3 describes it: vertices sorted along
+  (1, 1, 1) and glued within the tolerance, edges split where a vertex lands
+  inside them, coincident edges glued, the tolerance doubled while free edges
+  remain up to 1/200 of the box diagonal.
+- `src/brep/heal.rs` (`fix_loops`): `order_curves_into_loops`,
+  `fix_trim_loop_order` and `fix_loop_orientation` of
+  `src/topology/trimming_tools.rs`.
