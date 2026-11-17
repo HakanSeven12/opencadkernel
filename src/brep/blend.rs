@@ -1457,6 +1457,135 @@ fn fillet_convex(body: &Body, selected: &[EdgeKey], radius: f64) -> Result<Body,
     Ok(result)
 }
 
+/// The largest radius, up to `radius`, the edges are found to round to
+/// together — what a refusal of `radius` can name instead. `None` where
+/// nothing was found to fit.
+///
+/// Straight edges between planes start from their band's room: a round of
+/// radius `r` touches each face `r / tan(phi / 2)` from its edge, `phi` the
+/// angle between the faces' directions away from it, so a face with room
+/// `s` across from the edge takes radii below `s tan(phi / 2)` (after
+/// Solidcore's `band_room`; see `THIRD_PARTY.md`). The rest is found by
+/// halving between nothing and that.
+pub fn fillet_fit(body: &Body, edges: &[EdgeKey], radius: f64) -> Option<f64> {
+    let upper = edges
+        .iter()
+        .filter_map(|edge| band_room(body, *edge))
+        .map(|(rooms, angle)| rooms[0].1.min(rooms[1].1) * (angle * 0.5).tan())
+        .fold(f64::INFINITY, f64::min);
+    largest_fit(radius, upper, |size| fillet_edges(body, edges, size).is_ok())
+}
+
+/// The largest base distance, up to `base_distance`, the edges are found to
+/// bevel to together, the other distance kept in proportion: what a refusal
+/// can name instead. `None` where nothing was found to fit. A bevel's
+/// distances are its setbacks, so a face's room across from its edge bounds
+/// its distance directly.
+pub fn chamfer_fit(
+    body: &Body,
+    edges: &[EdgeKey],
+    base_face: FaceKey,
+    base_distance: f64,
+    other_distance: f64,
+) -> Option<f64> {
+    let ratio = other_distance / base_distance;
+    let upper = edges
+        .iter()
+        .filter_map(|edge| band_room(body, *edge))
+        .flat_map(|(rooms, _)| rooms)
+        .map(|(face, room)| if face == base_face { room } else { room / ratio })
+        .fold(f64::INFINITY, f64::min);
+    largest_fit(base_distance, upper, |size| {
+        chamfer_edges(body, edges, base_face, size, size * ratio).is_ok()
+    })
+}
+
+/// The largest size up to `asked` that `fits`, below the open bound `upper`:
+/// tried just under the bound first, then halved towards what fits.
+fn largest_fit(asked: f64, upper: f64, fits: impl Fn(f64) -> bool) -> Option<f64> {
+    if !asked.is_finite() || asked <= 0.0 {
+        return None;
+    }
+    // A round as wide as its face leaves a sliver: stay a little short.
+    let mut high = asked.min(upper * (1.0 - 1e-3));
+    if high > 0.0 && fits(high) {
+        return Some(high);
+    }
+    // ponytail: up to 12 more blends, each a full attempt; a closed-form
+    // fit per corner would cut this where refusals need to be quick.
+    let mut low = 0.0;
+    for _ in 0..12 {
+        let middle = 0.5 * (low + high);
+        if fits(middle) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    (low > 0.0).then_some(low)
+}
+
+/// The room a straight edge between two planes has on each face: how far
+/// from it, square to it and into the face, the face's boundary is first
+/// met — the least of three stations along the edge — and the angle
+/// between the two faces' directions away from it.
+fn band_room(body: &Body, edge_key: EdgeKey) -> Option<([(FaceKey, f64); 2], f64)> {
+    let edge = body.edges.get(edge_key)?;
+    if !straight(body.curves.get(edge.curve)?) || edge.coedges.len() != 2 {
+        return None;
+    }
+    let start = Vec3::from(body.vertices.get(edge.start)?.point);
+    let end = Vec3::from(body.vertices.get(edge.end)?.point);
+    let axis = (end - start).normalize()?;
+    let length = start.distance(end);
+    let face_of = |coedge| Some(body.loops.get(body.coedges.get(coedge)?.owner)?.owner);
+    let mut rooms = [(face_of(edge.coedges[0])?, 0.0), (face_of(edge.coedges[1])?, 0.0)];
+    let mut inward = [Vec3::ZERO; 2];
+    for (index, coedge_key) in edge.coedges.iter().enumerate() {
+        let coedge = body.coedges.get(*coedge_key)?;
+        let face_key = rooms[index].0;
+        let face = body.faces.get(face_key)?;
+        let Surface::Plane(plane) = body.surfaces.get(face.surface)? else { return None };
+        let normal = Vec3::from(plane.normal()?) * if face.forward { 1.0 } else { -1.0 };
+        // A face lies left of the way its loops walk, seen from outside.
+        let walk = if coedge.forward { axis } else { -axis };
+        let into = normal.cross(walk).normalize()?;
+        inward[index] = into;
+        let mut room = f64::INFINITY;
+        for station in [0.02, 0.5, 0.98] {
+            let from = start + axis * (length * station);
+            for other in body.face_coedges(face_key) {
+                let other = body.coedges.get(other)?.edge;
+                if other == edge_key {
+                    continue;
+                }
+                let node = body.edges.get(other)?;
+                let curve = body.curves.get(node.curve)?;
+                let steps = if straight(curve) { 1 } else { 32 };
+                let at = |step: usize| {
+                    let t = node.start_parameter
+                        + (node.end_parameter - node.start_parameter) * step as f64 / steps as f64;
+                    let offset = Vec3::from(curve.point_at(t)) - from;
+                    (offset.dot(into), offset.dot(axis))
+                };
+                for step in 0..steps {
+                    let ((x0, y0), (x1, y1)) = (at(step), at(step + 1));
+                    if (y0 > 0.0 && y1 > 0.0) || (y0 < 0.0 && y1 < 0.0) || y0 == y1 {
+                        continue;
+                    }
+                    let x = x0 + (x1 - x0) * y0 / (y0 - y1);
+                    if x > length * 1e-9 {
+                        room = room.min(x);
+                    }
+                }
+            }
+        }
+        rooms[index].1 = room;
+    }
+    let angle = inward[0].dot(inward[1]).clamp(-1.0, 1.0).acos();
+    rooms.iter().all(|(_, room)| room.is_finite()).then_some((rooms, angle))
+}
+
 /// Moves a planar face while extending or trimming its neighbouring surfaces.
 pub fn presspull(body: &Body, face_key: FaceKey, distance: f64) -> Option<Body> {
     super::presspull_face(body, face_key, distance, super::PresspullMode::Offset)
@@ -1673,26 +1802,52 @@ fn corner_blends(
                 }
             }
         }
-        if normals.len() != 3 || (0..3).any(|i|
-            (i + 1..3).any(|j| normals[i].dot(normals[j]).abs() > 1e-8)) {
+        if normals.len() != 3 {
             return Err(unsupported);
         }
-        if edges.len() == 3 {
-            let point = Vec3::from(body.vertices.get(vertex)
-                .ok_or(FilletError::InvalidBodyTopology)?.point);
-            let sum = normals.iter().copied().fold(Vec3::ZERO, |a, b| a + b);
-            let centre = point - sum * radius;
-            let normal = sum.normalize().ok_or(unsupported)?;
-            let origin = centre + normals[0] * radius;
-            if normal.dot(point - origin) <= tolerance { return Err(unsupported); }
-            // Keep both parameter poles and the longitude seam outside the
-            // trimmed patch so downstream meshing has a regular UV domain.
-            let pole = (normals[0] - normals[1]).normalize().ok_or(unsupported)?;
-            let frame = Plane::orthonormal(centre.to_array(), normal.to_array(),
-                pole.to_array()).ok_or(unsupported)?;
-            corners.push((Halfspace { origin, normal, offset: normal.dot(origin), added: true },
-                Sphere { frame, radius }));
+        let point = Vec3::from(body.vertices.get(vertex)
+            .ok_or(FilletError::InvalidBodyTopology)?.point);
+        if edges.len() == 2 {
+            // Two rounds meet on the edge left sharp only where both reach
+            // it at the same place: each touches the face it alone rests
+            // on `r (1 - cos)` of their shared face's angle to it from that
+            // face, so the two angles at the shared face must agree.
+            let frames = [edge_frame(body, edges[0]).ok_or(unsupported)?,
+                edge_frame(body, edges[1]).ok_or(unsupported)?];
+            let cosine = |frame: &EdgeFrame| frame.first_normal.dot(frame.second_normal);
+            if (cosine(&frames[0]) - cosine(&frames[1])).abs() > 1e-9 {
+                return Err(unsupported);
+            }
+            continue;
         }
+        // The ball a radius in from all three planes, `n_i . c = n_i . p - r`
+        // solved by Cramer's rule (after Solidcore's `planes_meet`; see
+        // `THIRD_PARTY.md`); it touches each at `c + r n_i`, and the
+        // corner is the sphere's triangle between those touches.
+        let [a, b, c] = [normals[0], normals[1], normals[2]];
+        let determinant = a.dot(b.cross(c));
+        if determinant.abs() < 1e-9 {
+            return Err(unsupported);
+        }
+        let centre = point - (b.cross(c) + c.cross(a) + a.cross(b)) * (radius / determinant);
+        let touches = [centre + a * radius, centre + b * radius, centre + c * radius];
+        let mut normal = (touches[1] - touches[0]).cross(touches[2] - touches[0])
+            .normalize().ok_or(unsupported)?;
+        if normal.dot(point - touches[0]) < 0.0 {
+            normal = -normal;
+        }
+        let origin = touches[0];
+        if normal.dot(point - origin) <= tolerance || normal.dot(origin - centre) <= tolerance {
+            return Err(unsupported);
+        }
+        // Keep both parameter poles and the longitude seam outside the
+        // trimmed patch so downstream meshing has a regular UV domain:
+        // `a - b` lies in the triangle's plane and outside its cone.
+        let pole = (a - b).normalize().ok_or(unsupported)?;
+        let frame = Plane::orthonormal(centre.to_array(), normal.to_array(),
+            pole.to_array()).ok_or(unsupported)?;
+        corners.push((Halfspace { origin, normal, offset: normal.dot(origin), added: true },
+            Sphere { frame, radius }));
     }
     Ok(corners)
 }
@@ -2194,7 +2349,13 @@ fn existing_corners(body: &Body) -> Option<Vec<(Halfspace, Sphere)>> {
                 || (offset - axis * offset.dot(axis)).length() > tolerance { return None; }
         }
         if points.len() != 3 { return None; }
-        let normal = points.iter().fold(Vec3::ZERO, |sum, point| sum + (*point - centre)).normalize()?;
+        // The plane through the three touches, facing out of the ball: its
+        // normal the sum of their directions only where the corner is square.
+        let sum = points.iter().fold(Vec3::ZERO, |sum, point| sum + (*point - centre));
+        let mut normal = (points[1] - points[0]).cross(points[2] - points[0]).normalize()?;
+        if normal.dot(sum) < 0.0 {
+            normal = -normal;
+        }
         let origin = points[0];
         if points.iter().any(|point| normal.dot(*point - origin).abs() > tolerance
             || (point.distance(centre) - sphere.radius).abs() > tolerance) { return None; }
@@ -2714,5 +2875,98 @@ mod tests {
 
         assert!(result.validate().is_empty());
         assert!(result.faces.len() > body.faces.len());
+    }
+
+    /// An equilateral prism, side 4 and 3 high: its upright edges meet its
+    /// ends square, but each other at sixty degrees.
+    fn triangular_prism() -> Body {
+        use crate::geom2d::{Curve as Curve2, Line};
+        let line = |start, end| Curve2::Line(Line { start, end });
+        let apex = [2.0, 2.0 * 3f64.sqrt()];
+        let profile = vec![line([0.0, 0.0], [4.0, 0.0]), line([4.0, 0.0], apex), line(apex, [0.0, 0.0])];
+        let plane = Plane::orthonormal([0.0; 3], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]).unwrap();
+        crate::brep::extrude(plane, &profile, [0.0, 0.0, 3.0]).unwrap()
+    }
+
+    fn volume(body: &Body) -> f64 {
+        crate::brep::mass_properties(body).unwrap().volume
+    }
+
+    #[test]
+    fn every_edge_of_a_prism_rounds_with_ball_corners_at_oblique_corners() {
+        let body = triangular_prism();
+        let edges: Vec<EdgeKey> = body.edges.keys().collect();
+        let radius = 0.3;
+        let rounded = fillet_edges(&body, &edges, radius).unwrap();
+        assert!(rounded.validate().is_empty());
+        let corners = rounded
+            .faces
+            .iter()
+            .filter(|(_, face)| matches!(rounded.surfaces.get(face.surface), Some(Surface::Sphere(_))))
+            .count();
+        assert_eq!(corners, 6);
+        // A convex solid rounded all over is its core grown by the ball: the
+        // core, its faces moved out by r, its edges' wedges of the cylinder
+        // (the turn between their faces) and the whole ball at its corners.
+        let inradius = 4.0 / (2.0 * 3f64.sqrt());
+        let side = 4.0 * (inradius - radius) / inradius;
+        let height = 3.0 - 2.0 * radius;
+        let end = 3f64.sqrt() / 4.0 * side * side;
+        let area = 2.0 * end + 3.0 * side * height;
+        let wedges = 3.0 * height * (2.0 * PI / 3.0) + 6.0 * side * (PI / 2.0);
+        let expected = end * height
+            + area * radius
+            + wedges * 0.5 * radius * radius
+            + 4.0 / 3.0 * PI * radius.powi(3);
+        let found = volume(&rounded);
+        assert!((found - expected).abs() < 1e-4 * expected, "{found} {expected}");
+    }
+
+    #[test]
+    fn two_edges_meeting_at_equal_angles_round_together_at_an_oblique_corner() {
+        // Two bottom edges of the prism meet at sixty degrees, each square
+        // to the bottom: the rounds reach the upright edge between their
+        // other faces at one height and meet there along an ellipse.
+        let body = triangular_prism();
+        let bottom: Vec<EdgeKey> = body
+            .edges
+            .iter()
+            .filter(|(_, edge)| {
+                [edge.start, edge.end]
+                    .iter()
+                    .all(|vertex| body.vertices.get(*vertex).unwrap().point[2].abs() < 1e-9)
+            })
+            .map(|(key, _)| key)
+            .collect();
+        let radius = 0.3;
+        let both = fillet_edges(&body, &bottom[..2], radius).unwrap();
+        assert!(both.validate().is_empty());
+        let whole = volume(&body);
+        let first = whole - volume(&fillet_edges(&body, &bottom[..1], radius).unwrap());
+        let second = whole - volume(&fillet_edges(&body, &bottom[1..2], radius).unwrap());
+        // The two cuts overlap only by the corner, well inside a ball's cube.
+        let removed = whole - volume(&both);
+        assert!(removed < first + second && removed > first + second - radius.powi(3));
+    }
+
+    #[test]
+    fn a_refused_size_names_the_largest_that_fits() {
+        let body = cuboid([0.0; 3], [4.0, 4.0, 4.0]).unwrap();
+        let (face, edges) = opposite_edges_on_one_face(&body);
+        assert!(fillet_edges(&body, &edges[..1], 5.0).is_err());
+        // A round on a square edge touches each face its radius from the
+        // edge: the face, 4 across, takes radii below 4.
+        let fit = fillet_fit(&body, &edges[..1], 5.0).unwrap();
+        assert!(fit > 3.99 && fit < 4.0, "{fit}");
+        assert!(fillet_edges(&body, &edges[..1], fit).is_ok());
+        // Two rounds on opposite edges of one face share it.
+        let fit = fillet_fit(&body, &edges, 5.0).unwrap();
+        assert!(fit > 1.99 && fit < 2.0, "{fit}");
+        // A bevel's distance is its setback, bounded by the room the same.
+        assert!(chamfer_edges(&body, &edges[..1], face, 5.0, 5.0).is_err());
+        let fit = chamfer_fit(&body, &edges[..1], face, 5.0, 5.0).unwrap();
+        assert!(fit > 3.99 && fit < 4.0, "{fit}");
+        // What fits is not cut down.
+        assert_eq!(fillet_fit(&body, &edges[..1], 1.0), Some(1.0));
     }
 }

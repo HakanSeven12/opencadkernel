@@ -1245,15 +1245,24 @@ impl NurbsSurface3 {
             let uv = along_u.dot(along_v);
             let vv = along_v.dot(along_v);
             let determinant = uu * vv - uv * uv;
-            if !determinant.is_finite() || determinant <= f64::EPSILON * 64.0 * uu * vv {
-                break;
-            }
             let ru = along_u.dot(residual);
             let rv = along_v.dot(residual);
-            let step = [
-                (-ru * vv + uv * rv) / determinant,
-                (uv * ru - uu * rv) / determinant,
-            ];
+            let step = if determinant.is_finite() && determinant > f64::EPSILON * 64.0 * uu * vv {
+                [
+                    (-ru * vv + uv * rv) / determinant,
+                    (uv * ru - uu * rv) / determinant,
+                ]
+            } else if uu >= vv && uu > 0.0 {
+                // A boundary collapsed to a point — a pole, a round closing
+                // where its faces meet tangentially — has no tangent across
+                // it, and the coarse search lands every point near it there:
+                // step along the tangent it still has, off the point.
+                [-ru / uu, 0.0]
+            } else if vv > 0.0 {
+                [0.0, -rv / vv]
+            } else {
+                break;
+            };
             let current = residual.length_squared();
             let mut accepted = false;
             for divisor in [1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {

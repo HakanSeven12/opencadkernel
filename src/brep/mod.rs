@@ -64,7 +64,10 @@ pub mod thicken;
 pub mod topology;
 
 pub use arena::{Arena, Key};
-pub use blend::{chamfer, chamfer_edges, fillet, fillet_edges, presspull, ChamferError, FilletError};
+pub use blend::{
+    chamfer, chamfer_edges, chamfer_fit, fillet, fillet_edges, fillet_fit, presspull, ChamferError,
+    FilletError,
+};
 pub use boolean::{combine, Operation};
 pub use bounds::{body_bounds, face_bounds, operation_tolerance, Aabb};
 pub use classify::{contains_point, Containment};
