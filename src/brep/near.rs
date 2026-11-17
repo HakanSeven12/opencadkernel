@@ -75,6 +75,11 @@ impl<'a> FaceSoups<'a> {
     pub(super) fn triangles(&self, face: FaceKey) -> Option<&[[Vec3; 3]]> {
         self.soup(face).map(|soup| soup.triangles.as_slice())
     }
+
+    /// How far the face's mesh may stray from its surface.
+    pub(super) fn deviation(&self, face: FaceKey) -> Option<f64> {
+        self.soup(face).map(|soup| soup.deviation)
+    }
 }
 
 /// Whether two faces stay apart by more than both meshes' deviations and
@@ -155,7 +160,7 @@ fn segment_crosses_triangle(p: Vec3, q: Vec3, t: &[Vec3; 3]) -> bool {
 }
 
 /// The point of triangle `t` nearest `point`.
-fn closest_on_triangle(point: Vec3, t: &[Vec3; 3]) -> Vec3 {
+pub(super) fn closest_on_triangle(point: Vec3, t: &[Vec3; 3]) -> Vec3 {
     let (a, b, c) = (t[0], t[1], t[2]);
     let (ab, ac, ap) = (b - a, c - a, point - a);
     let (d1, d2) = (ab.dot(ap), ac.dot(ap));

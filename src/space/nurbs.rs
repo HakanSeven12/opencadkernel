@@ -258,6 +258,44 @@ impl NurbsCurve3 {
         Some(curve)
     }
 
+    /// The pair written on one degree and one knot vector over the same
+    /// domain, each tracing the curve it was: what a ruled surface between
+    /// them needs. `None` where their domains differ.
+    pub fn made_compatible(&self, other: &Self) -> Option<(Self, Self)> {
+        let degree = self.degree.max(other.degree);
+        let raise = |curve: &Self| {
+            if curve.degree == degree {
+                Some(curve.clone())
+            } else {
+                curve.elevated(degree - curve.degree)
+            }
+        };
+        let (mut first, mut second) = (raise(self)?, raise(other)?);
+        let ((a0, a1), (b0, b1)) = (first.domain(), second.domain());
+        let scale = 1e-10 * (a1 - a0).abs().max(1.0);
+        if (a0 - b0).abs() > scale || (a1 - b1).abs() > scale {
+            return None;
+        }
+        let count = |curve: &Self, at: f64| curve.knots.iter().filter(|knot| (**knot - at).abs() <= scale).count();
+        for _ in 0..2 {
+            let source = second.clone();
+            let mut interior: Vec<f64> =
+                source.knots.iter().copied().filter(|knot| *knot > a0 + scale && *knot < a1 - scale).collect();
+            interior.dedup_by(|a, b| (*a - *b).abs() <= scale);
+            for at in interior {
+                for _ in count(&first, at)..count(&source, at) {
+                    first.insert_knot(at);
+                }
+            }
+            std::mem::swap(&mut first, &mut second);
+        }
+        if first.knots.len() != second.knots.len() {
+            return None;
+        }
+        second.knots.clone_from(&first.knots);
+        Some((first, second))
+    }
+
     fn elevated_once(&self) -> Option<Self> {
         let degree = self.degree;
         let raised = degree + 1;
