@@ -339,25 +339,40 @@ pub(super) fn planar_measure(body: &Body, face: FaceKey) -> Option<(f64, f64)> {
     let mut area = 0.0;
     let mut perimeter = 0.0;
     for ring in &node.loops {
-        let mut walk: Vec<Vec3> = Vec::new();
+        // Each edge's share of the area swept about the loop's first point,
+        // `½ ∫ (p − first) × dp`: in closed form along a circle, whose
+        // samples were most of a plate's cut when every hole was walked at
+        // every cut; along a chain of chords elsewhere.
+        let mut first = None;
         for coedge in &body.loops.get(*ring)?.coedges {
             let coedge = body.coedges.get(*coedge)?;
             let edge = body.edges.get(coedge.edge)?;
             let curve = body.curves.get(edge.curve)?;
-            let steps = if matches!(curve, Curve3::Line(_)) { 1 } else { 256 };
-            for step in 0..steps {
-                let unit = step as f64 / steps as f64;
-                let unit = if coedge.forward { unit } else { 1.0 - unit };
-                walk.push(Vec3::from(curve.point_at(
-                    edge.start_parameter + (edge.end_parameter - edge.start_parameter) * unit,
-                )));
+            let (from, to) = match coedge.forward {
+                true => (edge.start_parameter, edge.end_parameter),
+                false => (edge.end_parameter, edge.start_parameter),
+            };
+            let first = *first.get_or_insert(Vec3::from(curve.point_at(from)));
+            if let Curve3::Circle(circle) = curve {
+                let x = Vec3::from(circle.plane.x_axis);
+                let y = Vec3::from(circle.plane.y_axis);
+                let centre = Vec3::from(circle.plane.origin);
+                let chord = Vec3::from(curve.point_at(to)) - Vec3::from(curve.point_at(from));
+                let swept = (centre - first).cross(chord)
+                    + x.cross(y) * (circle.radius * circle.radius * (to - from));
+                area += 0.5 * swept.dot(normal);
+                perimeter += circle.radius * (to - from).abs();
+                continue;
             }
-        }
-        let first = *walk.first()?;
-        for (index, point) in walk.iter().enumerate() {
-            let next = walk[(index + 1) % walk.len()];
-            area += 0.5 * (*point - first).cross(next - first).dot(normal);
-            perimeter += point.distance(next);
+            let steps = if matches!(curve, Curve3::Line(_)) { 1 } else { 256 };
+            let mut previous = Vec3::from(curve.point_at(from));
+            for step in 1..=steps {
+                let next =
+                    Vec3::from(curve.point_at(from + (to - from) * step as f64 / steps as f64));
+                area += 0.5 * (previous - first).cross(next - previous).dot(normal);
+                perimeter += previous.distance(next);
+                previous = next;
+            }
         }
     }
     Some((area, perimeter))
@@ -401,6 +416,19 @@ fn split_face_in_place(
     // nowhere near it, is passed over without the crossing search.
     let piece_boxes: Vec<Option<[[f64; 2]; 2]>> =
         boundary_parts.iter().map(|(_, piece)| uv_box(piece)).collect();
+    // Whether a point is within the tolerance of the boundary, asked only of
+    // the pieces whose boxes come that near: a plate's face with a hundred
+    // holes measured every hole's image for every point.
+    let near_boundary = |point: [f64; 2]| {
+        original_boundary.iter().zip(&piece_boxes).any(|(edge, bounds)| {
+            bounds.is_none_or(|[low, high]| {
+                point[0] >= low[0] - tolerance
+                    && point[0] <= high[0] + tolerance
+                    && point[1] >= low[1] - tolerance
+                    && point[1] <= high[1] + tolerance
+            }) && distance_to(edge, point) <= tolerance
+        })
+    };
     let mut crossings_of = |shifted_cutter: Option<&crate::geom2d::Curve>| -> Option<()> {
         let cutter_box = shifted_cutter.and_then(uv_box);
         for (coedge, flat_edge) in &boundary_parts {
@@ -532,7 +560,7 @@ fn split_face_in_place(
                     [u, v],
                     Tolerance::new(tolerance),
                     node.forward,
-                ) && original_boundary.iter().all(|edge| distance_to(edge, [u, v]) > tolerance)
+                ) && !near_boundary([u, v])
             })
         });
     let mut cut_ends: Vec<[f64; 3]> = Vec::new();
@@ -673,9 +701,7 @@ fn split_face_in_place(
                 point,
                 Tolerance::new(tolerance),
                 node.forward,
-            ) && original_boundary
-                .iter()
-                .all(|edge| distance_to(edge, point) > tolerance)
+            ) && !near_boundary(point)
         }))
     };
     // Whether the stretch of the cutter between two parameters runs along the
@@ -819,9 +845,7 @@ fn split_face_in_place(
                 &original_boundary,
                 point,
                 Tolerance::new(tolerance),
-            ) && original_boundary
-                .iter()
-                .all(|edge| distance_to(edge, point) > tolerance)
+            ) && !near_boundary(point)
         });
         if !strictly_inside {
             return None;
@@ -1195,7 +1219,7 @@ fn split_face_in_place(
     let on_image = |parameter: f64| -> Option<bool> {
         let (u, v) = surface.parameters_at(cutter.point_at(parameter))?;
         Some(periodic_points([u, v], periods).into_iter().any(|point| {
-            original_boundary.iter().any(|edge| distance_to(edge, point) <= tolerance)
+            near_boundary(point)
         }))
     };
     let span = end_parameter - start_parameter;

@@ -332,3 +332,129 @@ pub fn meet(first: &Bounded, second: &Bounded, feature: f64) -> Result<Meeting, 
     let touches = found.points.iter().map(shared).filter(kept).collect();
     Ok(Meeting { branches, touches, crossings: found.vertices.clone() })
 }
+
+/// Whether two bounded surfaces are proved more than `gap` apart, without
+/// meshing either.
+///
+/// Each is cut into its rational Bézier pieces, which lie in the hull of
+/// their control points (positive weights). Pairs of pieces are taken
+/// nearest first: a pair whose boxes, or a slab across either piece's normal
+/// cone, keep them `gap` apart is dropped; any other has its larger piece
+/// halved. `true` once every pair is dropped. `false` — nothing proved, not
+/// a meeting found — when a pair stays close after its pieces have shrunk to
+/// a thousandth of where they started, or after a few thousand pairs.
+///
+/// Ported from Solidcore's certified face distance bound
+/// (`query/distance_bound.rs`, `query/contact.rs`: hull bounds tightened by
+/// de Casteljau subdivision, nearest pair first), on the vendored engine's
+/// pieces. Apache-2.0, see THIRD_PARTY.md.
+pub fn apart(first: &Bounded, second: &Bounded, gap: f64) -> bool {
+    use ssi::piece::{pieces_apart, Piece};
+    use std::cmp::Ordering;
+    use std::collections::BinaryHeap;
+    const PAIRS: usize = 4096;
+    struct Pair<'p> {
+        gap: f64,
+        one: &'p Piece,
+        other: &'p Piece,
+    }
+    impl PartialEq for Pair<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.gap.total_cmp(&other.gap) == Ordering::Equal
+        }
+    }
+    impl Eq for Pair<'_> {}
+    impl PartialOrd for Pair<'_> {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Pair<'_> {
+        // The heap pops the nearest pair first.
+        fn cmp(&self, other: &Self) -> Ordering {
+            other.gap.total_cmp(&self.gap)
+        }
+    }
+    let box_gap = |one: &Piece, other: &Piece| {
+        let (a, b) = (one.bounds(), other.bounds());
+        (0..3)
+            .map(|axis| (a[axis] - b[axis + 3]).max(b[axis] - a[axis + 3]).max(0.0))
+            .map(|apart| apart * apart)
+            .sum::<f64>()
+            .sqrt()
+    };
+    let (Ok((one, _)), Ok((other, _))) = (patch(first), patch(second)) else {
+        return false;
+    };
+    let (Ok(ones), Ok(others)) = (one.bezier_pieces(0), other.bezier_pieces(1)) else {
+        return false;
+    };
+    let smallest = ones.iter().chain(&others).map(Piece::size).fold(0.0, f64::max) * 1e-3;
+    let mut heap = BinaryHeap::new();
+    for one in &ones {
+        for other in &others {
+            heap.push(Pair { gap: box_gap(one, other), one, other });
+        }
+    }
+    let mut tried = 0;
+    while let Some(Pair { one, other, .. }) = heap.pop() {
+        tried += 1;
+        if tried > PAIRS {
+            return false;
+        }
+        if pieces_apart(one, other, gap) {
+            continue;
+        }
+        if one.size().max(other.size()) <= smallest.max(gap) {
+            return false;
+        }
+        let (larger, kept, first_larger) = match one.size() >= other.size() {
+            true => (one, other, true),
+            false => (other, one, false),
+        };
+        let along = if larger.extent(0) >= larger.extent(1) { 0 } else { 1 };
+        for half in larger.halves(along) {
+            let (one, other) = if first_larger { (half, kept) } else { (kept, half) };
+            heap.push(Pair { gap: box_gap(one, other), one, other });
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brep::geometry::{Cylinder, Sphere};
+    use crate::space::Plane;
+    use std::f64::consts::{FRAC_PI_2, PI, TAU};
+
+    fn ball(centre: [f64; 3], radius: f64) -> Surface {
+        let frame = Plane::from_axes(centre, [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        Surface::Sphere(Sphere { frame, radius })
+    }
+
+    #[test]
+    fn faces_a_gap_apart_are_proved_apart_and_touching_ones_are_not() {
+        let whole = |surface| Bounded { surface, u: [0.0, TAU], v: [-FRAC_PI_2, FRAC_PI_2] };
+        let one = ball([0.0; 3], 1.0);
+        // Two unit balls 2.01 apart: a hundredth between them.
+        let near = ball([2.01, 0.0, 0.0], 1.0);
+        assert!(apart(&whole(&one), &whole(&near), 1e-3));
+        assert!(!apart(&whole(&one), &whole(&near), 0.02));
+        // Overlapping, they meet.
+        let into = ball([1.5, 0.0, 0.0], 1.0);
+        assert!(!apart(&whole(&one), &whole(&into), 1e-6));
+        // A rod of radius 0.2 standing 0.25 off the ball's side, and the
+        // ball's half turned away from it, which the rod's box overlaps.
+        let rod = Surface::Cylinder(Cylinder {
+            base: Plane::from_axes([1.45, 0.0, -2.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+            radius: 0.2,
+        });
+        let rod = Bounded { surface: &rod, u: [0.0, TAU], v: [0.0, 4.0] };
+        assert!(apart(&whole(&one), &rod, 1e-6));
+        let far_half = Bounded { surface: &one, u: [FRAC_PI_2, 3.0 * FRAC_PI_2], v: [-1.0, 1.0] };
+        assert!(apart(&far_half, &rod, 1e-6));
+        let near_half = Bounded { surface: &one, u: [-PI / 4.0, PI / 4.0], v: [-1.0, 1.0] };
+        assert!(!apart(&near_half, &rod, 0.3));
+    }
+}

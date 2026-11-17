@@ -41,3 +41,7 @@ ssi = { package = "opencadkernel-ssi", path = "crates/opencadkernel-ssi", option
 [[example]]
 name = "ssi_corpus"
 required-features = ["brep"]
+
+[[example]]
+name = "boolean_bench"
+required-features = ["brep"]

@@ -71,6 +71,100 @@ pub fn combine(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body,
     super::transform(&result, &Placement::at(centre.to_array())).ok_or(Snag::CutRefused)
 }
 
+/// Combines one solid with many: `base` united with every tool, or with
+/// every tool taken away. An intersection is folded one tool at a time.
+///
+/// Tools whose boxes keep clear of each other go in together, as one body of
+/// several lumps, so a plate drilled with a hundred holes is cut once rather
+/// than re-imprinted, re-classified and re-joined a hundred times. A batch
+/// that refuses as one is cut one tool at a time instead. Tools that
+/// overlap each other are never put together: a point inside two of them
+/// would count its way out again.
+///
+/// After Solidcore's list Booleans (`boolean/merge/p3.rs`, `boolean_lists`,
+/// which combine each list into one operand first). Apache-2.0, see
+/// THIRD_PARTY.md.
+pub fn combine_all(
+    base: Body,
+    tools: Vec<Body>,
+    how: Operation,
+    tolerance: f64,
+) -> Result<Body, Snag> {
+    if how == Operation::Intersection {
+        return tools
+            .into_iter()
+            .try_fold(base, |result, tool| combine(result, tool, how, tolerance));
+    }
+    let clear = tolerance * 10.0;
+    let mut batches: Vec<(Vec<Body>, Vec<super::Aabb>)> = Vec::new();
+    for tool in tools {
+        let Some(bounds) = super::body_bounds(&tool) else {
+            batches.push((vec![tool], Vec::new()));
+            continue;
+        };
+        let bounds = bounds.grown(clear);
+        let fits = batches.iter().position(|(members, boxes)| {
+            boxes.len() == members.len() && boxes.iter().all(|other| !other.overlaps(&bounds))
+        });
+        match fits {
+            Some(index) => {
+                batches[index].0.push(tool);
+                batches[index].1.push(bounds);
+            }
+            None => batches.push((vec![tool], vec![bounds])),
+        }
+    }
+    let mut result = base;
+    for (members, _) in batches {
+        if members.len() == 1 {
+            let tool = members.into_iter().next().ok_or(Snag::CutRefused)?;
+            result = combine(result, tool, how, tolerance)?;
+            continue;
+        }
+        let together = lumps_of(&members, tolerance)
+            .and_then(|tool| combine(result.clone(), tool, how, tolerance));
+        result = match together {
+            Ok(body) => body,
+            Err(_) => members
+                .into_iter()
+                .try_fold(result, |result, tool| combine(result, tool, how, tolerance))?,
+        };
+    }
+    Ok(result)
+}
+
+/// Bodies that do not touch, as one body: every shell of each, a lump of
+/// its own.
+fn lumps_of(bodies: &[Body], tolerance: f64) -> Result<Body, Snag> {
+    let mut joined = Body::new();
+    for body in bodies {
+        for root in &body.roots {
+            let shells = body.lumps.get(*root).ok_or(Snag::CutRefused)?.shells.clone();
+            let lump = joined.lumps.insert(Lump {
+                shells: Vec::new(),
+                provenance: Provenance::Synthesized,
+            });
+            joined.roots.push(lump);
+            for from in shells {
+                let faces = body.shells.get(from).ok_or(Snag::CutRefused)?.faces.clone();
+                let shell = joined.shells.insert(Shell {
+                    faces: Vec::new(),
+                    owner: lump,
+                    provenance: Provenance::Synthesized,
+                });
+                joined.lumps.get_mut(lump).ok_or(Snag::CutRefused)?.shells.push(shell);
+                for face in faces {
+                    copy_face_with_tolerance(&mut joined, body, face, shell, false, tolerance)?;
+                }
+            }
+        }
+    }
+    match joined.validate().is_empty() {
+        true => Ok(joined),
+        false => Err(Snag::CutRefused),
+    }
+}
+
 /// Which whole round bodies are divided into seamless patches before a
 /// Boolean (see `divided_torus`). A sphere always is.
 #[derive(Clone, Copy, PartialEq)]
@@ -80,24 +174,59 @@ enum Divide {
     AlsoCylinder,
 }
 
-/// [`combine_retried`] with a whole torus or cone divided into seamless
+/// [`combine_here`] with a whole torus or cone divided into seamless
 /// patches first, as it came where that does not give a result whose every
 /// face meshes, and with a cylinder divided too where neither does.
 fn combine_dividing(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<Body, Snag> {
+    // Cut edges run on both bodies' surfaces to within the fit of a traced
+    // curve, which the retries open up tenfold; a little more is only
+    // a face meshed that need not have been.
+    let tolerance_of_cut = tolerance * 1000.0;
     // Only round faces are asked: dividing round bodies is all the ways of
     // trying differ by, and no way of dividing them mends a flat face that
     // will not mesh — while a plate's face, with every hole cut so far, was
     // meshed again at every cut of a long sequence.
+    //
+    // Nor is a face the cut never reached: one with no edge on both bodies'
+    // surfaces is a face of an input, or a patch the dividing made, as it
+    // came. Meshing every round face of the result was most of a curved
+    // boolean's time; the cut ones are what a way of dividing can spoil.
+    let surfaces_of = |body: &Body| -> Vec<Surface> {
+        body.faces
+            .iter()
+            .filter_map(|(_, face)| body.surfaces.get(face.surface))
+            .cloned()
+            .collect()
+    };
+    let inputs = [surfaces_of(&a), surfaces_of(&b)];
+    let on_both = |point: [f64; 3], fit: f64| {
+        inputs.iter().all(|surfaces| {
+            surfaces.iter().any(|surface| surface.distance_to(point).abs() <= fit)
+        })
+    };
     let meshes = |body: &Body| {
         let tolerance =
             super::mesh::TessellationTolerance::new(crate::tessellation::DEFAULT_ANGLE, 1e-9);
+        let cut_edge = |edge: EdgeKey| {
+            body.edges.get(edge).is_some_and(|edge| {
+                body.curves.get(edge.curve).is_some_and(|curve| {
+                    let middle = 0.5 * (edge.start_parameter + edge.end_parameter);
+                    on_both(curve.point_at(middle), tolerance_of_cut)
+                })
+            })
+        };
         body.face_keys().all(|face| {
             let flat = body
                 .faces
                 .get(face)
                 .and_then(|node| body.surfaces.get(node.surface))
                 .is_some_and(|surface| matches!(surface, Surface::Plane(_)));
-            flat || super::mesh::face_meshes(body, face, tolerance)
+            let cut = || {
+                body.face_coedges(face).iter().any(|coedge| {
+                    body.coedges.get(*coedge).is_some_and(|coedge| cut_edge(coedge.edge))
+                })
+            };
+            flat || !cut() || super::mesh::face_meshes(body, face, tolerance)
         })
     };
     // A way of dividing that finds nothing more to divide than the one
@@ -107,58 +236,87 @@ fn combine_dividing(a: Body, b: Body, how: Operation, tolerance: f64) -> Result<
     };
     let tori_or_cones = carries(|surface| matches!(surface, Surface::Torus(_) | Surface::Cone(_)));
     let cylinders = carries(|surface| matches!(surface, Surface::Cylinder(_)));
-    // The first result made stands where none meshes whole.
+    let ways: Vec<Divide> = [Divide::TorusAndCone, Divide::Nothing, Divide::AlsoCylinder]
+        .into_iter()
+        .filter(|divide| match divide {
+            Divide::Nothing => tori_or_cones,
+            Divide::AlsoCylinder => cylinders,
+            Divide::TorusAndCone => true,
+        })
+        .collect();
+    // Every way of dividing is tried plainly before any is tried again more
+    // loosely: a way that refuses outright (a ball divided at corners its
+    // crossing runs through) was retried three times over, at the cost of
+    // the whole boolean each time, before the next way was asked.
+    let single = ways.len() == 1;
+    // The first result made stands where none meshes whole, and the first
+    // refusal where none is made.
     let mut first: Option<Result<Body, Snag>> = None;
-    for divide in [Divide::TorusAndCone, Divide::Nothing, Divide::AlsoCylinder] {
-        if (divide == Divide::Nothing && !tori_or_cones)
-            || (divide == Divide::AlsoCylinder && !cylinders)
-        {
-            continue;
-        }
-        let result = combine_retried(a.clone(), b.clone(), how, tolerance, divide);
-        if result.as_ref().is_ok_and(|body| body.faces.is_empty() || meshes(body)) {
-            return result;
-        }
-        if first.as_ref().is_none_or(|first| first.is_err() && result.is_ok()) {
-            first = Some(result);
+    for retry in Retry::ALL {
+        for divide in &ways {
+            let result = combine_attempt(a.clone(), b.clone(), how, tolerance, *divide, retry);
+            // With no other way to try, whether it meshes changes nothing:
+            // the first result made stands either way. Meshing every round
+            // face of it only to find that out was most of a sphere's
+            // boolean.
+            if single && result.is_ok() {
+                return result;
+            }
+            if result.as_ref().is_ok_and(|body| body.faces.is_empty() || meshes(body)) {
+                return result;
+            }
+            if first.as_ref().is_none_or(|first| first.is_err() && result.is_ok()) {
+                first = Some(result);
+            }
         }
     }
     first.unwrap_or(Err(Snag::CutRefused))
 }
 
-/// [`combine_here`], tried once more with the tolerance opened up tenfold
-/// where it refuses: cuts landing a hair apart, a hair from a corner, read
-/// as one.
-fn combine_retried(
+/// How a refused [`combine_here`] is tried again.
+#[derive(Clone, Copy, PartialEq)]
+enum Retry {
+    /// As asked.
+    Plain,
+    /// Imprinting reaching curves (see [`imprint_reaching`]).
+    Reach,
+    /// The tolerance opened up tenfold: cuts landing a hair apart, a hair
+    /// from a corner, read as one.
+    Looser,
+    /// The pair the other way round: the imprint cuts the second body
+    /// against the first's cuts, and the order can settle a corner. Taken
+    /// only where every face of it still meshes.
+    Swapped,
+}
+
+impl Retry {
+    const ALL: [Self; 4] = [Self::Plain, Self::Reach, Self::Looser, Self::Swapped];
+}
+
+/// One attempt at [`combine_here`].
+fn combine_attempt(
     a: Body,
     b: Body,
     how: Operation,
     tolerance: f64,
     divide: Divide,
+    retry: Retry,
 ) -> Result<Body, Snag> {
-    let here = |a: Body, b: Body, tolerance: f64, swapped: bool, reach: bool| {
-        combine_here(a, b, how, tolerance, swapped, reach, divide)
-    };
-    here(a.clone(), b.clone(), tolerance, false, false)
-        .or_else(|snag| here(a.clone(), b.clone(), tolerance, false, true).map_err(|_| snag))
-        .or_else(|snag| {
-            here(a.clone(), b.clone(), tolerance * 10.0, false, false).map_err(|_| snag)
-        })
-        // The pair the other way round: the imprint cuts the second body
-        // against the first's cuts, and the order can settle a corner. Taken
-        // only where every face of it still meshes.
-        .or_else(|snag| {
-            let Ok(result) = here(b, a, tolerance, true, false) else {
-                return Err(snag);
-            };
+    match retry {
+        Retry::Plain => combine_here(a, b, how, tolerance, false, false, divide),
+        Retry::Reach => combine_here(a, b, how, tolerance, false, true, divide),
+        Retry::Looser => combine_here(a, b, how, tolerance * 10.0, false, false, divide),
+        Retry::Swapped => {
+            let result = combine_here(b, a, how, tolerance, true, false, divide)?;
             let mesh = super::mesh::tessellate(
                 &result,
                 super::mesh::TessellationTolerance::new(0.2, 1e-3),
             );
             (mesh.missing_faces.is_empty() && !mesh.mesh.is_empty())
                 .then_some(result)
-                .ok_or(snag)
-        })
+                .ok_or(Snag::CutRefused)
+        }
+    }
 }
 
 /// `swapped`: the bodies come second first, which only a difference minds —
@@ -257,7 +415,17 @@ fn combine_here(
             let side = match group.and_then(|group| sides.get(&group)) {
                 Some(side) => *side,
                 None => {
-                    let side = face_side(body, classifier, face, tolerance);
+                    // Read at the face's edges on the other body first: any
+                    // face of the group settles the whole group.
+                    let local = match group {
+                        Some(group) => body
+                            .face_keys()
+                            .filter(|key| groups.get(key) == Some(&group))
+                            .find_map(|key| local_side(body, classifier, key, tolerance)),
+                        None => local_side(body, classifier, face, tolerance),
+                    };
+                    let side =
+                        local.unwrap_or_else(|| face_side(body, classifier, face, tolerance));
                     if let (Some(group), Containment::Inside | Containment::Outside) = (group, side)
                     {
                         sides.insert(group, side);
@@ -1187,6 +1355,108 @@ pub(super) fn face_side(body: &Body, other: &Body, face: FaceKey, tolerance: f64
         .map_or(side, |point| contains_point(other, point, tolerance))
 }
 
+/// Which side of `other` a face lies on, read where it meets `other` rather
+/// than by casting rays through every face of it.
+///
+/// After the imprint a face that touches `other` does so along edges lying on
+/// `other`'s faces. At an edge's middle, where it lies on just one face of
+/// `other` — that face smooth there, the solid behind it a half-space to
+/// first order — the direction leading from the edge into the face, square
+/// to the edge, says the side: against the other face's outward normal is
+/// inside it, along it outside. A direction within ten degrees of the other
+/// face's tangent plane — a tangency, a coincident wall — settles nothing,
+/// and neither does a middle on an edge of `other`, where the solid is a
+/// wedge. Every edge that settles it has to agree; `None` where none does,
+/// or two disagree, and the rays are asked after all.
+///
+/// Ported from Solidcore's radial-sector classification at a shared edge
+/// (`query/edge.rs`, `radial_sector_classify_between`, driven by
+/// `boolean/merge/p4.rs`), reduced to the smooth sector. Apache-2.0, see
+/// THIRD_PARTY.md.
+fn local_side(body: &Body, other: &Body, face: FaceKey, tolerance: f64) -> Option<Containment> {
+    // sin 10°: nearer the tangent plane than this, first order says nothing.
+    const CLEAR: f64 = 0.173_648_177_666_930_35;
+    let node = body.faces.get(face)?;
+    let surface = body.surfaces.get(node.surface)?;
+    let sense = if node.forward { 1.0 } else { -1.0 };
+    let mut boundary: Option<Option<Vec<Curve>>> = None;
+    let mut found = None;
+    for coedge in body.face_coedges(face) {
+        let Some(edge) = body.coedges.get(coedge).and_then(|use_| body.edges.get(use_.edge))
+        else {
+            continue;
+        };
+        let Some(curve) = body.curves.get(edge.curve) else { continue };
+        let middle = 0.5 * (edge.start_parameter + edge.end_parameter);
+        let point = curve.point_at(middle);
+        // On exactly one face of `other`, clear of its edges.
+        let near = |key: FaceKey| {
+            super::classify::face_distance(other, key, point, tolerance * 10.0)
+                .is_some_and(|gap| gap <= tolerance * 10.0)
+        };
+        let mut on = other.face_keys().filter(|key| near(*key));
+        let (Some(wall), None) = (on.next(), on.next()) else { continue };
+        let wall_node = other.faces.get(wall)?;
+        let wall_surface = other.surfaces.get(wall_node.surface)?;
+        let Some(outward) = wall_surface
+            .parameters_at(point)
+            .and_then(|(u, v)| wall_surface.normal_at(u, v))
+            .and_then(|normal| Vec3::from(normal).normalize())
+            .map(|normal| if wall_node.forward { normal } else { -normal })
+        else {
+            continue;
+        };
+        let (Some(along), Some(normal)) = (
+            Vec3::from(curve.tangent_at(middle)).normalize(),
+            surface
+                .parameters_at(point)
+                .and_then(|(u, v)| surface.normal_at(u, v))
+                .and_then(|normal| Vec3::from(normal).normalize()),
+        ) else {
+            continue;
+        };
+        // Square to the edge in the face's tangent plane; which way leads
+        // into the face is asked of the face's own boundary a short step off.
+        let Some(across) = (normal * sense).cross(along).normalize() else { continue };
+        let lean = across.dot(outward);
+        if lean.abs() < CLEAR {
+            continue;
+        }
+        let boundary = boundary
+            .get_or_insert_with(|| pcurve::face_boundary(body, face, tolerance))
+            .as_ref()?;
+        let length = Vec3::from(curve.point_at(edge.start_parameter))
+            .distance(Vec3::from(curve.point_at(edge.end_parameter)))
+            .max(Vec3::from(point).distance(Vec3::from(curve.point_at(edge.start_parameter))));
+        let step = (length * 1e-3).max(tolerance * 100.0);
+        let inside = |direction: Vec3| {
+            surface.parameters_at((Vec3::from(point) + direction * step).to_array()).is_some_and(
+                |(u, v)| {
+                    pcurve::contains_parameter_facing(
+                        surface,
+                        boundary,
+                        [u, v],
+                        crate::geom2d::Tolerance::new(tolerance),
+                        node.forward,
+                    )
+                },
+            )
+        };
+        let into = match (inside(across), inside(-across)) {
+            (true, false) => 1.0,
+            (false, true) => -1.0,
+            _ => continue,
+        };
+        let side = if lean * into < 0.0 { Containment::Inside } else { Containment::Outside };
+        match found {
+            None => found = Some(side),
+            Some(seen) if seen != side => return None,
+            Some(_) => {}
+        }
+    }
+    found
+}
+
 /// A point strictly inside a face, in space.
 ///
 /// Found in the surface's parameter space, where "inside the boundary" is a
@@ -2038,5 +2308,73 @@ mod tests {
         let common = combine(rounded.clone(), moved, Operation::Intersection, tolerance).unwrap();
         let both = volume(&union) + volume(&common);
         assert!((both - 2.0 * volume(&rounded)).abs() < 1e-4 * both, "{both}");
+    }
+
+    #[test]
+    fn a_face_at_a_hole_is_read_at_its_edge() {
+        // A box with a round bar through it, imprinted: the box's top meets
+        // the bar along a circle and lies outside the bar; the bar's wall
+        // inside the box lies inside it — both read at the circle, no ray.
+        let mut plate = cuboid([0.0; 3], [4.0, 4.0, 1.0]).unwrap();
+        let mut bar = cylinder([2.0, 2.0, -1.0], 1.0, 3.0).unwrap();
+        let (plain_plate, plain_bar) = (plate.clone(), bar.clone());
+        imprint_reaching(&mut plate, &mut bar, TOL, false).unwrap();
+        let top = plate
+            .face_keys()
+            .find(|face| {
+                let point = interior_point(&plate, *face, TOL);
+                point.is_some_and(|point| (point[2] - 1.0).abs() < 1e-9)
+            })
+            .unwrap();
+        assert_eq!(local_side(&plate, &plain_bar, top, TOL), Some(Containment::Outside));
+        let wall = bar
+            .face_keys()
+            .find(|face| {
+                let round = matches!(
+                    bar.surfaces.get(bar.faces.get(*face).unwrap().surface),
+                    Some(Surface::Cylinder(_))
+                );
+                round
+                    && interior_point(&bar, *face, TOL)
+                        .is_some_and(|point| point[2] > 0.0 && point[2] < 1.0)
+            })
+            .unwrap();
+        assert_eq!(local_side(&bar, &plain_plate, wall, TOL), Some(Containment::Inside));
+        // A face meeting nothing of the other body is left to the rays.
+        let bottom_cap = bar
+            .face_keys()
+            .find(|face| {
+                let point = interior_point(&bar, *face, TOL);
+                point.is_some_and(|point| (point[2] + 1.0).abs() < 1e-9)
+            })
+            .unwrap();
+        assert_eq!(local_side(&bar, &plain_plate, bottom_cap, TOL), None);
+    }
+
+    #[test]
+    fn many_tools_cut_at_once_take_what_each_would() {
+        // Nine holes in a plate, cut together; two overlapping bars beside
+        // them go one at a time, and still take their union out.
+        let plate = cuboid([0.0; 3], [12.0, 12.0, 2.0]).unwrap();
+        let mut tools: Vec<Body> = (0..9)
+            .map(|index| {
+                let (i, j) = ((index % 3) as f64, (index / 3) as f64);
+                cylinder([2.0 + 4.0 * i, 2.0 + 4.0 * j, -1.0], 1.0, 4.0).unwrap()
+            })
+            .collect();
+        tools.push(cuboid([-1.0, 5.5, 0.5], [3.0, 1.0, 1.0]).unwrap());
+        tools.push(cuboid([1.0, 5.5, 0.5], [3.0, 1.0, 1.0]).unwrap());
+        let one_by_one = tools.iter().cloned().fold(plate.clone(), |result, tool| {
+            combine(result, tool, Operation::Difference, TOL).unwrap()
+        });
+        let result = combine_all(plate, tools, Operation::Difference, TOL).unwrap();
+        let volume = |body: &Body| crate::brep::mass_properties(body).unwrap().volume;
+        let (got, expected) = (volume(&result), volume(&one_by_one));
+        let pi = std::f64::consts::PI;
+        // The bars take more than half a unit beyond the holes: 4 of them in
+        // the plate, less the hole at (2, 6) they cross.
+        assert!(expected < 12.0 * 12.0 * 2.0 - 9.0 * pi * 2.0 - 0.5);
+        assert!((got - expected).abs() < 1e-6 * expected, "{got} against {expected}");
+        assert!(result.validate().is_empty());
     }
 }
