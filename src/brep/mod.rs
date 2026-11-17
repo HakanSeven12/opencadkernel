@@ -72,7 +72,7 @@ pub use blend::{
     chamfer, chamfer_edges, chamfer_fit, fillet, fillet_edges, fillet_fit, presspull, ChamferError,
     FilletError,
 };
-pub use boolean::{combine, Operation};
+pub use boolean::{combine, combine_all, Operation};
 pub use bounds::{body_bounds, face_bounds, operation_tolerance, Aabb};
 pub use classify::{contains_point, Containment};
 pub use geometry::{

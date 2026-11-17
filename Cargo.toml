@@ -46,3 +46,7 @@ nlib = { package = "opencadkernel-nlib", path = "crates/opencadkernel-nlib", opt
 [[example]]
 name = "ssi_corpus"
 required-features = ["brep"]
+
+[[example]]
+name = "boolean_bench"
+required-features = ["brep"]

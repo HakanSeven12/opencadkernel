@@ -1989,6 +1989,34 @@ fn face_parameter_box(body: &Body, face: FaceKey, tolerance: f64) -> Option<[[f6
         .then_some([low, high])
 }
 
+/// Whether two faces are proved apart on their surfaces' Bézier pieces over
+/// the faces' parameter boxes ([`super::ssi::apart`]): no mesh of either is
+/// made for a pair that never comes near. The boxes, read off sampled
+/// boundary images, are grown a little so a bulge between samples stays in.
+fn proved_apart(
+    a: &Body,
+    one: FaceKey,
+    one_surface: &Surface,
+    b: &Body,
+    other: FaceKey,
+    other_surface: &Surface,
+    tolerance: f64,
+) -> bool {
+    let grown = |[low, high]: [[f64; 2]; 2]| {
+        let pad = (high[0] - low[0]).hypot(high[1] - low[1]) * 0.02;
+        ([low[0] - pad, high[0] + pad], [low[1] - pad, high[1] + pad])
+    };
+    let (Some((u, v)), Some((s, t))) = (
+        face_parameter_box(a, one, tolerance).map(grown),
+        face_parameter_box(b, other, tolerance).map(grown),
+    ) else {
+        return false;
+    };
+    let first = super::ssi::Bounded { surface: one_surface, u, v };
+    let second = super::ssi::Bounded { surface: other_surface, u: s, v: t };
+    super::ssi::apart(&first, &second, tolerance * 10.0)
+}
+
 /// The curves two faces share, from the full surface/surface intersection of
 /// their bounded pieces, fitted as the march's are. `None` when either face
 /// has no box or the intersection is refused.
@@ -2019,6 +2047,62 @@ fn bounded_meeting(
             .map(Curve3::Nurbs)
         })
         .collect()
+}
+
+/// Whether a closed conic two surfaces cross along bounds a cap lying
+/// within `tolerance` of both — a ball sunk a hair into the face it rests
+/// on, two balls a hair into each other. Near a contact the surfaces' gap
+/// is to second order a quadratic whose zero set is the curve; the gap at
+/// the middle of the cap is at most the largest `θ / (2κ)` along it, where
+/// the normals part by `θ` and the curve bends by `κ`. Within the tolerance
+/// everywhere, and the cap's centre (the mean centre of curvature) within it
+/// of both surfaces, the two only touch there.
+///
+/// Ported from Solidcore's `cap_centre_within_tolerance`
+/// (`topology/face/p3.rs`), Apache-2.0, see THIRD_PARTY.md.
+fn tangent_cap(one: &Surface, other: &Surface, curve: &Curve3, tolerance: f64) -> bool {
+    const SAMPLES: usize = 8;
+    if !matches!(curve, Curve3::Circle(_) | Curve3::Ellipse(_)) {
+        return false;
+    }
+    let normal = |surface: &Surface, point: [f64; 3]| {
+        surface
+            .parameters_at(point)
+            .and_then(|(u, v)| surface.normal_at(u, v))
+            .and_then(|normal| Vec3::from(normal).normalize())
+    };
+    let mut centre = Vec3::new(0.0, 0.0, 0.0);
+    for sample in 0..SAMPLES {
+        let t = std::f64::consts::TAU * (sample as f64 + 0.5) / SAMPLES as f64;
+        // The parameter is an angle on both conics; differences a
+        // thousandth of a radian apart read the bend to a millionth.
+        let step = 1e-3;
+        let (before, at, after) = (
+            Vec3::from(curve.point_at(t - step)),
+            Vec3::from(curve.point_at(t)),
+            Vec3::from(curve.point_at(t + step)),
+        );
+        let first = (after - before) * (0.5 / step);
+        let second = (after + before - at * 2.0) * (1.0 / (step * step));
+        let speed = first.length_squared();
+        if speed <= f64::EPSILON {
+            return false;
+        }
+        let bend = (second - first * (second.dot(first) / speed)) * (1.0 / speed);
+        let kappa = bend.length();
+        if kappa <= f64::EPSILON {
+            return false;
+        }
+        let (Some(a), Some(b)) = (normal(one, at.to_array()), normal(other, at.to_array())) else {
+            return false;
+        };
+        if a.cross(b).length() > 2.0 * kappa * tolerance {
+            return false;
+        }
+        centre = centre + at + bend * (1.0 / (kappa * kappa));
+    }
+    let centre = (centre * (1.0 / SAMPLES as f64)).to_array();
+    one.distance_to(centre).abs() <= tolerance && other.distance_to(centre).abs() <= tolerance
 }
 
 /// Every curve the two bodies' faces share.
@@ -2077,6 +2161,19 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64, reach: bool) -> Result<Vec<
                 // and the shaft in it. Only the stretch where both faces
                 // are is kept.
                 Meeting::Curves(curves) => {
+                    // A closed curve round a cap that stays within the
+                    // tolerance of both surfaces is a touch there, not a
+                    // crossing: cut along, it would part faces no side test
+                    // can tell apart.
+                    let curves: Vec<Curve3> = curves
+                        .into_iter()
+                        .filter(|curve| {
+                            !tangent_cap(one_surface, other_surface, curve, tolerance)
+                        })
+                        .collect();
+                    if curves.is_empty() {
+                        continue;
+                    }
                     // Surfaces that meet, faces that may not: boxes overlap
                     // round many pairs whose faces stay well apart, and the
                     // whole curves of those would cut both bodies for
@@ -2099,6 +2196,11 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64, reach: bool) -> Result<Vec<
                         continue;
                     }
                     let seen = seen || settled.is_some();
+                    if !seen
+                        && proved_apart(a, *one, one_surface, b, *other, other_surface, tolerance)
+                    {
+                        continue;
+                    }
                     if !seen {
                         let soups = soups.get_or_insert_with(|| {
                             (
@@ -2200,6 +2302,9 @@ fn shared_curves(a: &Body, b: &Body, tolerance: f64, reach: bool) -> Result<Vec<
                 // the two faces never come near; where they do cross, the
                 // crossing is traced onto both surfaces instead.
                 Meeting::Unknown => {
+                    if proved_apart(a, *one, one_surface, b, *other, other_surface, tolerance) {
+                        continue;
+                    }
                     let soups = soups.get_or_insert_with(|| {
                         (
                             super::near::FaceSoups::of(a, tolerance),
@@ -2504,6 +2609,35 @@ fn cut_along(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cap_within_the_tolerance_is_a_touch() {
+        use crate::brep::geometry::{Circle3, Sphere};
+        // A unit ball and a plane `sink` below its top: they cross in a
+        // circle round a cap `sink` high.
+        let tolerance = 1e-6;
+        let ball = Surface::Sphere(Sphere {
+            frame: crate::space::Plane::XY,
+            radius: 1.0,
+        });
+        for (sink, touch) in [(tolerance * 0.25, true), (tolerance * 100.0, false)] {
+            let height = 1.0 - sink;
+            let plane = Surface::Plane(crate::space::Plane::from_axes(
+                [0.0, 0.0, height],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+            ));
+            let circle = Curve3::Circle(Circle3 {
+                plane: crate::space::Plane::from_axes(
+                    [0.0, 0.0, height],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                ),
+                radius: (1.0 - height * height).sqrt(),
+            });
+            assert_eq!(tangent_cap(&plane, &ball, &circle, tolerance), touch, "{sink}");
+        }
+    }
     use crate::brep::make::cuboid;
 
     const TOL: f64 = 1e-9;
