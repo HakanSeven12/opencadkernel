@@ -40,6 +40,7 @@ mod fillet_circular;
 mod fillet_prismatic;
 mod fillet_rolling;
 pub mod geometry;
+pub mod heal;
 pub mod imprint;
 pub mod intersect;
 pub mod loft;
