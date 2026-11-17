@@ -554,9 +554,19 @@ pub(super) fn merge_coplanar_pieces(body: &mut Body, tolerance: f64) {
     merge_coplanar(body, tolerance, true);
 }
 
+/// [`merge_coplanar_pieces`], joining edges left in line even where no
+/// faces were joined: what a solid's clean-up asks for.
+pub(super) fn clean_body(body: &mut Body, tolerance: f64) {
+    merge_coplanar_with(body, tolerance, true, true);
+}
+
 fn merge_coplanar(body: &mut Body, tolerance: f64, curved: bool) {
+    merge_coplanar_with(body, tolerance, curved, false);
+}
+
+fn merge_coplanar_with(body: &mut Body, tolerance: f64, curved: bool, always: bool) {
     let mut merged = body.clone();
-    let mut changed = false;
+    let mut changed = always;
     loop {
         let next = merged
             .edges

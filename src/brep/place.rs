@@ -199,7 +199,7 @@ fn moved_pcurve(
     curve.transformed(&crate::geom2d::Transform::scale(factors[0], factors[1]))
 }
 
-fn move_curve(curve: &Curve3, place: &Placement, scale: f64) -> Option<Curve3> {
+pub(super) fn move_curve(curve: &Curve3, place: &Placement, scale: f64) -> Option<Curve3> {
     Some(match curve {
         Curve3::Line(line) => Curve3::Line(super::geometry::Line3 {
             origin: place.point(line.origin),
@@ -232,7 +232,7 @@ fn move_curve(curve: &Curve3, place: &Placement, scale: f64) -> Option<Curve3> {
     })
 }
 
-fn move_surface(surface: &Surface, place: &Placement, scale: f64) -> Option<Surface> {
+pub(super) fn move_surface(surface: &Surface, place: &Placement, scale: f64) -> Option<Surface> {
     Some(match surface {
         Surface::Plane(plane) => Surface::Plane(place.frame(plane)?),
         Surface::Cylinder(cylinder) => Surface::Cylinder(super::geometry::Cylinder {

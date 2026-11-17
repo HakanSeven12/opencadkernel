@@ -35,6 +35,7 @@ mod chamfer_circular;
 mod chamfer_prismatic;
 mod chamfer_profile;
 pub mod classify;
+pub mod edit;
 mod fillet_circular;
 mod fillet_prismatic;
 mod fillet_rolling;
@@ -69,6 +70,10 @@ pub use bounds::{body_bounds, face_bounds, operation_tolerance, Aabb};
 pub use classify::{contains_point, Containment};
 pub use geometry::{
     Circle3, Cone, Curve3, Cylinder, Ellipse3, Line3, OffsetSurface, Sphere, Surface, Torus,
+};
+pub use edit::{
+    check, clean, delete_faces, extrude_faces, face_at_point, face_sheet, imprint_curve, move_faces,
+    offset_faces, rotation, separate, taper_faces,
 };
 pub use imprint::{imprint, Imprint, Snag};
 pub use intersect::{surfaces as intersect_surfaces, Meeting};

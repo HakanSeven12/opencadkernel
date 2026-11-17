@@ -1318,6 +1318,24 @@ fn smooth_scheduled_edge(
     let [first, second] = edge.coedges.as_slice() else {
         return false;
     };
+    // An edge dividing one plane was put there on purpose — an imprint, a
+    // split — and is drawn; only a smooth change of surface is hidden.
+    let plane = |coedge: &super::topology::CoedgeKey| {
+        let face = body.faces.get(body.loops.get(body.coedges.get(*coedge)?.owner)?.owner)?;
+        match body.surfaces.get(face.surface)? {
+            super::geometry::Surface::Plane(plane) => Some(*plane),
+            _ => None,
+        }
+    };
+    if let (Some(one), Some(two)) = (plane(first), plane(second)) {
+        let parallel = match (one.normal(), two.normal()) {
+            (Some(a), Some(b)) => Vec3::from(a).dot(Vec3::from(b)).abs() >= 1.0 - 1e-12,
+            _ => false,
+        };
+        if one == two || (parallel && two.distance_to(one.origin).is_some_and(|gap| gap.abs() <= 1e-9)) {
+            return false;
+        }
+    }
     schedule.iter().all(|sample| {
         let normals =
             [first, second].map(|coedge| outward_normal_at_edge(body, *coedge, sample.position));
@@ -6606,7 +6624,7 @@ mod tests {
     }
 
     #[test]
-    fn tangent_face_boundary_is_not_a_visible_edge() {
+    fn an_edge_dividing_one_plane_is_drawn_and_a_tangent_one_is_not() {
         let mut solid = cuboid([0.0; 3], [2.0, 3.0, 4.0]).unwrap();
         let edge_key = solid.edge_keys().next().unwrap();
         let edge = solid.edges.get(edge_key).unwrap().clone();
@@ -6632,25 +6650,20 @@ mod tests {
                 position: solid.vertices.get(edge.end).unwrap().point,
             },
         ];
-        assert!(smooth_scheduled_edge(&solid, edge_key, &schedule));
-        let tessellation = tessellate(
-            &solid,
-            TessellationTolerance::new(default_angle(), TOL),
-        );
-        assert!(!tessellation.edges.iter().any(|edge| edge.edge == edge_key));
-        assert!(tessellation
-            .drawing_edges
-            .iter()
-            .any(|edge| edge.edge == edge_key));
-        let midpoint =
-            [0, 1, 2].map(|axis| 0.5 * (schedule[0].position[axis] + schedule[1].position[axis]));
-        assert!(polyline_on_face_boundary(
-            &solid,
-            faces[0],
-            &[schedule[0].position, midpoint, schedule[1].position],
-            TOL,
-            &HashMap::from([(edge_key, schedule.to_vec())]),
-        ));
+        assert!(!smooth_scheduled_edge(&solid, edge_key, &schedule));
+
+        // A round meets the faces it joins tangentially: those edges stay hidden.
+        let block = cuboid([0.0; 3], [10.0, 10.0, 10.0]).unwrap();
+        let corner = block
+            .edge_keys()
+            .find(|key| {
+                let (start, end) = block.edge_endpoints(*key).unwrap();
+                start[2] == 10.0 && end[2] == 10.0 && start[1] == 10.0 && end[1] == 10.0
+            })
+            .unwrap();
+        let rounded = crate::brep::fillet_edges(&block, &[corner], 2.0).unwrap();
+        let tessellation = tessellate(&rounded, TessellationTolerance::new(default_angle(), TOL));
+        assert_eq!(tessellation.edges.len(), rounded.edges.len() - 2);
     }
 
     #[test]
