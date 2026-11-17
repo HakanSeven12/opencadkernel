@@ -50,6 +50,7 @@ pub mod mesh;
 mod march;
 mod near;
 pub(crate) mod nurbs_builder;
+pub mod nurbs_form;
 pub mod pcurve;
 pub mod place;
 pub mod presspull;
@@ -81,6 +82,7 @@ pub use loft::loft;
 pub use loft_general::{loft_with_options, LoftError, LoftOptions, LoftSection};
 pub use mass::{analytic_mass_properties, mass_properties, MassProperties};
 pub use mesh::{body as mesh_body, Mesh};
+pub use nurbs_form::{nurbs_curve_form, nurbs_form, quarter_parameter};
 pub use recognize::{analytic_curve, analytic_surface};
 pub use place::{edge_points, edge_polylines, transform, Placement};
 pub use presspull::{

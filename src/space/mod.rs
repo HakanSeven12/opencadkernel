@@ -21,6 +21,8 @@ pub mod helix;
 pub mod line_union;
 pub mod lengthen;
 pub mod nurbs;
+#[cfg(feature = "nlib")]
+pub mod nurbs_tools;
 mod knot_compaction;
 mod polyline_approximation;
 pub mod plane;

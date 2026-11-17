@@ -384,56 +384,68 @@ impl Surface {
                 ))
             }
             Self::Torus(torus) => {
-                // The section is a quartic in the ray parameter. Its roots
-                // lie within the torus's bounding sphere, so the span there is
-                // walked for sign changes and each one halved down to a
-                // root. Two roots inside one step, or a graze, show no
-                // change and are missed together — an even number, which
-                // leaves a crossing count's parity as it was.
+                // The section is a quartic in the ray parameter, solved in
+                // closed form. It is set up on the unit direction from the
+                // line's point nearest the centre, in units of the torus's
+                // size, so its coefficients are near one whatever the model's
+                // scale and the ray's start. A graze (a double root) is no
+                // crossing and is left out, keeping a crossing count's parity.
                 let axis = Vec3::from(torus.frame.normal()?);
                 let (major, minor) = (torus.major_radius.abs(), torus.minor_radius.abs());
-                let offset = start - Vec3::from(torus.frame.origin);
-                let bound = major + minor;
-                let span = roots(
-                    along.length_squared(),
-                    2.0 * offset.dot(along),
-                    offset.length_squared() - bound * bound,
-                );
-                let [first, second] = span[..] else {
+                let (length, size) = (along.length(), major + minor);
+                if !(length > 0.0 && size > 0.0) {
                     return Some(Vec::new());
-                };
-                let (enter, leave) = (first.min(second), first.max(second));
-                let quartic = |t: f64| {
-                    let q = offset + along * t;
-                    let height = q.dot(axis);
-                    let squared = q.length_squared();
-                    let across = squared - height * height;
-                    let sum = squared + major * major - minor * minor;
-                    sum * sum - 4.0 * major * major * across
-                };
-                const STEPS: usize = 256;
-                let mut hits = Vec::new();
-                let mut previous = (enter, quartic(enter));
-                for step in 1..=STEPS {
-                    let t = enter + (leave - enter) * step as f64 / STEPS as f64;
-                    let value = quartic(t);
-                    if value == 0.0 {
-                        hits.push(t);
-                    } else if previous.1 != 0.0 && (value > 0.0) != (previous.1 > 0.0) {
-                        let (mut low, mut high) = (previous.0, t);
-                        let low_positive = previous.1 > 0.0;
-                        for _ in 0..64 {
-                            let middle = 0.5 * (low + high);
-                            if (quartic(middle) > 0.0) == low_positive {
-                                low = middle;
-                            } else {
-                                high = middle;
-                            }
-                        }
-                        hits.push(0.5 * (low + high));
-                    }
-                    previous = (t, value);
                 }
+                let unit = along / length;
+                let offset = start - Vec3::from(torus.frame.origin);
+                let shift = -offset.dot(unit);
+                let near = (offset + unit * shift) / size;
+                let (big, small) = (major / size, minor / size);
+                let (h0, h1) = (near.dot(axis), unit.dot(axis));
+                let squared = near.length_squared();
+                let c = squared + big * big - small * small;
+                let four = 4.0 * big * big;
+                // |q|^4-style expansion with `near` perpendicular to `unit`.
+                let coefficients = [
+                    c * c - four * (squared - h0 * h0),
+                    2.0 * four * h0 * h1,
+                    2.0 * c - four * (1.0 - h1 * h1),
+                    0.0,
+                    1.0,
+                ];
+                let quartic = |s: f64| {
+                    coefficients.iter().rev().fold(0.0, |value, &k| value * s + k)
+                };
+                let slope = |s: f64| {
+                    4.0 * s * s * s
+                        + 3.0 * coefficients[3] * s * s
+                        + 2.0 * coefficients[2] * s
+                        + coefficients[1]
+                };
+                const STEP: f64 = 1e-9;
+                let mut hits: Vec<f64> =
+                    nlib::geom::polynomial::solve_quartic(&coefficients, 1e-12)
+                        .iter()
+                        .filter_map(|&root| {
+                            // Newton polishes what the closed form rounds.
+                            let mut s = root;
+                            for _ in 0..3 {
+                                let d = slope(s);
+                                if d == 0.0 {
+                                    break;
+                                }
+                                let next = s - quartic(s) / d;
+                                if !next.is_finite() {
+                                    break;
+                                }
+                                s = next;
+                            }
+                            let crosses = (quartic(s - STEP) > 0.0) != (quartic(s + STEP) > 0.0);
+                            crosses.then_some((shift + s * size) / length)
+                        })
+                        .collect();
+                hits.sort_by(f64::total_cmp);
+                hits.dedup_by(|a, b| (*a - *b).abs() <= STEP * size / length);
                 Some(hits)
             }
             Self::Nurbs(surface) | Self::Offset(OffsetSurface { approximation: surface, .. }) => nurbs_ray_hits(surface, start, along),
@@ -965,6 +977,36 @@ mod tests {
         assert!((surface.point_at(0.0, PI)[0] - 8.0).abs() < 1e-12);
         // The centre of the hole is a major radius from the tube.
         assert!((surface.distance_to([0.0, 0.0, 0.0]) - 8.0).abs() < 1e-12);
+    }
+
+    /// A torus's ray hits are the quartic's roots in closed form, exact from
+    /// any start and scale; a graze is no crossing.
+    #[test]
+    fn torus_ray_hits_are_exact() {
+        let surface = Surface::Torus(Torus { frame: xy(), major_radius: 5.0, minor_radius: 1.0 });
+        let check = |origin: [f64; 3], direction: [f64; 3], expected: &[f64]| {
+            let hits = surface.ray_hits(origin, direction).unwrap();
+            assert_eq!(hits.len(), expected.len(), "{origin:?} {hits:?}");
+            for (hit, want) in hits.iter().zip(expected) {
+                assert!((hit - want).abs() < 1e-9, "{hit} {want}");
+            }
+        };
+        check([0.0; 3], [1.0, 0.0, 0.0], &[-6.0, -4.0, 4.0, 6.0]);
+        check([1000.0, 0.0, 0.0], [-2.0, 0.0, 0.0], &[497.0, 498.0, 502.0, 503.0]);
+        let r = 0.75_f64.sqrt();
+        check([0.0, -20.0, 0.5], [0.0, 1.0, 0.0], &[20.0 - 5.0 - r, 20.0 - 5.0 + r, 20.0 + 5.0 - r, 20.0 + 5.0 + r]);
+        check([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], &[]);
+        check([0.0, 0.0, 3.0], [1.0, 0.0, 0.0], &[]);
+        // Down through the tube.
+        check([5.0, 0.0, 10.0], [0.0, 0.0, -1.0], &[9.0, 11.0]);
+        // Large and far: same answers scaled.
+        let big = Surface::Torus(Torus { frame: xy(), major_radius: 5e4, minor_radius: 1e4 });
+        let hits = big.ray_hits([1e7, 0.0, 0.0], [-1.0, 0.0, 0.0]).unwrap();
+        let want = [1e7 - 6e4, 1e7 - 4e4, 1e7 + 4e4, 1e7 + 6e4];
+        assert_eq!(hits.len(), 4);
+        for (hit, want) in hits.iter().zip(want) {
+            assert!((hit - want).abs() < 1e-6, "{hit} {want}");
+        }
     }
 
     #[test]

@@ -1,0 +1,10 @@
+[package]
+name = "opencadkernel-nlib"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "NURBS curve and surface routines (fitting, knot tools, extension, deviation, matching, filling) from Solidcore's NLib layer"
+publish = false
+
+[lib]
+name = "nlib"
